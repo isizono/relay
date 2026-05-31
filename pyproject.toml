@@ -1,0 +1,11 @@
+[project]
+name = "powwow"
+version = "0.1.0"
+description = "Claude Code間のメッセージング中継システム（履歴を持つ軽量サービス・窓口モデル）"
+requires-python = ">=3.11"
+# server.py 本体は標準ライブラリ（http.server + sqlite3）のみで依存ゼロを維持する（D#2282）。
+dependencies = []
+
+[dependency-groups]
+# MCPサーバー（PR-c）が使う MCP Python SDK は当該PRで追加する。
+dev = ["pytest>=8.0"]

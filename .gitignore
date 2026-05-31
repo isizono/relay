@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# uv
+.uv/
+
+# SQLite (powwow データストア)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# OS
+.DS_Store
