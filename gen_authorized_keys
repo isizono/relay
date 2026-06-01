@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""gen_authorized_keys — authorized_keys 生成スクリプト（エントリーポイント）。
+
+ロジックは gen_authorized_keys.py に集約。このファイルは実行可能スクリプトとして
+PATH に置かれる。
+"""
+import sys
+from pathlib import Path
+
+# 同ディレクトリの gen_authorized_keys.py をインポート
+sys.path.insert(0, str(Path(__file__).parent))
+import gen_authorized_keys as gak
+
+if __name__ == "__main__":
+    gak.main()
