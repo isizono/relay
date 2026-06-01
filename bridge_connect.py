@@ -5,10 +5,13 @@ authorized_keys で各鍵行に `command="bridge-connect --handle=<user>"` と�
 forced command が設定される。powwow_code は forced command には焼かず、
 $SSH_ORIGINAL_COMMAND から取得する（D#2302）。
 
-分岐ロジック（D#2272, D#2302）:
-  "bridge recv --powwow=X"   → 受信モード（SSE購読を stdout へ中継）
-  "bridge send --powwow=X --body=Y ..." → 送信モード（POST /send を実行）
-  それ以外（空含む）          → エラー
+分岐ロジック（D#2272, D#2302, D#2307）:
+  "bridge recv --powwow=X"                  → 受信モード（SSE購読を stdout へ中継）
+  "bridge send --powwow=X --body=Y ..."     → 送信モード（POST /send を実行）
+  "bridge create"                           → 作成モード（POST /create を実行）
+  "bridge history --powwow=X [--since=N] [--limit=N]" → 履歴取得モード（GET /history）
+  "bridge presence --powwow=X"             → 接続中handle一覧モード（GET /presence）
+  それ以外（空含む）                         → エラー
 
 handle は必ず自身の --handle 引数からのみ取得し、$SSH_ORIGINAL_COMMAND 内の
 handle 指定は無視する（handle 詐称防止、D#2285）。
@@ -88,6 +91,34 @@ def parse_recv_command(original_cmd: str) -> dict | None:
     return _parse_subcommand(original_cmd, "recv")
 
 
+def parse_create_command(original_cmd: str) -> dict | None:
+    """"bridge create" をパース。引数なしで空 dict を返す。"""
+    return _parse_subcommand(original_cmd, "create")
+
+
+def parse_history_command(original_cmd: str) -> dict | None:
+    """"bridge history --powwow=X [--since=N] [--limit=N]" をパース。"""
+    return _parse_subcommand(original_cmd, "history")
+
+
+def parse_presence_command(original_cmd: str) -> dict | None:
+    """"bridge presence --powwow=X" をパース。"""
+    return _parse_subcommand(original_cmd, "presence")
+
+
+def _parse_bool(value) -> bool:
+    """文字列 "true"/"false" を bool に変換する。
+
+    bridge send では --needs-reply=true/false の文字列が渡される場合がある。
+    Python の bool("false") は True になるため、明示的な変換が必要（D#2307）。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() == "true"
+    return bool(value)
+
+
 def mode_recv(handle: str, powwow_code: str, server: str, curl_fn=None) -> int:
     """受信モード: SSE 購読を stdout に中継する。
 
@@ -108,6 +139,29 @@ def mode_recv(handle: str, powwow_code: str, server: str, curl_fn=None) -> int:
     return result.returncode
 
 
+def _run_curl_and_propagate(args: list[str]) -> int:
+    """curl を実行し、成功時は stdout を継承、失敗時はエラー情報を stderr に流す（Major 1 対応）。
+
+    curl は ``-sf --fail-with-body`` で呼び出すことを前提とし、HTTP 4xx/5xx で非0終了する。
+    --fail-with-body（curl 7.76+）により、4xx でも body を stdout に出して非0終了するため、
+    サーバーの {"error": "..."} を stderr 経由で呼び出し元に伝播できる。
+
+    非0終了時は curl の stdout（サーバーレスポンス本体）と stderr（curl 自体のエラー）を
+    まとめて stderr に流して呼び出し元（mcp_server.py 経由で Claude）に伝播させる。
+    """
+    result = subprocess.run(args, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if result.returncode != 0:
+        if result.stdout:
+            print(result.stdout, file=sys.stderr)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+        return result.returncode
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+        sys.stdout.flush()
+    return 0
+
+
 def mode_send(
     handle: str,
     send_params: dict,
@@ -125,7 +179,7 @@ def mode_send(
         return 1
 
     body_text = send_params.get("body", "")
-    needs_reply = bool(send_params.get("needs-reply", False))
+    needs_reply = _parse_bool(send_params.get("needs-reply", False))
     in_reply_to_raw = send_params.get("in-reply-to")
     in_reply_to: int | None = None
     if in_reply_to_raw is not None:
@@ -151,14 +205,90 @@ def mode_send(
     if curl_fn is not None:
         return curl_fn(url, payload)
 
-    # 実際の curl で POST
-    result = subprocess.run(
-        ["curl", "-s", "-X", "POST", url,
+    # -sf + --fail-with-body で HTTP エラーを非0終了として伝播（Major 1）
+    return _run_curl_and_propagate(
+        ["curl", "-sf", "--fail-with-body", "-X", "POST", url,
          "-H", "Content-Type: application/json",
-         "-d", payload],
-        stdin=subprocess.DEVNULL,
+         "-d", payload]
     )
-    return result.returncode
+
+
+def mode_create(server: str, curl_fn=None) -> int:
+    """作成モード: POST /create を実行し、レスポンス JSON を stdout に出力する。
+
+    curl_fn は (url: str) -> int 形式。None の場合は subprocess.run(curl) を使う。
+    戻り値は終了コード。
+    """
+    url = f"{server}/create"
+
+    if curl_fn is not None:
+        return curl_fn(url)
+
+    return _run_curl_and_propagate(
+        ["curl", "-sf", "--fail-with-body", "-X", "POST", url,
+         "-H", "Content-Type: application/json",
+         "-d", "{}"]
+    )
+
+
+def mode_history(
+    history_params: dict,
+    server: str,
+    curl_fn=None,
+) -> int:
+    """履歴取得モード: GET /history を実行し、レスポンス JSON を stdout に出力する。
+
+    curl_fn は (url: str) -> int 形式。None の場合は subprocess.run(curl) を使う。
+    戻り値は終了コード。
+    """
+    powwow_code = history_params.get("powwow", "")
+    if not powwow_code:
+        print("エラー: bridge history には --powwow=CODE が必要です", file=sys.stderr)
+        return 1
+
+    qs_dict: dict = {"powwow": powwow_code}
+    since_raw = history_params.get("since")
+    if since_raw is not None:
+        qs_dict["since"] = since_raw
+    limit_raw = history_params.get("limit")
+    if limit_raw is not None:
+        qs_dict["limit"] = limit_raw
+
+    qs = urllib.parse.urlencode(qs_dict)
+    url = f"{server}/history?{qs}"
+
+    if curl_fn is not None:
+        return curl_fn(url)
+
+    return _run_curl_and_propagate(
+        ["curl", "-sf", "--fail-with-body", url]
+    )
+
+
+def mode_presence(
+    presence_params: dict,
+    server: str,
+    curl_fn=None,
+) -> int:
+    """接続中handle一覧モード: GET /presence を実行し、レスポンス JSON を stdout に出力する。
+
+    curl_fn は (url: str) -> int 形式。None の場合は subprocess.run(curl) を使う。
+    戻り値は終了コード。
+    """
+    powwow_code = presence_params.get("powwow", "")
+    if not powwow_code:
+        print("エラー: bridge presence には --powwow=CODE が必要です", file=sys.stderr)
+        return 1
+
+    qs = urllib.parse.urlencode({"powwow": powwow_code})
+    url = f"{server}/presence?{qs}"
+
+    if curl_fn is not None:
+        return curl_fn(url)
+
+    return _run_curl_and_propagate(
+        ["curl", "-sf", "--fail-with-body", url]
+    )
 
 
 def run(
@@ -166,6 +296,9 @@ def run(
     original_command: str | None = None,
     curl_recv_fn=None,
     curl_send_fn=None,
+    curl_create_fn=None,
+    curl_history_fn=None,
+    curl_presence_fn=None,
 ) -> int:
     """メインロジック。テスト時は curl_*_fn でモック可能。
 
@@ -196,7 +329,23 @@ def run(
     if send_params is not None:
         return mode_send(handle, send_params, server, curl_fn=curl_send_fn)
 
-    print(f"エラー: 不明なコマンド: {original_command!r}（'bridge recv' または 'bridge send' が必要）", file=sys.stderr)
+    create_params = parse_create_command(original_command)
+    if create_params is not None:
+        return mode_create(server, curl_fn=curl_create_fn)
+
+    history_params = parse_history_command(original_command)
+    if history_params is not None:
+        return mode_history(history_params, server, curl_fn=curl_history_fn)
+
+    presence_params = parse_presence_command(original_command)
+    if presence_params is not None:
+        return mode_presence(presence_params, server, curl_fn=curl_presence_fn)
+
+    print(
+        f"エラー: 不明なコマンド: {original_command!r}"
+        "（'bridge recv', 'bridge send', 'bridge create', 'bridge history', 'bridge presence' が必要）",
+        file=sys.stderr,
+    )
     return 1
 
 

@@ -25,6 +25,52 @@
 
 現状の `server.py` は PoC（SSE中継のみ・インメモリ）の移植。PR-a で SQLite 永続化・各エンドポイント・ブロードキャスト・アイドル削除ジョブを足して本実装にする。
 
+## 受信（recv_monitor.sh）
+
+`recv_monitor.sh` は SSH forced command（bridge-connect）経由で SSE を購読し、`data:` 行を stdout に流す。
+Claude Code の `Monitor`（persistent）でこのスクリプトの stdout を監視することで、新着メッセージをイベントドリブンに受け取れる。
+
+```bash
+# Monitor(persistent) で受信待ち起動
+./recv_monitor.sh --powwow=abc123 --host=powwow
+```
+
+接続断時は自動再接続する（1 秒インターバル）。取りこぼしは MCP ツール `GetHistory(since=N)` で回収する設計のため、スクリプト側は単純再接続のみで十分（D#2257）。
+
+### オプション
+
+| オプション | 説明 | デフォルト |
+|---|---|---|
+| `--powwow=CODE` | powwow コード（必須） | — |
+| `--host=HOST` | SSH ホスト | `powwow` |
+| `--no-reconnect` | 接続断時に再接続しない（デバッグ用） | false |
+| `--filter-only` | stdin を読んで `data:` 行のみ流す（テスト用） | false |
+
+### フィルタのテスト
+
+```bash
+# data: 行のみ通ることを確認
+printf ': connected\n\ndata: {"body":"hi"}\n\n' | ./recv_monitor.sh --filter-only
+# → data: {"body":"hi"}
+
+# シェルテスト実行
+bash tests/test_recv_monitor.sh
+```
+
+## bridge サブコマンド一覧
+
+bridge-connect が受け付けるサブコマンド（SSH forced command 経由）:
+
+| サブコマンド | 用途 | 主な引数 |
+|---|---|---|
+| `bridge recv --powwow=X` | SSE 購読（受信モード） | `--powwow` |
+| `bridge send --powwow=X --body=Y` | メッセージ送信 | `--powwow`, `--body`, `--needs-reply`, `--in-reply-to` |
+| `bridge create` | powwow 作成 | なし |
+| `bridge history --powwow=X` | メッセージ履歴取得 | `--powwow`, `--since`, `--limit` |
+| `bridge presence --powwow=X` | 接続中 handle 一覧取得 | `--powwow` |
+
+MCP サーバー（`mcp_server.py`）は内部でこれらのサブコマンドを SSH 越しに呼び出す。
+
 ## メッセージ順序の真実源
 
 メッセージ順序の真実源は **`msg_id`（SQLite `INTEGER PRIMARY KEY AUTOINCREMENT` で単調増加）** とする。SSE ブロードキャストでの**到達順は厳密に保証しない**（複数スレッドが同時に `/send` を叩いた場合、`save_message` の commit 順と各購読者 queue への `put` 順が逆転する可能性がある）。
