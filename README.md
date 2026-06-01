@@ -25,6 +25,16 @@
 
 現状の `server.py` は PoC（SSE中継のみ・インメモリ）の移植。PR-a で SQLite 永続化・各エンドポイント・ブロードキャスト・アイドル削除ジョブを足して本実装にする。
 
+## メッセージ順序の真実源
+
+メッセージ順序の真実源は **`msg_id`（SQLite `INTEGER PRIMARY KEY AUTOINCREMENT` で単調増加）** とする。SSE ブロードキャストでの**到達順は厳密に保証しない**（複数スレッドが同時に `/send` を叩いた場合、`save_message` の commit 順と各購読者 queue への `put` 順が逆転する可能性がある）。
+
+受信側 Claude は `msg_id` で:
+- スレッド構造の復元（`in_reply_to` → 親 `msg_id`）
+- 重複・欠落の冪等突合（`GetHistory(since=最後に見た msg_id)` で取りこぼし再取得）
+
+を行うため、broadcast 到達順の前後に依存しない設計になっている。並行 send 時の SQLite 同時書き込みは WAL モード + `busy_timeout=5000ms` で吸収する。
+
 ## 開発
 
 ```bash

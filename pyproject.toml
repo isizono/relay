@@ -9,3 +9,6 @@ dependencies = []
 [dependency-groups]
 # MCPサーバー（PR-c）が使う MCP Python SDK は当該PRで追加する。
 dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
