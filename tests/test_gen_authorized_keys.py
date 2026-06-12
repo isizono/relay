@@ -3,7 +3,7 @@
 エッジケース表 #1〜#5 をカバーする:
   #1: gen_authorized_keys は各ユーザーに forced command 前置の鍵行を出力する
   #2: members.txt 重複ユーザー名は1回に正規化される
-  #3: bridge-connect は $SSH_ORIGINAL_COMMAND="bridge recv --powwow=X" で受信モードに分岐する（D#2302）
+  #3: bridge-connect は $SSH_ORIGINAL_COMMAND="bridge recv --channel=X" で受信モードに分岐する（D#2302）
   #4: bridge-connect は "bridge send ..." のとき送信モードに分岐する
   #5: bridge-connect は handle を --handle 引数からのみ取り、ORIGINAL_COMMAND 内の handle を無視する
 """
@@ -160,11 +160,11 @@ def test_case02_comments_and_blank_lines_ignored(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# エッジケース #3: $SSH_ORIGINAL_COMMAND="bridge recv --powwow=X" で受信モード分岐（D#2302）
+# エッジケース #3: $SSH_ORIGINAL_COMMAND="bridge recv --channel=X" で受信モード分岐（D#2302）
 # ---------------------------------------------------------------------------
 
 def test_case03_bridge_recv_command_triggers_recv_mode():
-    """bridge-connect は $SSH_ORIGINAL_COMMAND="bridge recv --powwow=X" で受信モードに分岐する。
+    """bridge-connect は $SSH_ORIGINAL_COMMAND="bridge recv --channel=X" で受信モードに分岐する。
 
     エッジケース #3（D#2272, D#2302）に対応。
     curl_recv_fn に渡された URL が SSE 購読 URL かつ handle が --handle 由来であることを確認。
@@ -177,7 +177,7 @@ def test_case03_bridge_recv_command_triggers_recv_mode():
 
     exit_code = bc.run(
         argv=["--handle=alice", "--server=http://127.0.0.1:8765"],
-        original_command="bridge recv --powwow=testcode123",
+        original_command="bridge recv --channel=testcode123",
         curl_recv_fn=mock_recv,
         curl_send_fn=None,
     )
@@ -188,7 +188,7 @@ def test_case03_bridge_recv_command_triggers_recv_mode():
     url = received_urls[0]
     assert "/stream?" in url, f"受信 URL が /stream を含まない: {url}"
     assert "handle=alice" in url, f"handle が URL に含まれていない: {url}"
-    assert "powwow=testcode123" in url, f"powwow_code が URL に含まれていない: {url}"
+    assert "channel=testcode123" in url, f"channel_code が URL に含まれていない: {url}"
 
 
 def test_case03_empty_original_command_returns_error():
@@ -212,9 +212,9 @@ def test_case03_whitespace_only_original_command_returns_error():
 
 
 def test_case03_recv_url_uses_urllib_quote():
-    """受信URLの powwow/handle 値は urllib でクエリエンコードされる（D#2302、観点6-3）。
+    """受信URLの channel/handle 値は urllib でクエリエンコードされる（D#2302、観点6-3）。
 
-    `&` や `#` を含む powwow_code でも URL が破綻しないこと。
+    `&` や `#` を含む channel_code でも URL が破綻しないこと。
     """
     received_urls = []
 
@@ -224,16 +224,16 @@ def test_case03_recv_url_uses_urllib_quote():
 
     bc.run(
         argv=["--handle=alice", "--server=http://127.0.0.1:8765"],
-        original_command="bridge recv --powwow=a&b#c",
+        original_command="bridge recv --channel=a&b#c",
         curl_recv_fn=mock_recv,
     )
 
     assert len(received_urls) == 1
     url = received_urls[0]
     # & と # が URL エンコードされている（'%26', '%23'）こと
-    assert "a%26b%23c" in url, f"powwow_code が URL エンコードされていない: {url}"
-    # 生の & や # が powwow= の値部分に直接埋まっていないこと
-    assert "powwow=a&b" not in url, f"生の & が埋まっている: {url}"
+    assert "a%26b%23c" in url, f"channel_code が URL エンコードされていない: {url}"
+    # 生の & や # が channel= の値部分に直接埋まっていないこと
+    assert "channel=a&b" not in url, f"生の & が埋まっている: {url}"
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +254,7 @@ def test_case04_bridge_send_command_triggers_send_mode():
 
     exit_code = bc.run(
         argv=["--handle=bob", "--server=http://127.0.0.1:8765"],
-        original_command="bridge send --powwow=abc123 --body=hello",
+        original_command="bridge send --channel=abc123 --body=hello",
         curl_recv_fn=None,
         curl_send_fn=mock_send,
     )
@@ -266,7 +266,7 @@ def test_case04_bridge_send_command_triggers_send_mode():
     assert "/send" in req["url"], f"送信 URL が /send を含まない: {req['url']}"
 
     payload = json.loads(req["body"])
-    assert payload["powwow"] == "abc123", f"powwow_code が不正: {payload}"
+    assert payload["channel"] == "abc123", f"channel_code が不正: {payload}"
     assert payload["body"] == "hello", f"body が不正: {payload}"
 
 
@@ -280,7 +280,7 @@ def test_case04_bridge_send_with_needs_reply():
 
     bc.run(
         argv=["--handle=alice", "--server=http://127.0.0.1:8765"],
-        original_command="bridge send --powwow=xyz --body=test --needs-reply",
+        original_command="bridge send --channel=xyz --body=test --needs-reply",
         curl_send_fn=mock_send,
     )
 
@@ -298,7 +298,7 @@ def test_case04_bridge_send_with_in_reply_to():
 
     bc.run(
         argv=["--handle=alice", "--server=http://127.0.0.1:8765"],
-        original_command="bridge send --powwow=xyz --body=test --in-reply-to=42",
+        original_command="bridge send --channel=xyz --body=test --in-reply-to=42",
         curl_send_fn=mock_send,
     )
 
@@ -325,7 +325,7 @@ def test_case05_handle_from_flag_not_from_original_command():
     # ORIGINAL_COMMAND に別ユーザー名 "evil-user" を混入
     exit_code = bc.run(
         argv=["--handle=alice", "--server=http://127.0.0.1:8765"],
-        original_command="bridge send --powwow=abc --body=hi --handle=evil-user",
+        original_command="bridge send --channel=abc --body=hi --handle=evil-user",
         curl_send_fn=mock_send,
     )
 
@@ -352,7 +352,7 @@ def test_case05_handle_from_recv_url_not_from_original_command():
 
     bc.run(
         argv=["--handle=carol", "--server=http://127.0.0.1:8765"],
-        original_command="bridge recv --powwow=testcode --handle=evil-user",
+        original_command="bridge recv --channel=testcode --handle=evil-user",
         curl_recv_fn=mock_recv,
     )
 
@@ -367,10 +367,10 @@ def test_case05_handle_from_recv_url_not_from_original_command():
 # ---------------------------------------------------------------------------
 
 def test_parse_send_command_valid():
-    """"bridge send --powwow=X --body=Y" が正しくパースされる。"""
-    params = bc.parse_send_command("bridge send --powwow=abc123 --body=hello")
+    """"bridge send --channel=X --body=Y" が正しくパースされる。"""
+    params = bc.parse_send_command("bridge send --channel=abc123 --body=hello")
     assert params is not None
-    assert params["powwow"] == "abc123"
+    assert params["channel"] == "abc123"
     assert params["body"] == "hello"
 
 
@@ -383,7 +383,7 @@ def test_parse_send_command_not_bridge():
 
 def test_parse_send_command_handle_ignored():
     """ORIGINAL_COMMAND 内の --handle は parse_send_command がパース結果から除外する。"""
-    params = bc.parse_send_command("bridge send --powwow=X --body=Y --handle=attacker")
+    params = bc.parse_send_command("bridge send --channel=X --body=Y --handle=attacker")
     assert params is not None
     assert "handle" not in params, "parse_send_command が ORIGINAL_COMMAND の handle を受け取った"
 
@@ -420,14 +420,14 @@ def test_missing_handle_returns_error():
     assert exit_code != 0, "--handle なしで終了コード0になってしまった"
 
 
-def test_recv_mode_missing_powwow_returns_error():
-    """受信モードで $SSH_ORIGINAL_COMMAND="bridge recv" のみ（--powwow なし）はエラー（D#2302）。"""
+def test_recv_mode_missing_channel_returns_error():
+    """受信モードで $SSH_ORIGINAL_COMMAND="bridge recv" のみ（--channel なし）はエラー（D#2302）。"""
     exit_code = bc.run(
         argv=["--handle=alice", "--server=http://127.0.0.1:8765"],
         original_command="bridge recv",
         curl_recv_fn=lambda url: 0,
     )
-    assert exit_code != 0, "--powwow なし bridge recv で終了コード0になってしまった"
+    assert exit_code != 0, "--channel なし bridge recv で終了コード0になってしまった"
 
 
 # ---------------------------------------------------------------------------
@@ -436,14 +436,14 @@ def test_recv_mode_missing_powwow_returns_error():
 
 def test_parse_send_command_shlex_quoted_body():
     """--body='hello world' のように引用符付きの本文が shlex で正しくパースされる。"""
-    params = bc.parse_send_command("bridge send --powwow=X --body='hello world'")
+    params = bc.parse_send_command("bridge send --channel=X --body='hello world'")
     assert params is not None
     assert params["body"] == "hello world", f"shlex パース不正: {params}"
 
 
 def test_parse_send_command_shlex_body_with_special_chars():
     """本文に ; & を含むケース。shlex は引用符内をそのまま保持する。"""
-    params = bc.parse_send_command('bridge send --powwow=X --body="a;b&c"')
+    params = bc.parse_send_command('bridge send --channel=X --body="a;b&c"')
     assert params is not None
     assert params["body"] == "a;b&c"
 
@@ -454,22 +454,22 @@ def test_parse_send_command_unclosed_quote_returns_none():
 
 
 def test_parse_recv_command_valid():
-    """"bridge recv --powwow=X" が正しくパースされる（D#2302）。"""
-    params = bc.parse_recv_command("bridge recv --powwow=abc123")
+    """"bridge recv --channel=X" が正しくパースされる（D#2302）。"""
+    params = bc.parse_recv_command("bridge recv --channel=abc123")
     assert params is not None
-    assert params["powwow"] == "abc123"
+    assert params["channel"] == "abc123"
 
 
 def test_parse_recv_command_not_recv():
     """"bridge send ..." や不明コマンドは parse_recv_command が None を返す。"""
-    assert bc.parse_recv_command("bridge send --powwow=X") is None
+    assert bc.parse_recv_command("bridge send --channel=X") is None
     assert bc.parse_recv_command("") is None
     assert bc.parse_recv_command("ssh fwd") is None
 
 
 def test_parse_recv_command_handle_ignored():
     """recv コマンド内の --handle も parse_recv_command がパース結果から除外する（D#2285）。"""
-    params = bc.parse_recv_command("bridge recv --powwow=X --handle=attacker")
+    params = bc.parse_recv_command("bridge recv --channel=X --handle=attacker")
     assert params is not None
     assert "handle" not in params
 

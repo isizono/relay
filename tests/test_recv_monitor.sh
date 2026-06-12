@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # recv_monitor.sh のテストスイート。
 #
-# テスト対象: recv_monitor.sh の --filter-only モードと --powwow バリデーション。
+# テスト対象: recv_monitor.sh の --filter-only モードと --channel バリデーション。
 # SSE フィルタ挙動（#1a〜#1f）と入力バリデーション（#2a〜#2b）を検証する。
 #
 # 実行方法:
@@ -80,48 +80,48 @@ actual=$(printf '' | "$SCRIPT" --filter-only || true)
 run_test "#1f 空入力 → 出力なし" "$actual" ''
 
 # ---------------------------------------------------------------------------
-# #2a: 不正な powwow_code（空白含む）は exit 2
+# #2a: 不正な channel_code（空白含む）は exit 2
 # ---------------------------------------------------------------------------
 set +e
-"$SCRIPT" --powwow="hello world" 2>/dev/null
+"$SCRIPT" --channel="hello world" 2>/dev/null
 actual_exit=$?
 set -e
-run_exit_test "#2a 空白含むpowwow_codeはexit2" "2" "$actual_exit"
+run_exit_test "#2a 空白含むchannel_codeはexit2" "2" "$actual_exit"
 
 # ---------------------------------------------------------------------------
-# #2b: 不正な powwow_code（記号含む）は exit 2
+# #2b: 不正な channel_code（記号含む）は exit 2
 # ---------------------------------------------------------------------------
 set +e
-"$SCRIPT" --powwow="code;evil" 2>/dev/null
+"$SCRIPT" --channel="code;evil" 2>/dev/null
 actual_exit=$?
 set -e
-run_exit_test "#2b 記号含むpowwow_codeはexit2" "2" "$actual_exit"
+run_exit_test "#2b 記号含むchannel_codeはexit2" "2" "$actual_exit"
 
 # ---------------------------------------------------------------------------
-# #2c: 正常な powwow_code はバリデーションを通過する（filter-only モードで動作確認）
-#   ※ SSH呼び出しは行わず、--powwow のバリデーション通過のみ確認
-#   valid_code を渡して --filter-only モードで起動（--powwow はバリデーション通過後は無視）
+# #2c: 正常な channel_code はバリデーションを通過する（filter-only モードで動作確認）
+#   ※ SSH呼び出しは行わず、--channel のバリデーション通過のみ確認
+#   valid_code を渡して --filter-only モードで起動（--channel はバリデーション通過後は無視）
 # ---------------------------------------------------------------------------
 # バリデーション通過後の --filter-only 動作で正常コードの受容を確認
-actual=$(printf 'data: ok\n' | "$SCRIPT" --powwow=abc-123_XY --filter-only || true)
-run_test "#2c 正常なpowwow_codeはバリデーション通過" "$actual" 'data: ok'
+actual=$(printf 'data: ok\n' | "$SCRIPT" --channel=abc-123_XY --filter-only || true)
+run_test "#2c 正常なchannel_codeはバリデーション通過" "$actual" 'data: ok'
 
 # ---------------------------------------------------------------------------
-# #2d: --filter-only でも不正な powwow_code は exit 2（Major 2: バリデーション位置修正）
+# #2d: --filter-only でも不正な channel_code は exit 2（Major 2: バリデーション位置修正）
 #   バリデーションが --filter-only 分岐より前で実行されることを確認
 # ---------------------------------------------------------------------------
 set +e
-printf 'data: ok\n' | "$SCRIPT" --powwow="bad;evil" --filter-only 2>/dev/null
+printf 'data: ok\n' | "$SCRIPT" --channel="bad;evil" --filter-only 2>/dev/null
 actual_exit=$?
 set -e
-run_exit_test "#2d --filter-onlyでも不正なpowwow_codeはexit2" "2" "$actual_exit"
+run_exit_test "#2d --filter-onlyでも不正なchannel_codeはexit2" "2" "$actual_exit"
 
 # ---------------------------------------------------------------------------
-# #2e: --filter-only 単体（--powwow なし）はバリデーションをスキップして動作
+# #2e: --filter-only 単体（--channel なし）はバリデーションをスキップして動作
 #   stdin → data: 行のみ stdout に流す
 # ---------------------------------------------------------------------------
 actual=$(printf 'data: standalone\n' | "$SCRIPT" --filter-only || true)
-run_test "#2e --filter-only単体（--powwowなし）は動作" "$actual" 'data: standalone'
+run_test "#2e --filter-only単体（--channelなし）は動作" "$actual" 'data: standalone'
 
 # ---------------------------------------------------------------------------
 # 結果サマリ

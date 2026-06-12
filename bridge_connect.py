@@ -2,15 +2,15 @@
 """bridge-connect — SSH forced command ラッパー。
 
 authorized_keys で各鍵行に `command="bridge-connect --handle=<user>"` として
-forced command が設定される。powwow_code は forced command には焼かず、
+forced command が設定される。channel_code は forced command には焼かず、
 $SSH_ORIGINAL_COMMAND から取得する（D#2302）。
 
 分岐ロジック（D#2272, D#2302, D#2307）:
-  "bridge recv --powwow=X"                  → 受信モード（SSE購読を stdout へ中継）
-  "bridge send --powwow=X --body=Y ..."     → 送信モード（POST /send を実行）
-  "bridge create"                           → 作成モード（POST /create を実行）
-  "bridge history --powwow=X [--since=N] [--limit=N]" → 履歴取得モード（GET /history）
-  "bridge presence --powwow=X"             → 接続中handle一覧モード（GET /presence）
+  "bridge recv --channel=X"                  → 受信モード（SSE購読を stdout へ中継）
+  "bridge send --channel=X --body=Y ..."     → 送信モード（POST /send を実行）
+  "bridge create"                            → 作成モード（POST /create を実行）
+  "bridge history --channel=X [--since=N] [--limit=N]" → 履歴取得モード（GET /history）
+  "bridge presence --channel=X"             → 接続中handle一覧モード（GET /presence）
   それ以外（空含む）                         → エラー
 
 handle は必ず自身の --handle 引数からのみ取得し、$SSH_ORIGINAL_COMMAND 内の
@@ -23,7 +23,7 @@ handle 指定は無視する（handle 詐称防止、D#2285）。
     --handle=<user>   handle（authorized_keys で固定される）[必須]
     --server=<url>    サーバーベースURL（デフォルト: http://127.0.0.1:8765）
 
-クライアント側は ssh host "bridge recv --powwow=X" / "bridge send --powwow=X --body=Y" で呼び出す。
+クライアント側は ssh host "bridge recv --channel=X" / "bridge send --channel=X --body=Y" で呼び出す。
 """
 import json
 import os
@@ -82,12 +82,12 @@ def _parse_subcommand(original_cmd: str, expected_subcmd: str) -> dict | None:
 
 
 def parse_send_command(original_cmd: str) -> dict | None:
-    """"bridge send --powwow=X --body=Y [--needs-reply] [--in-reply-to=N]" をパース。"""
+    """"bridge send --channel=X --body=Y [--needs-reply] [--in-reply-to=N]" をパース。"""
     return _parse_subcommand(original_cmd, "send")
 
 
 def parse_recv_command(original_cmd: str) -> dict | None:
-    """"bridge recv --powwow=X" をパース。"""
+    """"bridge recv --channel=X" をパース。"""
     return _parse_subcommand(original_cmd, "recv")
 
 
@@ -97,12 +97,12 @@ def parse_create_command(original_cmd: str) -> dict | None:
 
 
 def parse_history_command(original_cmd: str) -> dict | None:
-    """"bridge history --powwow=X [--since=N] [--limit=N]" をパース。"""
+    """"bridge history --channel=X [--since=N] [--limit=N]" をパース。"""
     return _parse_subcommand(original_cmd, "history")
 
 
 def parse_presence_command(original_cmd: str) -> dict | None:
-    """"bridge presence --powwow=X" をパース。"""
+    """"bridge presence --channel=X" をパース。"""
     return _parse_subcommand(original_cmd, "presence")
 
 
@@ -119,13 +119,13 @@ def _parse_bool(value) -> bool:
     return bool(value)
 
 
-def mode_recv(handle: str, powwow_code: str, server: str, curl_fn=None) -> int:
+def mode_recv(handle: str, channel_code: str, server: str, curl_fn=None) -> int:
     """受信モード: SSE 購読を stdout に中継する。
 
     curl_fn は (url: str) -> int 形式。None の場合は subprocess.run(curl) を使う。
     戻り値は終了コード。
     """
-    qs = urllib.parse.urlencode({"powwow": powwow_code, "handle": handle})
+    qs = urllib.parse.urlencode({"channel": channel_code, "handle": handle})
     url = f"{server}/stream?{qs}"
 
     if curl_fn is not None:
@@ -173,9 +173,9 @@ def mode_send(
     handle は必ず自身の --handle 引数から（send_params 内の handle は無視済み）。
     curl_fn は (url: str, body: str) -> int 形式。None の場合は subprocess.run(curl) を使う。
     """
-    powwow_code = send_params.get("powwow", "")
-    if not powwow_code:
-        print("エラー: bridge send には --powwow=CODE が必要です", file=sys.stderr)
+    channel_code = send_params.get("channel", "")
+    if not channel_code:
+        print("エラー: bridge send には --channel=CODE が必要です", file=sys.stderr)
         return 1
 
     body_text = send_params.get("body", "")
@@ -191,7 +191,7 @@ def mode_send(
 
     payload = json.dumps(
         {
-            "powwow": powwow_code,
+            "channel": channel_code,
             "handle": handle,  # forced command で固定された値（D#2285）
             "body": body_text,
             "needs_reply": needs_reply,
@@ -241,12 +241,12 @@ def mode_history(
     curl_fn は (url: str) -> int 形式。None の場合は subprocess.run(curl) を使う。
     戻り値は終了コード。
     """
-    powwow_code = history_params.get("powwow", "")
-    if not powwow_code:
-        print("エラー: bridge history には --powwow=CODE が必要です", file=sys.stderr)
+    channel_code = history_params.get("channel", "")
+    if not channel_code:
+        print("エラー: bridge history には --channel=CODE が必要です", file=sys.stderr)
         return 1
 
-    qs_dict: dict = {"powwow": powwow_code}
+    qs_dict: dict = {"channel": channel_code}
     since_raw = history_params.get("since")
     if since_raw is not None:
         qs_dict["since"] = since_raw
@@ -275,12 +275,12 @@ def mode_presence(
     curl_fn は (url: str) -> int 形式。None の場合は subprocess.run(curl) を使う。
     戻り値は終了コード。
     """
-    powwow_code = presence_params.get("powwow", "")
-    if not powwow_code:
-        print("エラー: bridge presence には --powwow=CODE が必要です", file=sys.stderr)
+    channel_code = presence_params.get("channel", "")
+    if not channel_code:
+        print("エラー: bridge presence には --channel=CODE が必要です", file=sys.stderr)
         return 1
 
-    qs = urllib.parse.urlencode({"powwow": powwow_code})
+    qs = urllib.parse.urlencode({"channel": channel_code})
     url = f"{server}/presence?{qs}"
 
     if curl_fn is not None:
@@ -319,11 +319,11 @@ def run(
 
     recv_params = parse_recv_command(original_command)
     if recv_params is not None:
-        powwow_code = recv_params.get("powwow", "")
-        if not powwow_code:
-            print("エラー: bridge recv には --powwow=CODE が必要です", file=sys.stderr)
+        channel_code = recv_params.get("channel", "")
+        if not channel_code:
+            print("エラー: bridge recv には --channel=CODE が必要です", file=sys.stderr)
             return 1
-        return mode_recv(handle, powwow_code, server, curl_fn=curl_recv_fn)
+        return mode_recv(handle, channel_code, server, curl_fn=curl_recv_fn)
 
     send_params = parse_send_command(original_command)
     if send_params is not None:

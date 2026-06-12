@@ -1,5 +1,5 @@
 [project]
-name = "powwow"
+name = "relay"
 version = "0.1.0"
 description = "Claude Code間のメッセージング中継システム（履歴を持つ軽量サービス・窓口モデル）"
 requires-python = ">=3.11"

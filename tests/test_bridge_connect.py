@@ -34,8 +34,8 @@ class TestParseCreateCommand:
 
     def test_not_create_returns_none(self):
         """'bridge send' や 'bridge recv' は None を返す。"""
-        assert bc.parse_create_command("bridge send --powwow=X") is None
-        assert bc.parse_create_command("bridge recv --powwow=X") is None
+        assert bc.parse_create_command("bridge send --channel=X") is None
+        assert bc.parse_create_command("bridge recv --channel=X") is None
         assert bc.parse_create_command("") is None
         assert bc.parse_create_command("bridge") is None
 
@@ -45,33 +45,33 @@ class TestParseCreateCommand:
 # ---------------------------------------------------------------------------
 
 class TestParseHistoryCommand:
-    def test_valid_with_powwow_only(self):
-        """'bridge history --powwow=X' は {"powwow": "X"} を返す。"""
-        params = bc.parse_history_command("bridge history --powwow=abc123")
-        assert params == {"powwow": "abc123"}
+    def test_valid_with_channel_only(self):
+        """'bridge history --channel=X' は {"channel": "X"} を返す。"""
+        params = bc.parse_history_command("bridge history --channel=abc123")
+        assert params == {"channel": "abc123"}
 
     def test_valid_with_since(self):
-        """'bridge history --powwow=X --since=5' は since も含む。"""
-        params = bc.parse_history_command("bridge history --powwow=abc --since=5")
-        assert params == {"powwow": "abc", "since": "5"}
+        """'bridge history --channel=X --since=5' は since も含む。"""
+        params = bc.parse_history_command("bridge history --channel=abc --since=5")
+        assert params == {"channel": "abc", "since": "5"}
 
     def test_valid_with_since_and_limit(self):
         """since と limit を両方含む。"""
         params = bc.parse_history_command(
-            "bridge history --powwow=abc --since=5 --limit=10"
+            "bridge history --channel=abc --since=5 --limit=10"
         )
-        assert params == {"powwow": "abc", "since": "5", "limit": "10"}
+        assert params == {"channel": "abc", "since": "5", "limit": "10"}
 
     def test_handle_ignored(self):
-        """'bridge history --powwow=X --handle=evil' でも handle は除外される。"""
+        """'bridge history --channel=X --handle=evil' でも handle は除外される。"""
         params = bc.parse_history_command(
-            "bridge history --powwow=abc --handle=evil"
+            "bridge history --channel=abc --handle=evil"
         )
         assert "handle" not in params
-        assert params["powwow"] == "abc"
+        assert params["channel"] == "abc"
 
     def test_not_history_returns_none(self):
-        assert bc.parse_history_command("bridge send --powwow=X") is None
+        assert bc.parse_history_command("bridge send --channel=X") is None
         assert bc.parse_history_command("bridge create") is None
 
 
@@ -81,18 +81,18 @@ class TestParseHistoryCommand:
 
 class TestParsePresenceCommand:
     def test_valid(self):
-        """'bridge presence --powwow=X' は {"powwow": "X"} を返す。"""
-        params = bc.parse_presence_command("bridge presence --powwow=abc")
-        assert params == {"powwow": "abc"}
+        """'bridge presence --channel=X' は {"channel": "X"} を返す。"""
+        params = bc.parse_presence_command("bridge presence --channel=abc")
+        assert params == {"channel": "abc"}
 
     def test_handle_ignored(self):
         params = bc.parse_presence_command(
-            "bridge presence --powwow=abc --handle=evil"
+            "bridge presence --channel=abc --handle=evil"
         )
         assert "handle" not in params
 
     def test_not_presence_returns_none(self):
-        assert bc.parse_presence_command("bridge send --powwow=X") is None
+        assert bc.parse_presence_command("bridge send --channel=X") is None
         assert bc.parse_presence_command("") is None
 
 
@@ -175,8 +175,8 @@ class TestModeCreate:
 # ---------------------------------------------------------------------------
 
 class TestModeHistory:
-    def test_powwow_only(self):
-        """history_params に powwow のみ → /history?powwow=X を呼ぶ。"""
+    def test_channel_only(self):
+        """history_params に channel のみ → /history?channel=X を呼ぶ。"""
         received_urls = []
 
         def mock_curl(url: str) -> int:
@@ -184,7 +184,7 @@ class TestModeHistory:
             return 0
 
         result = bc.mode_history(
-            history_params={"powwow": "abc"},
+            history_params={"channel": "abc"},
             server="http://127.0.0.1:8765",
             curl_fn=mock_curl,
         )
@@ -192,7 +192,7 @@ class TestModeHistory:
         assert len(received_urls) == 1
         url = received_urls[0]
         assert url.startswith("http://127.0.0.1:8765/history?")
-        assert "powwow=abc" in url
+        assert "channel=abc" in url
         assert "since=" not in url
         assert "limit=" not in url
 
@@ -205,17 +205,17 @@ class TestModeHistory:
             return 0
 
         bc.mode_history(
-            history_params={"powwow": "abc", "since": "5", "limit": "10"},
+            history_params={"channel": "abc", "since": "5", "limit": "10"},
             server="http://127.0.0.1:8765",
             curl_fn=mock_curl,
         )
         url = received_urls[0]
-        assert "powwow=abc" in url
+        assert "channel=abc" in url
         assert "since=5" in url
         assert "limit=10" in url
 
-    def test_missing_powwow_returns_error(self):
-        """powwow なしは 1 を返す。"""
+    def test_missing_channel_returns_error(self):
+        """channel なしは 1 を返す。"""
         called = []
 
         def mock_curl(url: str) -> int:
@@ -228,7 +228,7 @@ class TestModeHistory:
             curl_fn=mock_curl,
         )
         assert result == 1
-        assert called == [], "powwow なしで curl_fn が呼ばれた"
+        assert called == [], "channel なしで curl_fn が呼ばれた"
 
 
 # ---------------------------------------------------------------------------
@@ -244,16 +244,16 @@ class TestModePresence:
             return 0
 
         result = bc.mode_presence(
-            presence_params={"powwow": "abc"},
+            presence_params={"channel": "abc"},
             server="http://127.0.0.1:8765",
             curl_fn=mock_curl,
         )
         assert result == 0
         url = received_urls[0]
         assert url.startswith("http://127.0.0.1:8765/presence?")
-        assert "powwow=abc" in url
+        assert "channel=abc" in url
 
-    def test_missing_powwow_returns_error(self):
+    def test_missing_channel_returns_error(self):
         called = []
 
         def mock_curl(url: str) -> int:
@@ -292,7 +292,7 @@ class TestRunCreateHistoryPresence:
         assert called[0].endswith("/create")
 
     def test_history_command_dispatches_to_mode_history(self):
-        """'bridge history --powwow=X' で curl_history_fn が呼ばれる。"""
+        """'bridge history --channel=X' で curl_history_fn が呼ばれる。"""
         called = []
 
         def mock_history(url: str) -> int:
@@ -301,17 +301,17 @@ class TestRunCreateHistoryPresence:
 
         result = bc.run(
             argv=["--handle=alice"],
-            original_command="bridge history --powwow=abc --since=3",
+            original_command="bridge history --channel=abc --since=3",
             curl_history_fn=mock_history,
         )
         assert result == 0
         assert len(called) == 1
         assert "/history?" in called[0]
-        assert "powwow=abc" in called[0]
+        assert "channel=abc" in called[0]
         assert "since=3" in called[0]
 
     def test_presence_command_dispatches_to_mode_presence(self):
-        """'bridge presence --powwow=X' で curl_presence_fn が呼ばれる。"""
+        """'bridge presence --channel=X' で curl_presence_fn が呼ばれる。"""
         called = []
 
         def mock_presence(url: str) -> int:
@@ -320,13 +320,13 @@ class TestRunCreateHistoryPresence:
 
         result = bc.run(
             argv=["--handle=alice"],
-            original_command="bridge presence --powwow=abc",
+            original_command="bridge presence --channel=abc",
             curl_presence_fn=mock_presence,
         )
         assert result == 0
         assert len(called) == 1
         assert "/presence?" in called[0]
-        assert "powwow=abc" in called[0]
+        assert "channel=abc" in called[0]
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +364,7 @@ class TestCurlFailFlag:
     def test_mode_history_uses_curl_fail_flag(self, monkeypatch):
         captured = self._capture_curl_args(monkeypatch)
         bc.mode_history(
-            history_params={"powwow": "abc"},
+            history_params={"channel": "abc"},
             server="http://127.0.0.1:8765",
         )
         assert len(captured) == 1
@@ -374,7 +374,7 @@ class TestCurlFailFlag:
     def test_mode_presence_uses_curl_fail_flag(self, monkeypatch):
         captured = self._capture_curl_args(monkeypatch)
         bc.mode_presence(
-            presence_params={"powwow": "abc"},
+            presence_params={"channel": "abc"},
             server="http://127.0.0.1:8765",
         )
         assert len(captured) == 1
@@ -385,7 +385,7 @@ class TestCurlFailFlag:
         captured = self._capture_curl_args(monkeypatch)
         bc.mode_send(
             handle="alice",
-            send_params={"powwow": "abc", "body": "hi"},
+            send_params={"channel": "abc", "body": "hi"},
             server="http://127.0.0.1:8765",
         )
         assert len(captured) == 1
@@ -407,7 +407,7 @@ class TestHttpErrorPropagation:
     def test_mode_create_propagates_http_error(self, monkeypatch, capsys):
         """curl が非0終了したら mode_create も非0、エラーは stderr に流れる。"""
         result_obj = self._make_failing_run(
-            stdout='{"error": "powwow が見つかりません"}',
+            stdout='{"error": "channel が見つかりません"}',
             stderr="curl: (22) HTTP/1.1 404",
         )
         monkeypatch.setattr(bc.subprocess, "run", lambda *a, **kw: result_obj)
@@ -417,50 +417,50 @@ class TestHttpErrorPropagation:
         captured = capsys.readouterr()
         # stdout か stderr いずれかにエラー情報が含まれる
         combined = captured.err
-        assert ("powwow が見つかりません" in combined) or ("404" in combined) or ("curl" in combined), \
+        assert ("channel が見つかりません" in combined) or ("404" in combined) or ("curl" in combined), \
             f"エラー情報が stderr に出ていない: stderr={captured.err!r}"
 
     def test_mode_history_propagates_http_error(self, monkeypatch, capsys):
         result_obj = self._make_failing_run(
-            stdout='{"error": "powwow が見つかりません"}',
+            stdout='{"error": "channel が見つかりません"}',
             stderr="",
         )
         monkeypatch.setattr(bc.subprocess, "run", lambda *a, **kw: result_obj)
 
         ret = bc.mode_history(
-            history_params={"powwow": "missing"},
+            history_params={"channel": "missing"},
             server="http://127.0.0.1:8765",
         )
         assert ret != 0
         captured = capsys.readouterr()
-        assert "powwow" in captured.err or "error" in captured.err.lower(), \
+        assert "channel" in captured.err or "error" in captured.err.lower(), \
             f"エラー情報が stderr にない: {captured.err!r}"
 
     def test_mode_presence_propagates_http_error(self, monkeypatch, capsys):
         result_obj = self._make_failing_run(
-            stdout='{"error": "powwow が見つかりません"}',
+            stdout='{"error": "channel が見つかりません"}',
         )
         monkeypatch.setattr(bc.subprocess, "run", lambda *a, **kw: result_obj)
 
         ret = bc.mode_presence(
-            presence_params={"powwow": "missing"},
+            presence_params={"channel": "missing"},
             server="http://127.0.0.1:8765",
         )
         assert ret != 0
         captured = capsys.readouterr()
-        assert "powwow" in captured.err or "error" in captured.err.lower()
+        assert "channel" in captured.err or "error" in captured.err.lower()
 
     def test_mode_send_propagates_http_error(self, monkeypatch, capsys):
         result_obj = self._make_failing_run(
-            stdout='{"error": "powwow が見つかりません"}',
+            stdout='{"error": "channel が見つかりません"}',
         )
         monkeypatch.setattr(bc.subprocess, "run", lambda *a, **kw: result_obj)
 
         ret = bc.mode_send(
             handle="alice",
-            send_params={"powwow": "missing", "body": "hi"},
+            send_params={"channel": "missing", "body": "hi"},
             server="http://127.0.0.1:8765",
         )
         assert ret != 0
         captured = capsys.readouterr()
-        assert "powwow" in captured.err or "error" in captured.err.lower()
+        assert "channel" in captured.err or "error" in captured.err.lower()

@@ -1,4 +1,4 @@
-"""powwow server.py テストスイート。
+"""relay server.py テストスイート。
 
 エッジケース表 #1〜#22 全項目をカバーする。
 各テストは独立した一時 DB を使い、実際に条件を突いて期待結果を assert する。
@@ -29,7 +29,7 @@ import server as srv
 @pytest.fixture()
 def db(tmp_path):
     """各テスト用の一時 SQLite DB パスを返し、スキーマを初期化する。"""
-    path = str(tmp_path / "test_powwow.db")
+    path = str(tmp_path / "test_relay.db")
     srv.init_db(path)
     return path
 
@@ -81,18 +81,18 @@ def _get(url: str) -> tuple[int, dict]:
         return e.code, json.loads(e.read())
 
 
-def _create_powwow(base_url: str) -> str:
-    """POST /create を呼び powwow_code を返す。"""
+def _create_channel(base_url: str) -> str:
+    """POST /create を呼び channel_code を返す。"""
     status, body = _post(f"{base_url}/create", {})
     assert status == 200, f"create 失敗: {body}"
-    return body["powwow_code"]
+    return body["channel_code"]
 
 
-def _send(base_url: str, powwow: str, handle: str, body_text: str,
+def _send(base_url: str, channel: str, handle: str, body_text: str,
           needs_reply: bool = False, in_reply_to=None) -> tuple[int, dict]:
     """POST /send を呼び (status, response) を返す。"""
     return _post(f"{base_url}/send", {
-        "powwow": powwow,
+        "channel": channel,
         "handle": handle,
         "body": body_text,
         "needs_reply": needs_reply,
@@ -123,7 +123,7 @@ def _open_stream(port: int, code: str, handle: str) -> socket.socket:
     """
     s = socket.create_connection(("127.0.0.1", port))
     s.sendall(
-        f"GET /stream?powwow={code}&handle={handle} HTTP/1.1\r\n"
+        f"GET /stream?channel={code}&handle={handle} HTTP/1.1\r\n"
         f"Host: 127.0.0.1\r\n\r\n".encode("utf-8")
     )
     s.settimeout(2.0)
@@ -153,7 +153,7 @@ def _read_sse_data(sock: socket.socket) -> dict:
 def test_case01_history_since_excludes_since_itself(http_server):
     """GET /history?since=N は msg_id > N のメッセージのみ返し、N 自身は含まない。"""
     base_url, _ = http_server
-    code = _create_powwow(base_url)
+    code = _create_channel(base_url)
 
     status1, r1 = _send(base_url, code, "alice", "msg-1")
     assert status1 == 200
@@ -164,7 +164,7 @@ def test_case01_history_since_excludes_since_itself(http_server):
     msg_id_2 = r2["msg_id"]
 
     # since=msg_id_1 → msg_id > msg_id_1 のみ（msg_id_1 自身は含まない）
-    status, resp = _get(f"{base_url}/history?powwow={code}&since={msg_id_1}")
+    status, resp = _get(f"{base_url}/history?channel={code}&since={msg_id_1}")
     assert status == 200
     ids = [m["msg_id"] for m in resp["messages"]]
     assert msg_id_1 not in ids, "since 自身が含まれている"
@@ -176,14 +176,14 @@ def test_case01_history_since_excludes_since_itself(http_server):
 # ---------------------------------------------------------------------------
 
 def test_case02_history_no_since_returns_all(http_server):
-    """GET /history（since 未指定）は当該 powwow の全メッセージを返す。"""
+    """GET /history（since 未指定）は当該 channel の全メッセージを返す。"""
     base_url, _ = http_server
-    code = _create_powwow(base_url)
+    code = _create_channel(base_url)
 
     for i in range(3):
         _send(base_url, code, "alice", f"msg-{i}")
 
-    status, resp = _get(f"{base_url}/history?powwow={code}")
+    status, resp = _get(f"{base_url}/history?channel={code}")
     assert status == 200
     assert len(resp["messages"]) == 3
 
@@ -195,10 +195,10 @@ def test_case02_history_no_since_returns_all(http_server):
 def test_case03_history_message_has_all_six_fields(http_server):
     """history の各メッセージは msg_id/handle/body/needs_reply/in_reply_to/created_at の6フィールドを含む。"""
     base_url, _ = http_server
-    code = _create_powwow(base_url)
+    code = _create_channel(base_url)
     _send(base_url, code, "alice", "hello")
 
-    status, resp = _get(f"{base_url}/history?powwow={code}")
+    status, resp = _get(f"{base_url}/history?channel={code}")
     assert status == 200
     assert len(resp["messages"]) == 1
     msg = resp["messages"][0]
@@ -212,7 +212,7 @@ def test_case03_history_message_has_all_six_fields(http_server):
 
 def test_case04_msg_id_monotonically_increases(db):
     """連続して保存した2メッセージは msg_id が後者 > 前者（単調増加）。"""
-    code = srv.create_powwow(db)
+    code = srv.create_channel(db)
     m1 = srv.save_message(code, "alice", "first", False, None, db)
     m2 = srv.save_message(code, "alice", "second", False, None, db)
     assert m2["msg_id"] > m1["msg_id"], "msg_id が単調増加していない"
@@ -225,7 +225,7 @@ def test_case04_msg_id_monotonically_increases(db):
 def test_case05_send_without_in_reply_to_is_accepted(http_server):
     """POST /send で in_reply_to=null（info/request）は常に200で受理・保存される。"""
     base_url, _ = http_server
-    code = _create_powwow(base_url)
+    code = _create_channel(base_url)
     status, resp = _send(base_url, code, "alice", "info message", needs_reply=False, in_reply_to=None)
     assert status == 200
     assert "msg_id" in resp
@@ -236,9 +236,9 @@ def test_case05_send_without_in_reply_to_is_accepted(http_server):
 # ---------------------------------------------------------------------------
 
 def test_case06_send_with_valid_in_reply_to_is_accepted(http_server):
-    """POST /send で in_reply_to が同一 powwow 内の有効な msg_id なら200で受理し、その値を保存する。"""
+    """POST /send で in_reply_to が同一 channel 内の有効な msg_id なら200で受理し、その値を保存する。"""
     base_url, _ = http_server
-    code = _create_powwow(base_url)
+    code = _create_channel(base_url)
 
     status1, r1 = _send(base_url, code, "alice", "original")
     assert status1 == 200
@@ -248,7 +248,7 @@ def test_case06_send_with_valid_in_reply_to_is_accepted(http_server):
     assert status2 == 200, f"有効な in_reply_to で失敗: {r2}"
 
     # history で in_reply_to が保存されていることを確認
-    _, hist = _get(f"{base_url}/history?powwow={code}")
+    _, hist = _get(f"{base_url}/history?channel={code}")
     reply_msg = next(m for m in hist["messages"] if m["msg_id"] == r2["msg_id"])
     assert reply_msg["in_reply_to"] == parent_id
 
@@ -258,15 +258,15 @@ def test_case06_send_with_valid_in_reply_to_is_accepted(http_server):
 # ---------------------------------------------------------------------------
 
 def test_case07_send_with_invalid_in_reply_to_returns_400(http_server):
-    """POST /send で in_reply_to が同一 powwow 内に存在しない msg_id なら400を返し、メッセージを保存しない。"""
+    """POST /send で in_reply_to が同一 channel 内に存在しない msg_id なら400を返し、メッセージを保存しない。"""
     base_url, _ = http_server
-    code = _create_powwow(base_url)
+    code = _create_channel(base_url)
 
     status, resp = _send(base_url, code, "alice", "bad reply", in_reply_to=99999)
     assert status == 400, f"無効な in_reply_to で400以外: {status}"
 
     # メッセージが保存されていないことを確認
-    _, hist = _get(f"{base_url}/history?powwow={code}")
+    _, hist = _get(f"{base_url}/history?channel={code}")
     assert len(hist["messages"]) == 0, "無効な in_reply_to でメッセージが保存された"
 
 
@@ -275,12 +275,12 @@ def test_case07_send_with_invalid_in_reply_to_returns_400(http_server):
 # ---------------------------------------------------------------------------
 
 def test_case08_send_updates_last_activity_at(db):
-    """POST /send 成功時、当該 powwow の last_activity_at が送信時刻に更新される。"""
-    code = srv.create_powwow(db)
+    """POST /send 成功時、当該 channel の last_activity_at が送信時刻に更新される。"""
+    code = srv.create_channel(db)
 
     conn = sqlite3.connect(db)
     before = conn.execute(
-        "SELECT last_activity_at FROM powwows WHERE powwow_code = ?", (code,)
+        "SELECT last_activity_at FROM channels WHERE channel_code = ?", (code,)
     ).fetchone()[0]
     conn.close()
 
@@ -290,7 +290,7 @@ def test_case08_send_updates_last_activity_at(db):
 
     conn = sqlite3.connect(db)
     after = conn.execute(
-        "SELECT last_activity_at FROM powwows WHERE powwow_code = ?", (code,)
+        "SELECT last_activity_at FROM channels WHERE channel_code = ?", (code,)
     ).fetchone()[0]
     conn.close()
 
@@ -302,14 +302,14 @@ def test_case08_send_updates_last_activity_at(db):
 # ---------------------------------------------------------------------------
 
 def test_case09_send_broadcasts_to_all_subscribers(http_server):
-    """POST /send は当該 powwow の全 SSE 購読者にメッセージを配信する（ブロードキャスト）。
+    """POST /send は当該 channel の全 SSE 購読者にメッセージを配信する（ブロードキャスト）。
 
     /send（HTTP 経由）で実装の save→broadcast 結線を一括テストする。
     送信内容（body・handle・msg_id）が SSE data 行の JSON に一致することを
     各購読者ごとに突き合わせて検証する（件数だけでなく中身の同一性も検証）。
     """
     base_url, _ = http_server
-    code = _create_powwow(base_url)
+    code = _create_channel(base_url)
     port = _port_of(base_url)
 
     # 別 handle の2購読者を接続（送信者除外に巻き込まれないよう sender とは別 handle）
@@ -347,7 +347,7 @@ def test_case09_send_broadcasts_to_all_subscribers(http_server):
 
 def test_case10_stream_handle_appears_in_presence(db):
     """GET /stream 接続中の handle は GET /presence に現れる。"""
-    code = srv.create_powwow(db)
+    code = srv.create_channel(db)
     q1: queue.Queue = queue.Queue()
     with srv._sub_lock:
         srv._subscribers[code] = [("alice", q1)]
@@ -371,7 +371,7 @@ def test_case11_broken_pipe_removes_subscriber(http_server):
     のみが除外を行う構造にする。
     """
     base_url, _ = http_server
-    code = _create_powwow(base_url)
+    code = _create_channel(base_url)
     port = _port_of(base_url)
 
     # SSE 接続して presence に "dying_subscriber" を載せる
@@ -405,29 +405,29 @@ def test_case11_broken_pipe_removes_subscriber(http_server):
 
 
 # ---------------------------------------------------------------------------
-# エッジケース #12: POST /create は呼ぶたびに一意な powwow_code を発行する
+# エッジケース #12: POST /create は呼ぶたびに一意な channel_code を発行する
 # ---------------------------------------------------------------------------
 
 def test_case12_create_returns_unique_codes(db):
-    """POST /create は呼ぶたびに一意な powwow_code を発行する。"""
-    codes = [srv.create_powwow(db) for _ in range(20)]
-    assert len(set(codes)) == len(codes), "powwow_code に重複が発生した"
+    """POST /create は呼ぶたびに一意な channel_code を発行する。"""
+    codes = [srv.create_channel(db) for _ in range(20)]
+    assert len(set(codes)) == len(codes), "channel_code に重複が発生した"
 
 
 # ---------------------------------------------------------------------------
-# エッジケース #13: last_activity_at が1年超過した powwow はアイドル削除される（境界テスト）
+# エッジケース #13: last_activity_at が1年超過した channel はアイドル削除される（境界テスト）
 # ---------------------------------------------------------------------------
 
-def test_case13_idle_cleanup_deletes_expired_powwow(db):
-    """last_activity_at が現在から1年超過した powwow は、アイドル削除でpowwow行とそのmessages全行が消える。"""
-    code = srv.create_powwow(db)
+def test_case13_idle_cleanup_deletes_expired_channel(db):
+    """last_activity_at が現在から1年超過した channel は、アイドル削除でchannel行とそのmessages全行が消える。"""
+    code = srv.create_channel(db)
     srv.save_message(code, "alice", "old msg", False, None, db)
 
     # last_activity_at を1年以上前に書き換え
     past = (datetime.now(timezone.utc) - timedelta(days=366)).isoformat()
     conn = sqlite3.connect(db)
     conn.execute(
-        "UPDATE powwows SET last_activity_at = ? WHERE powwow_code = ?",
+        "UPDATE channels SET last_activity_at = ? WHERE channel_code = ?",
         (past, code),
     )
     conn.commit()
@@ -436,47 +436,47 @@ def test_case13_idle_cleanup_deletes_expired_powwow(db):
     deleted = srv.run_idle_cleanup(db)
     assert deleted == 1, f"削除件数が1ではない: {deleted}"
 
-    # powwow 行が消えていることを確認
+    # channel 行が消えていることを確認
     conn = sqlite3.connect(db)
     row = conn.execute(
-        "SELECT 1 FROM powwows WHERE powwow_code = ?", (code,)
+        "SELECT 1 FROM channels WHERE channel_code = ?", (code,)
     ).fetchone()
     msg_row = conn.execute(
-        "SELECT 1 FROM messages WHERE powwow_code = ?", (code,)
+        "SELECT 1 FROM messages WHERE channel_code = ?", (code,)
     ).fetchone()
     conn.close()
 
-    assert row is None, "powwow 行が削除されていない"
+    assert row is None, "channel 行が削除されていない"
     assert msg_row is None, "messages 行が削除されていない"
 
 
 # ---------------------------------------------------------------------------
-# エッジケース #14: last_activity_at が1年未満の powwow は削除されない（境界テスト）
+# エッジケース #14: last_activity_at が1年未満の channel は削除されない（境界テスト）
 # ---------------------------------------------------------------------------
 
-def test_case14_idle_cleanup_does_not_delete_recent_powwow(db):
-    """last_activity_at が現在から1年未満（境界: 1年ちょうど直前）の powwow は削除されない。"""
-    code = srv.create_powwow(db)
+def test_case14_idle_cleanup_does_not_delete_recent_channel(db):
+    """last_activity_at が現在から1年未満（境界: 1年ちょうど直前）の channel は削除されない。"""
+    code = srv.create_channel(db)
 
     # last_activity_at を364日前（1年未満）に書き換え
     recent = (datetime.now(timezone.utc) - timedelta(days=364)).isoformat()
     conn = sqlite3.connect(db)
     conn.execute(
-        "UPDATE powwows SET last_activity_at = ? WHERE powwow_code = ?",
+        "UPDATE channels SET last_activity_at = ? WHERE channel_code = ?",
         (recent, code),
     )
     conn.commit()
     conn.close()
 
     deleted = srv.run_idle_cleanup(db)
-    assert deleted == 0, "1年未満の powwow が削除された"
+    assert deleted == 0, "1年未満の channel が削除された"
 
     conn = sqlite3.connect(db)
     row = conn.execute(
-        "SELECT 1 FROM powwows WHERE powwow_code = ?", (code,)
+        "SELECT 1 FROM channels WHERE channel_code = ?", (code,)
     ).fetchone()
     conn.close()
-    assert row is not None, "1年未満の powwow 行が消えている"
+    assert row is not None, "1年未満の channel 行が消えている"
 
 
 # ---------------------------------------------------------------------------
@@ -493,11 +493,11 @@ def test_case15_server_binds_to_localhost(http_server):
 
 
 # ---------------------------------------------------------------------------
-# エッジケース #16: 存在しない powwow_code への send/history/stream は404を返す
+# エッジケース #16: 存在しない channel_code への send/history/stream は404を返す
 # ---------------------------------------------------------------------------
 
-def test_case16_nonexistent_powwow_returns_404(http_server):
-    """存在しない powwow_code への send/history/stream は404を返す。"""
+def test_case16_nonexistent_channel_returns_404(http_server):
+    """存在しない channel_code への send/history/stream は404を返す。"""
     base_url, _ = http_server
     nonexistent = "no-such-code"
 
@@ -506,15 +506,15 @@ def test_case16_nonexistent_powwow_returns_404(http_server):
     assert status == 404, f"/send が404以外: {status}"
 
     # /history
-    status, _ = _get(f"{base_url}/history?powwow={nonexistent}")
+    status, _ = _get(f"{base_url}/history?channel={nonexistent}")
     assert status == 404, f"/history が404以外: {status}"
 
     # /presence
-    status, _ = _get(f"{base_url}/presence?powwow={nonexistent}")
+    status, _ = _get(f"{base_url}/presence?channel={nonexistent}")
     assert status == 404, f"/presence が404以外: {status}"
 
-    # /stream（存在しない powwow は SSE を張る前に404を返す）
-    status, _ = _get(f"{base_url}/stream?powwow={nonexistent}&handle=alice")
+    # /stream（存在しない channel は SSE を張る前に404を返す）
+    status, _ = _get(f"{base_url}/stream?channel={nonexistent}&handle=alice")
     assert status == 404, f"/stream が404以外: {status}"
 
 
@@ -524,7 +524,7 @@ def test_case16_nonexistent_powwow_returns_404(http_server):
 
 def test_case17_sender_handle_excluded_from_broadcast(db):
     """送信者と同一 handle の SSE 購読者は、その送信者の送信メッセージをブロードキャストで受け取らない（サーバー側でskip）。"""
-    code = srv.create_powwow(db)
+    code = srv.create_channel(db)
 
     sender_q: queue.Queue = queue.Queue()
     other_q: queue.Queue = queue.Queue()
@@ -551,7 +551,7 @@ def test_case17_sender_handle_excluded_from_broadcast(db):
 def test_case18_needs_reply_stored_and_returned_correctly(http_server):
     """POST /send で needs_reply=true/false がそのまま保存され、history でその値が返る（true/false両方を検証）。"""
     base_url, _ = http_server
-    code = _create_powwow(base_url)
+    code = _create_channel(base_url)
 
     # needs_reply=True
     status, r1 = _send(base_url, code, "alice", "need reply", needs_reply=True)
@@ -560,7 +560,7 @@ def test_case18_needs_reply_stored_and_returned_correctly(http_server):
     status, r2 = _send(base_url, code, "alice", "no reply needed", needs_reply=False)
     assert status == 200
 
-    _, hist = _get(f"{base_url}/history?powwow={code}")
+    _, hist = _get(f"{base_url}/history?channel={code}")
     msgs = {m["msg_id"]: m for m in hist["messages"]}
 
     assert msgs[r1["msg_id"]]["needs_reply"] is True, "needs_reply=True が正しく保存されていない"
@@ -574,20 +574,20 @@ def test_case18_needs_reply_stored_and_returned_correctly(http_server):
 def test_case19_history_limit_restricts_results(http_server):
     """GET /history?limit=N は最大N件に制限して返す（since と併用可）。"""
     base_url, _ = http_server
-    code = _create_powwow(base_url)
+    code = _create_channel(base_url)
 
     for i in range(5):
         _send(base_url, code, "alice", f"msg-{i}")
 
     # limit=3 で3件のみ
-    status, resp = _get(f"{base_url}/history?powwow={code}&limit=3")
+    status, resp = _get(f"{base_url}/history?channel={code}&limit=3")
     assert status == 200
     assert len(resp["messages"]) == 3, f"limit=3 なのに {len(resp['messages'])} 件返った"
 
     # since と併用: since=msg_id[1] かつ limit=2
     all_ids = [m["msg_id"] for m in resp["messages"]]
     since_id = all_ids[0]
-    status2, resp2 = _get(f"{base_url}/history?powwow={code}&since={since_id}&limit=2")
+    status2, resp2 = _get(f"{base_url}/history?channel={code}&since={since_id}&limit=2")
     assert status2 == 200
     assert len(resp2["messages"]) <= 2, "since+limit の組合せで件数超過"
     for m in resp2["messages"]:
@@ -601,7 +601,7 @@ def test_case19_history_limit_restricts_results(http_server):
 def test_case20_arbitrary_handle_is_accepted(http_server):
     """server.py はクエリで渡された任意の handle をそのまま受理する（真正性を検証しない）。"""
     base_url, _ = http_server
-    code = _create_powwow(base_url)
+    code = _create_channel(base_url)
 
     # 普通のユーザー名
     status1, _ = _send(base_url, code, "alice", "hi")
@@ -612,7 +612,7 @@ def test_case20_arbitrary_handle_is_accepted(http_server):
     assert status2 == 200
 
     # history で handle がそのまま保存されていることを確認
-    _, hist = _get(f"{base_url}/history?powwow={code}")
+    _, hist = _get(f"{base_url}/history?channel={code}")
     handles = [m["handle"] for m in hist["messages"]]
     assert "alice" in handles
     assert "handle-with-dashes_and.dots" in handles
@@ -624,16 +624,16 @@ def test_case20_arbitrary_handle_is_accepted(http_server):
 
 def test_case21_create_initializes_last_activity_at_equal_to_created_at(db):
     """POST /create 時、last_activity_at が created_at と同値で初期化される。"""
-    code = srv.create_powwow(db)
+    code = srv.create_channel(db)
 
     conn = sqlite3.connect(db)
     row = conn.execute(
-        "SELECT created_at, last_activity_at FROM powwows WHERE powwow_code = ?",
+        "SELECT created_at, last_activity_at FROM channels WHERE channel_code = ?",
         (code,),
     ).fetchone()
     conn.close()
 
-    assert row is not None, "powwow が作成されていない"
+    assert row is not None, "channel が作成されていない"
     created_at, last_activity_at = row
     assert created_at == last_activity_at, (
         f"created_at={created_at} と last_activity_at={last_activity_at} が一致しない"
@@ -641,14 +641,14 @@ def test_case21_create_initializes_last_activity_at_equal_to_created_at(db):
 
 
 # ---------------------------------------------------------------------------
-# エッジケース #22: powwow_code は UNIQUE 制約があり衝突時リトライで一意発行される
+# エッジケース #22: channel_code は UNIQUE 制約があり衝突時リトライで一意発行される
 # ---------------------------------------------------------------------------
 
-def test_case22_powwow_code_unique_constraint_and_retry(db, monkeypatch):
-    """powwow_code は UNIQUE 制約があり、衝突時リトライで一意発行される。
+def test_case22_channel_code_unique_constraint_and_retry(db, monkeypatch):
+    """channel_code は UNIQUE 制約があり、衝突時リトライで一意発行される。
 
     `secrets.token_urlsafe` を monkeypatch で「最初の2回は同じ値、3回目は別値」
-    に差し替え、create_powwow が:
+    に差し替え、create_channel が:
       1. 1回目で "COLLIDE" を発行（成功）
       2. 2回目で "COLLIDE" を再発行 → INSERT で IntegrityError →
          `except sqlite3.IntegrityError: continue` 経路に入る
@@ -667,12 +667,12 @@ def test_case22_powwow_code_unique_constraint_and_retry(db, monkeypatch):
     monkeypatch.setattr(srv.secrets, "token_urlsafe", fake_token_urlsafe)
 
     # 1回目: "COLLIDE" が発行される
-    code1 = srv.create_powwow(db)
+    code1 = srv.create_channel(db)
     assert code1 == "COLLIDE", f"1回目の発行値が想定外: {code1}"
     assert call_count["n"] == 1, "1回目は1回呼び出しで成功すべき"
 
     # 2回目: "COLLIDE" を再試行 → IntegrityError → リトライ → "UNIQUE-2"
-    code2 = srv.create_powwow(db)
+    code2 = srv.create_channel(db)
     assert code2 == "UNIQUE-2", f"リトライ後の発行値が想定外: {code2}"
     assert call_count["n"] == 3, (
         "2回目は token_urlsafe が2回呼ばれる（衝突→リトライ）はず: "
@@ -683,7 +683,7 @@ def test_case22_powwow_code_unique_constraint_and_retry(db, monkeypatch):
     conn = sqlite3.connect(db)
     rows = {
         r[0]
-        for r in conn.execute("SELECT powwow_code FROM powwows").fetchall()
+        for r in conn.execute("SELECT channel_code FROM channels").fetchall()
     }
     conn.close()
     assert rows == {"COLLIDE", "UNIQUE-2"}, f"DB に保存された code が想定外: {rows}"

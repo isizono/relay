@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""powwow MCPサーバー。
+"""relay MCPサーバー。
 
 Claude Code 向けの MCP (Model Context Protocol) サーバー。
-bridge-connect 越しに SSH forced command 経由で powwow サーバーと通信する（D#2272）。
+bridge-connect 越しに SSH forced command 経由で relay サーバーと通信する（D#2272）。
 
-POWWOW_SSH_HOST 環境変数で接続先ホストを指定する（デフォルト: "powwow"）。
-実運用では ~/.ssh/config に `Host powwow` エイリアスを定義する想定。
+RELAY_SSH_HOST 環境変数で接続先ホストを指定する（デフォルト: "relay"）。
+実運用では ~/.ssh/config に `Host relay` エイリアスを定義する想定。
 
 ControlMaster オプション (-o ControlMaster=auto -o ControlPath=... -o ControlPersist=600) を
 全 SSH 呼び出しに付与し、接続多重化でコストを軽減する（D#2272）。
 
 ツール一覧:
-  CreatePowwow()                                → {"powwow_code": str}
-  SendMessage(powwow_code, body, needs_reply, in_reply_to) → {"msg_id": int}
-  GetHistory(powwow_code, since, limit)         → {"messages": [...]}
-  GetPresence(powwow_code)                      → {"handles": [...]}
+  CreateChannel()                                → {"channel_code": str}
+  SendMessage(channel_code, body, needs_reply, in_reply_to) → {"msg_id": int}
+  GetHistory(channel_code, since, limit)         → {"messages": [...]}
+  GetPresence(channel_code)                      → {"handles": [...]}
 """
 import json
 import os
@@ -24,16 +24,16 @@ import tempfile
 
 from mcp.server.fastmcp import FastMCP
 
-HOST = os.environ.get("POWWOW_SSH_HOST", "powwow")
+HOST = os.environ.get("RELAY_SSH_HOST", "relay")
 
-_ctl_path = os.path.join(tempfile.gettempdir(), "powwow_ssh_ctl_%h_%p_%r")
+_ctl_path = os.path.join(tempfile.gettempdir(), "relay_ssh_ctl_%h_%p_%r")
 control_master_opts = [
     "-o", "ControlMaster=auto",
     "-o", f"ControlPath={_ctl_path}",
     "-o", "ControlPersist=600",
 ]
 
-mcp = FastMCP("powwow")
+mcp = FastMCP("relay")
 
 
 def _bridge(subcmd: str, **kwargs) -> str:
@@ -61,19 +61,19 @@ def _bridge(subcmd: str, **kwargs) -> str:
 
 
 @mcp.tool()
-def CreatePowwow() -> dict:
-    """新しい powwow を作成し、接続コードを返す。
+def CreateChannel() -> dict:
+    """新しい channel を作成し、接続コードを返す。
 
-    戻り値: {"powwow_code": str}
+    戻り値: {"channel_code": str}
     """
     output = _bridge("create")
     data = json.loads(output)
-    return {"powwow_code": data["powwow_code"]}
+    return {"channel_code": data["channel_code"]}
 
 
 @mcp.tool()
 def SendMessage(
-    powwow_code: str,
+    channel_code: str,
     body: str,
     needs_reply: bool = False,
     in_reply_to: int | None = None,
@@ -83,7 +83,7 @@ def SendMessage(
     戻り値: {"msg_id": int}
     """
     kwargs: dict = {
-        "powwow": powwow_code,
+        "channel": channel_code,
         "body": body,
         "needs_reply": str(needs_reply).lower(),
     }
@@ -96,7 +96,7 @@ def SendMessage(
 
 @mcp.tool()
 def GetHistory(
-    powwow_code: str,
+    channel_code: str,
     since: int | None = None,
     limit: int | None = None,
 ) -> dict:
@@ -105,7 +105,7 @@ def GetHistory(
     since 指定時は msg_id > since のメッセージのみ返す。
     戻り値: {"messages": [...]}
     """
-    kwargs: dict = {"powwow": powwow_code}
+    kwargs: dict = {"channel": channel_code}
     if since is not None:
         kwargs["since"] = since
     if limit is not None:
@@ -116,12 +116,12 @@ def GetHistory(
 
 
 @mcp.tool()
-def GetPresence(powwow_code: str) -> dict:
+def GetPresence(channel_code: str) -> dict:
     """現在接続中の handle 一覧を取得する。
 
     戻り値: {"handles": [...]}
     """
-    output = _bridge("presence", powwow=powwow_code)
+    output = _bridge("presence", channel=channel_code)
     data = json.loads(output)
     return {"handles": data["handles"]}
 

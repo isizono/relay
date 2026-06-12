@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""powwow 中継サーバー（SQLite永続化版）。
+"""relay 中継サーバー（SQLite永続化版）。
 
 エンドポイント:
-- POST /create                               : powwow_code 発行
-- GET  /stream?powwow=CODE&handle=NAME       : SSE購読（接続=presence登録）
-- POST /send                                 : メッセージ保存 + 全購読者へブロードキャスト
-- GET  /history?powwow=CODE[&since=N][&limit=N] : 履歴取得
-- GET  /presence?powwow=CODE                 : 現在の接続中handle一覧
+- POST /create                                   : channel_code 発行
+- GET  /stream?channel=CODE&handle=NAME          : SSE購読（接続=presence登録）
+- POST /send                                     : メッセージ保存 + 全購読者へブロードキャスト
+- GET  /history?channel=CODE[&since=N][&limit=N] : 履歴取得
+- GET  /presence?channel=CODE                    : 現在の接続中handle一覧
 
 メッセージ順序の真実源は ``msg_id`` (AUTOINCREMENT で単調増加)。SSE broadcast の
 到達順は厳密に保証しない（受信側は GetHistory + msg_id で冪等突合する設計）。
@@ -25,9 +25,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 PORT = 8765
-DB_PATH = "powwow.db"
+DB_PATH = "relay.db"
 
-# powwow_code → list of (handle, queue.Queue)
+# channel_code → list of (handle, queue.Queue)
 # presence も兼用: 接続中の handle はこのリストに現れる
 _subscribers: dict[str, list[tuple[str, queue.Queue]]] = {}
 _sub_lock = threading.Lock()
@@ -49,7 +49,7 @@ def _db_connect(db_path: str = DB_PATH) -> sqlite3.Connection:
 
     ThreadingHTTPServer 配下で複数スレッドが同時に書き込むため、WAL モードと
     busy_timeout を設定して ``sqlite3.OperationalError: database is locked`` を
-    回避する。複数 Claude が同一 powwow に同時 send するのがこのシステムの常態で
+    回避する。複数 Claude が同一 channel に同時 send するのがこのシステムの常態で
     あり、並行書き込みは想定内のため（D#2285 でハンドルは非検証＝アクセスは
     bridge-connect 経由に限られるが、同時アクセス自体は起こりうる）。
     """
@@ -65,19 +65,19 @@ def init_db(db_path: str = DB_PATH) -> None:
     conn = _db_connect(db_path)
     try:
         conn.executescript("""
-            CREATE TABLE IF NOT EXISTS powwows (
-                powwow_code      TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS channels (
+                channel_code     TEXT PRIMARY KEY,
                 created_at       TEXT NOT NULL,
                 last_activity_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS messages (
-                msg_id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                powwow_code TEXT NOT NULL REFERENCES powwows(powwow_code),
-                handle      TEXT NOT NULL,
-                body        TEXT NOT NULL,
-                needs_reply INTEGER NOT NULL,
-                in_reply_to INTEGER,
-                created_at  TEXT NOT NULL
+                msg_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_code TEXT NOT NULL REFERENCES channels(channel_code),
+                handle       TEXT NOT NULL,
+                body         TEXT NOT NULL,
+                needs_reply  INTEGER NOT NULL,
+                in_reply_to  INTEGER,
+                created_at   TEXT NOT NULL
             );
         """)
         conn.commit()
@@ -91,11 +91,11 @@ def _now_iso() -> str:
 
 
 # ---------------------------------------------------------------------------
-# powwow CRUD
+# channel CRUD
 # ---------------------------------------------------------------------------
 
-def create_powwow(db_path: str = DB_PATH) -> str:
-    """powwow を作成し powwow_code を返す。衝突時はリトライ（D#2287）。"""
+def create_channel(db_path: str = DB_PATH) -> str:
+    """channel を作成し channel_code を返す。衝突時はリトライ（D#2287）。"""
     conn = _db_connect(db_path)
     try:
         for _ in range(10):
@@ -103,7 +103,7 @@ def create_powwow(db_path: str = DB_PATH) -> str:
             now = _now_iso()
             try:
                 conn.execute(
-                    "INSERT INTO powwows (powwow_code, created_at, last_activity_at) VALUES (?, ?, ?)",
+                    "INSERT INTO channels (channel_code, created_at, last_activity_at) VALUES (?, ?, ?)",
                     (code, now, now),
                 )
                 conn.commit()
@@ -111,28 +111,28 @@ def create_powwow(db_path: str = DB_PATH) -> str:
             except sqlite3.IntegrityError:
                 # UNIQUE 制約違反 → リトライ
                 continue
-        raise RuntimeError("powwow_code 発行に10回失敗しました")
+        raise RuntimeError("channel_code 発行に10回失敗しました")
     finally:
         conn.close()
 
 
-def powwow_exists(powwow_code: str, db_path: str = DB_PATH) -> bool:
-    """powwow_code が DB に存在するか確認する。"""
+def channel_exists(channel_code: str, db_path: str = DB_PATH) -> bool:
+    """channel_code が DB に存在するか確認する。"""
     conn = _db_connect(db_path)
     try:
         row = conn.execute(
-            "SELECT 1 FROM powwows WHERE powwow_code = ?", (powwow_code,)
+            "SELECT 1 FROM channels WHERE channel_code = ?", (channel_code,)
         ).fetchone()
         return row is not None
     finally:
         conn.close()
 
 
-def _update_last_activity(powwow_code: str, ts: str, conn: sqlite3.Connection) -> None:
+def _update_last_activity(channel_code: str, ts: str, conn: sqlite3.Connection) -> None:
     """last_activity_at を更新する（既存の conn を再利用）。"""
     conn.execute(
-        "UPDATE powwows SET last_activity_at = ? WHERE powwow_code = ?",
-        (ts, powwow_code),
+        "UPDATE channels SET last_activity_at = ? WHERE channel_code = ?",
+        (ts, channel_code),
     )
 
 
@@ -141,7 +141,7 @@ def _update_last_activity(powwow_code: str, ts: str, conn: sqlite3.Connection) -
 # ---------------------------------------------------------------------------
 
 def save_message(
-    powwow_code: str,
+    channel_code: str,
     handle: str,
     body: str,
     needs_reply: bool,
@@ -150,31 +150,31 @@ def save_message(
 ) -> dict:
     """メッセージを保存し、保存されたメッセージ dict を返す。
 
-    in_reply_to が同一 powwow 内に存在しない msg_id の場合は ValueError を送出する。
+    in_reply_to が同一 channel 内に存在しない msg_id の場合は ValueError を送出する。
     """
     conn = _db_connect(db_path)
     try:
         # in_reply_to バリデーション
         if in_reply_to is not None:
             row = conn.execute(
-                "SELECT 1 FROM messages WHERE msg_id = ? AND powwow_code = ?",
-                (in_reply_to, powwow_code),
+                "SELECT 1 FROM messages WHERE msg_id = ? AND channel_code = ?",
+                (in_reply_to, channel_code),
             ).fetchone()
             if row is None:
-                raise ValueError(f"in_reply_to={in_reply_to} は powwow={powwow_code} 内に存在しません")
+                raise ValueError(f"in_reply_to={in_reply_to} は channel={channel_code} 内に存在しません")
 
         now = _now_iso()
         cur = conn.execute(
-            "INSERT INTO messages (powwow_code, handle, body, needs_reply, in_reply_to, created_at)"
+            "INSERT INTO messages (channel_code, handle, body, needs_reply, in_reply_to, created_at)"
             " VALUES (?, ?, ?, ?, ?, ?)",
-            (powwow_code, handle, body, 1 if needs_reply else 0, in_reply_to, now),
+            (channel_code, handle, body, 1 if needs_reply else 0, in_reply_to, now),
         )
         msg_id = cur.lastrowid
-        _update_last_activity(powwow_code, now, conn)
+        _update_last_activity(channel_code, now, conn)
         conn.commit()
         return {
             "msg_id": msg_id,
-            "powwow_code": powwow_code,
+            "channel_code": channel_code,
             "handle": handle,
             "body": body,
             "needs_reply": needs_reply,
@@ -186,7 +186,7 @@ def save_message(
 
 
 def get_history(
-    powwow_code: str,
+    channel_code: str,
     since: int | None = None,
     limit: int | None = None,
     db_path: str = DB_PATH,
@@ -202,10 +202,10 @@ def get_history(
         sql = (
             "SELECT msg_id, handle, body, needs_reply, in_reply_to, created_at"
             " FROM messages"
-            " WHERE powwow_code = ? AND msg_id > ?"
+            " WHERE channel_code = ? AND msg_id > ?"
             " ORDER BY msg_id"
         )
-        params: list = [powwow_code, since_val]
+        params: list = [channel_code, since_val]
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)
@@ -230,23 +230,23 @@ def get_history(
 # ---------------------------------------------------------------------------
 
 def run_idle_cleanup(db_path: str = DB_PATH) -> int:
-    """last_activity_at が現在から1年超過した powwow を削除する。
+    """last_activity_at が現在から1年超過した channel を削除する。
 
-    削除件数（powwow 数）を返す。
+    削除件数（channel 数）を返す。
     """
     conn = _db_connect(db_path)
     try:
         cutoff = datetime.now(timezone.utc).timestamp() - IDLE_SECONDS
         cutoff_iso = datetime.fromtimestamp(cutoff, timezone.utc).isoformat()
-        # 削除対象の powwow_code を取得
+        # 削除対象の channel_code を取得
         rows = conn.execute(
-            "SELECT powwow_code FROM powwows WHERE last_activity_at < ?",
+            "SELECT channel_code FROM channels WHERE last_activity_at < ?",
             (cutoff_iso,),
         ).fetchall()
-        codes = [r["powwow_code"] for r in rows]
+        codes = [r["channel_code"] for r in rows]
         for code in codes:
-            conn.execute("DELETE FROM messages WHERE powwow_code = ?", (code,))
-            conn.execute("DELETE FROM powwows WHERE powwow_code = ?", (code,))
+            conn.execute("DELETE FROM messages WHERE channel_code = ?", (code,))
+            conn.execute("DELETE FROM channels WHERE channel_code = ?", (code,))
         conn.commit()
         return len(codes)
     finally:
@@ -278,10 +278,10 @@ def stop_idle_job() -> None:
 # presence / ブロードキャスト
 # ---------------------------------------------------------------------------
 
-def get_presence(powwow_code: str) -> list[str]:
+def get_presence(channel_code: str) -> list[str]:
     """現在 SSE 接続中の handle 一覧を返す（重複除去・順序不定）。"""
     with _sub_lock:
-        entries = _subscribers.get(powwow_code, [])
+        entries = _subscribers.get(channel_code, [])
         # 同一 handle が複数接続していても1件として扱う
         seen: dict[str, bool] = {}
         result = []
@@ -292,11 +292,11 @@ def get_presence(powwow_code: str) -> list[str]:
         return result
 
 
-def _broadcast(powwow_code: str, sender_handle: str, msg: dict) -> None:
-    """同一 powwow の購読者（送信者と同一 handle を除く）にメッセージを配信する（D#2286）。"""
+def _broadcast(channel_code: str, sender_handle: str, msg: dict) -> None:
+    """同一 channel の購読者（送信者と同一 handle を除く）にメッセージを配信する（D#2286）。"""
     payload = json.dumps(msg, ensure_ascii=False)
     with _sub_lock:
-        entries = list(_subscribers.get(powwow_code, []))
+        entries = list(_subscribers.get(channel_code, []))
     for handle, q in entries:
         if handle == sender_handle:
             # 送信者自身へはエコーしない（D#2286）
@@ -337,15 +337,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_stream(self, params: dict) -> None:
         """SSE ストリーム（接続 = presence 登録）。"""
-        powwow_code = params.get("powwow")
+        channel_code = params.get("channel")
         handle = params.get("handle")
 
-        if not powwow_code or not handle:
-            self._send_json(400, {"error": "powwow と handle は必須です"})
+        if not channel_code or not handle:
+            self._send_json(400, {"error": "channel と handle は必須です"})
             return
 
-        if not powwow_exists(powwow_code, DB_PATH):
-            self._send_json(404, {"error": "powwow が見つかりません"})
+        if not channel_exists(channel_code, DB_PATH):
+            self._send_json(404, {"error": "channel が見つかりません"})
             return
 
         self.send_response(200)
@@ -356,9 +356,9 @@ class Handler(BaseHTTPRequestHandler):
 
         q: queue.Queue = queue.Queue()
         with _sub_lock:
-            if powwow_code not in _subscribers:
-                _subscribers[powwow_code] = []
-            _subscribers[powwow_code].append((handle, q))
+            if channel_code not in _subscribers:
+                _subscribers[channel_code] = []
+            _subscribers[channel_code].append((handle, q))
 
         try:
             self.wfile.write(b": connected\n\n")
@@ -371,7 +371,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
         finally:
             with _sub_lock:
-                entries = _subscribers.get(powwow_code, [])
+                entries = _subscribers.get(channel_code, [])
                 try:
                     entries.remove((handle, q))
                 except ValueError:
@@ -379,13 +379,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_history(self, params: dict) -> None:
         """履歴取得。"""
-        powwow_code = params.get("powwow")
-        if not powwow_code:
-            self._send_json(400, {"error": "powwow は必須です"})
+        channel_code = params.get("channel")
+        if not channel_code:
+            self._send_json(400, {"error": "channel は必須です"})
             return
 
-        if not powwow_exists(powwow_code, DB_PATH):
-            self._send_json(404, {"error": "powwow が見つかりません"})
+        if not channel_exists(channel_code, DB_PATH):
+            self._send_json(404, {"error": "channel が見つかりません"})
             return
 
         since_str = params.get("since")
@@ -410,21 +410,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "limit は正の整数で指定してください"})
                 return
 
-        messages = get_history(powwow_code, since=since, limit=limit, db_path=DB_PATH)
+        messages = get_history(channel_code, since=since, limit=limit, db_path=DB_PATH)
         self._send_json(200, {"messages": messages})
 
     def _handle_presence(self, params: dict) -> None:
         """presence 取得。"""
-        powwow_code = params.get("powwow")
-        if not powwow_code:
-            self._send_json(400, {"error": "powwow は必須です"})
+        channel_code = params.get("channel")
+        if not channel_code:
+            self._send_json(400, {"error": "channel は必須です"})
             return
 
-        if not powwow_exists(powwow_code, DB_PATH):
-            self._send_json(404, {"error": "powwow が見つかりません"})
+        if not channel_exists(channel_code, DB_PATH):
+            self._send_json(404, {"error": "channel が見つかりません"})
             return
 
-        handles = get_presence(powwow_code)
+        handles = get_presence(channel_code)
         self._send_json(200, {"handles": handles})
 
     # ------------------------------------------------------------------
@@ -442,9 +442,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def _handle_create(self) -> None:
-        """powwow 作成。"""
-        code = create_powwow(DB_PATH)
-        self._send_json(200, {"powwow_code": code})
+        """channel 作成。"""
+        code = create_channel(DB_PATH)
+        self._send_json(200, {"channel_code": code})
 
     def _handle_send(self) -> None:
         """メッセージ送信・保存・ブロードキャスト。"""
@@ -457,23 +457,23 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "JSON パースエラー"})
             return
 
-        powwow_code = data.get("powwow")
+        channel_code = data.get("channel")
         handle = data.get("handle")
         body = data.get("body")
         needs_reply = data.get("needs_reply", False)
         in_reply_to = data.get("in_reply_to")  # None or int
 
-        if not powwow_code or not handle or body is None:
-            self._send_json(400, {"error": "powwow, handle, body は必須です"})
+        if not channel_code or not handle or body is None:
+            self._send_json(400, {"error": "channel, handle, body は必須です"})
             return
 
-        if not powwow_exists(powwow_code, DB_PATH):
-            self._send_json(404, {"error": "powwow が見つかりません"})
+        if not channel_exists(channel_code, DB_PATH):
+            self._send_json(404, {"error": "channel が見つかりません"})
             return
 
         try:
             msg = save_message(
-                powwow_code=powwow_code,
+                channel_code=channel_code,
                 handle=handle,
                 body=body,
                 needs_reply=bool(needs_reply),
@@ -484,7 +484,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": str(e)})
             return
 
-        _broadcast(powwow_code, handle, msg)
+        _broadcast(channel_code, handle, msg)
         self._send_json(200, {"msg_id": msg["msg_id"]})
 
     # ------------------------------------------------------------------
@@ -509,7 +509,7 @@ def main(db_path: str = DB_PATH):
     _schedule_idle_cleanup(db_path)
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(
-        f"powwow relay on http://127.0.0.1:{PORT}",
+        f"relay on http://127.0.0.1:{PORT}",
         flush=True,
     )
     try:

@@ -42,22 +42,22 @@ def _get_remote_cmd(args: list[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# CreatePowwow
+# CreateChannel
 # ---------------------------------------------------------------------------
 
-class TestCreatePowwow:
-    def test_returns_powwow_code(self):
-        """CreatePowwow は {"powwow_code": "abc123"} を返す。"""
-        mock_result = _make_mock_run({"powwow_code": "abc123"})
+class TestCreateChannel:
+    def test_returns_channel_code(self):
+        """CreateChannel は {"channel_code": "abc123"} を返す。"""
+        mock_result = _make_mock_run({"channel_code": "abc123"})
         with patch("subprocess.run", return_value=mock_result):
-            result = ms.CreatePowwow()
-        assert result == {"powwow_code": "abc123"}
+            result = ms.CreateChannel()
+        assert result == {"channel_code": "abc123"}
 
     def test_calls_bridge_create(self):
-        """CreatePowwow は ssh ... 'bridge create' を呼ぶ。"""
-        mock_result = _make_mock_run({"powwow_code": "abc123"})
+        """CreateChannel は ssh ... 'bridge create' を呼ぶ。"""
+        mock_result = _make_mock_run({"channel_code": "abc123"})
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            ms.CreatePowwow()
+            ms.CreateChannel()
         args = mock_run.call_args[0][0]
         assert "ssh" in args
         remote_cmd = _get_remote_cmd(args)
@@ -65,10 +65,10 @@ class TestCreatePowwow:
         assert "create" in remote_cmd
 
     def test_control_master_options(self):
-        """CreatePowwow は ControlMaster オプション付きで ssh を呼ぶ。"""
-        mock_result = _make_mock_run({"powwow_code": "abc123"})
+        """CreateChannel は ControlMaster オプション付きで ssh を呼ぶ。"""
+        mock_result = _make_mock_run({"channel_code": "abc123"})
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            ms.CreatePowwow()
+            ms.CreateChannel()
         args = mock_run.call_args[0][0]
         _assert_control_master(args)
 
@@ -79,17 +79,17 @@ class TestCreatePowwow:
 
 class TestSendMessage:
     def test_argv_structure_basic(self):
-        """SendMessage はリモートコマンドに --powwow=, --body=, --needs-reply=false を含む。"""
+        """SendMessage はリモートコマンドに --channel=, --body=, --needs-reply=false を含む。"""
         mock_result = _make_mock_run({"msg_id": 1})
         with patch("subprocess.run", return_value=mock_result) as mock_run:
             ms.SendMessage(
-                powwow_code="test-code",
+                channel_code="test-code",
                 body="Hello world",
                 needs_reply=False,
             )
         args = mock_run.call_args[0][0]
         remote_cmd = _get_remote_cmd(args)
-        assert "--powwow=test-code" in remote_cmd
+        assert "--channel=test-code" in remote_cmd
         assert "--needs-reply=false" in remote_cmd
 
     def test_body_with_spaces_is_quoted(self):
@@ -101,7 +101,7 @@ class TestSendMessage:
         mock_result = _make_mock_run({"msg_id": 1})
         with patch("subprocess.run", return_value=mock_result) as mock_run:
             ms.SendMessage(
-                powwow_code="test-code",
+                channel_code="test-code",
                 body="hello world",
                 needs_reply=False,
             )
@@ -121,7 +121,7 @@ class TestSendMessage:
         """SendMessage は --handle= を含まない（handle は server 側で forced command 固定、D#2285）。"""
         mock_result = _make_mock_run({"msg_id": 1})
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            ms.SendMessage(powwow_code="code", body="hi")
+            ms.SendMessage(channel_code="code", body="hi")
         args = mock_run.call_args[0][0]
         remote_cmd = _get_remote_cmd(args)
         assert "--handle=" not in remote_cmd, f"handle が含まれている: {remote_cmd}"
@@ -130,7 +130,7 @@ class TestSendMessage:
         """in_reply_to 指定時は --in-reply-to=N が含まれる（ハイフン区切り、D#2308）。"""
         mock_result = _make_mock_run({"msg_id": 2})
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            ms.SendMessage(powwow_code="code", body="reply", in_reply_to=10)
+            ms.SendMessage(channel_code="code", body="reply", in_reply_to=10)
         args = mock_run.call_args[0][0]
         remote_cmd = _get_remote_cmd(args)
         assert "--in-reply-to=10" in remote_cmd, f"--in-reply-to=10 がない: {remote_cmd}"
@@ -139,7 +139,7 @@ class TestSendMessage:
         """in_reply_to=None のとき --in-reply-to= は含まれない。"""
         mock_result = _make_mock_run({"msg_id": 3})
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            ms.SendMessage(powwow_code="code", body="hi", in_reply_to=None)
+            ms.SendMessage(channel_code="code", body="hi", in_reply_to=None)
         args = mock_run.call_args[0][0]
         remote_cmd = _get_remote_cmd(args)
         assert "--in-reply-to=" not in remote_cmd, f"--in-reply-to= が含まれている: {remote_cmd}"
@@ -148,7 +148,7 @@ class TestSendMessage:
         """needs_reply=True は --needs-reply=true（小文字文字列）でリモートコマンドに入る（D#2307/2308）。"""
         mock_result = _make_mock_run({"msg_id": 4})
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            ms.SendMessage(powwow_code="code", body="hi", needs_reply=True)
+            ms.SendMessage(channel_code="code", body="hi", needs_reply=True)
         args = mock_run.call_args[0][0]
         remote_cmd = _get_remote_cmd(args)
         assert "--needs-reply=true" in remote_cmd, f"--needs-reply=true がない: {remote_cmd}"
@@ -157,7 +157,7 @@ class TestSendMessage:
         """needs_reply=False は --needs-reply=false（小文字文字列）でリモートコマンドに入る（D#2307）。"""
         mock_result = _make_mock_run({"msg_id": 5})
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            ms.SendMessage(powwow_code="code", body="hi", needs_reply=False)
+            ms.SendMessage(channel_code="code", body="hi", needs_reply=False)
         args = mock_run.call_args[0][0]
         remote_cmd = _get_remote_cmd(args)
         assert "--needs-reply=false" in remote_cmd, f"--needs-reply=false がない: {remote_cmd}"
@@ -166,7 +166,7 @@ class TestSendMessage:
         """SendMessage は ControlMaster オプション付きで ssh を呼ぶ。"""
         mock_result = _make_mock_run({"msg_id": 1})
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            ms.SendMessage(powwow_code="code", body="hi")
+            ms.SendMessage(channel_code="code", body="hi")
         args = mock_run.call_args[0][0]
         _assert_control_master(args)
 
@@ -178,7 +178,7 @@ class TestSendMessage:
         mock_result.stdout = ""
         with patch("subprocess.run", return_value=mock_result):
             with pytest.raises(RuntimeError) as exc_info:
-                ms.SendMessage(powwow_code="code", body="hi")
+                ms.SendMessage(channel_code="code", body="hi")
         assert "1" in str(exc_info.value)
         assert "send" in str(exc_info.value)
 
@@ -198,7 +198,7 @@ class TestGetHistory:
         """GetHistory(since=5) は --since=5 をリモートコマンドに含める。"""
         mock_result = _make_mock_run({"messages": self._sample_messages()})
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            ms.GetHistory(powwow_code="code", since=5)
+            ms.GetHistory(channel_code="code", since=5)
         args = mock_run.call_args[0][0]
         remote_cmd = _get_remote_cmd(args)
         assert "--since=5" in remote_cmd, f"--since=5 がない: {remote_cmd}"
@@ -207,7 +207,7 @@ class TestGetHistory:
         """GetHistory(since=None) は --since= を含まない。"""
         mock_result = _make_mock_run({"messages": self._sample_messages()})
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            ms.GetHistory(powwow_code="code", since=None)
+            ms.GetHistory(channel_code="code", since=None)
         args = mock_run.call_args[0][0]
         remote_cmd = _get_remote_cmd(args)
         assert "--since=" not in remote_cmd, f"--since= が含まれている: {remote_cmd}"
@@ -216,7 +216,7 @@ class TestGetHistory:
         """GetHistory(limit=10) は --limit=10 をリモートコマンドに含める。"""
         mock_result = _make_mock_run({"messages": self._sample_messages()})
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            ms.GetHistory(powwow_code="code", limit=10)
+            ms.GetHistory(channel_code="code", limit=10)
         args = mock_run.call_args[0][0]
         remote_cmd = _get_remote_cmd(args)
         assert "--limit=10" in remote_cmd, f"--limit=10 がない: {remote_cmd}"
@@ -225,7 +225,7 @@ class TestGetHistory:
         """GetHistory(limit=None) は --limit= を含まない。"""
         mock_result = _make_mock_run({"messages": self._sample_messages()})
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            ms.GetHistory(powwow_code="code", limit=None)
+            ms.GetHistory(channel_code="code", limit=None)
         args = mock_run.call_args[0][0]
         remote_cmd = _get_remote_cmd(args)
         assert "--limit=" not in remote_cmd, f"--limit= が含まれている: {remote_cmd}"
@@ -235,14 +235,14 @@ class TestGetHistory:
         messages = self._sample_messages()
         mock_result = _make_mock_run({"messages": messages})
         with patch("subprocess.run", return_value=mock_result):
-            result = ms.GetHistory(powwow_code="code")
+            result = ms.GetHistory(channel_code="code")
         assert result == {"messages": messages}
 
     def test_control_master_options(self):
         """GetHistory は ControlMaster オプション付きで ssh を呼ぶ。"""
         mock_result = _make_mock_run({"messages": []})
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            ms.GetHistory(powwow_code="code")
+            ms.GetHistory(channel_code="code")
         args = mock_run.call_args[0][0]
         _assert_control_master(args)
 
@@ -254,7 +254,7 @@ class TestGetHistory:
         mock_result.stdout = ""
         with patch("subprocess.run", return_value=mock_result):
             with pytest.raises(RuntimeError) as exc_info:
-                ms.GetHistory(powwow_code="code")
+                ms.GetHistory(channel_code="code")
         assert "1" in str(exc_info.value)
         assert "history" in str(exc_info.value)
 
@@ -268,25 +268,25 @@ class TestGetPresence:
         """GetPresence は {"handles": [...]} を返す。"""
         mock_result = _make_mock_run({"handles": ["alice", "bob"]})
         with patch("subprocess.run", return_value=mock_result):
-            result = ms.GetPresence(powwow_code="code")
+            result = ms.GetPresence(channel_code="code")
         assert result == {"handles": ["alice", "bob"]}
 
     def test_calls_bridge_presence(self):
-        """GetPresence は ssh ... 'bridge presence --powwow=...' を呼ぶ。"""
+        """GetPresence は ssh ... 'bridge presence --channel=...' を呼ぶ。"""
         mock_result = _make_mock_run({"handles": []})
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            ms.GetPresence(powwow_code="abc")
+            ms.GetPresence(channel_code="abc")
         args = mock_run.call_args[0][0]
         remote_cmd = _get_remote_cmd(args)
         assert "bridge" in remote_cmd
         assert "presence" in remote_cmd
-        assert "--powwow=abc" in remote_cmd
+        assert "--channel=abc" in remote_cmd
 
     def test_control_master_options(self):
         """GetPresence は ControlMaster オプション付きで ssh を呼ぶ。"""
         mock_result = _make_mock_run({"handles": []})
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            ms.GetPresence(powwow_code="code")
+            ms.GetPresence(channel_code="code")
         args = mock_run.call_args[0][0]
         _assert_control_master(args)
 
@@ -298,7 +298,7 @@ class TestGetPresence:
         mock_result.stdout = ""
         with patch("subprocess.run", return_value=mock_result):
             with pytest.raises(RuntimeError) as exc_info:
-                ms.GetPresence(powwow_code="code")
+                ms.GetPresence(channel_code="code")
         assert "1" in str(exc_info.value)
         assert "presence" in str(exc_info.value)
 
@@ -321,7 +321,7 @@ class TestBridgeHelper:
         """kwargs のアンダースコアはハイフンに変換されてリモートコマンドに含まれる（D#2308）。"""
         mock_result = _make_mock_run({})
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            ms._bridge("send", powwow="code", needs_reply="true", in_reply_to=5)
+            ms._bridge("send", channel="code", needs_reply="true", in_reply_to=5)
         args = mock_run.call_args[0][0]
         remote_cmd = _get_remote_cmd(args)
         assert "--needs-reply=true" in remote_cmd, f"needs_reply のハイフン変換失敗: {remote_cmd}"
@@ -331,7 +331,7 @@ class TestBridgeHelper:
         """kwargs の値が None のものは --flag=None として追加されない。"""
         mock_result = _make_mock_run({})
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            ms._bridge("history", powwow="code", since=None, limit=None)
+            ms._bridge("history", channel="code", since=None, limit=None)
         args = mock_run.call_args[0][0]
         remote_cmd = _get_remote_cmd(args)
         assert "--since=" not in remote_cmd

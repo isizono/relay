@@ -1,4 +1,4 @@
-# powwow
+# relay
 
 別々の人間が使う Claude Code 同士に「認識合わせ」を代行させるための、履歴を持つ軽量メッセージング中継サービス。Claude は自動返信せず、人間が承認してから送る**窓口モデル**を採る。
 
@@ -7,9 +7,9 @@
 2層ハイブリッド構成。
 
 - **受信**: 各クライアントが SSE（`GET /stream`）を購読し、`Monitor`（persistent）で新着をイベントドリブンに待ち受ける。
-- **送信・操作**: MCPサーバーのツール（CreatePowwow / SendMessage / GetHistory / GetPresence）経由。送信は HTTP POST。
+- **送信・操作**: MCPサーバーのツール（CreateChannel / SendMessage / GetHistory / GetPresence）経由。送信は HTTP POST。
 - **認証**: SSH 公開鍵に全委譲。`handle` は GitHub ユーザー名で、`github.com/<user>.keys` を流用。`authorized_keys` の forced command で handle を固定するため詐称不可。中継サーバーはホストPCの localhost に bind し、外部到達は SSH forced command 経由のみ。
-- **ストレージ**: SQLite。最終メッセージから1年アイドルの powwow は丸ごと自動削除。
+- **ストレージ**: SQLite。最終メッセージから1年アイドルの channel は丸ごと自動削除。
 
 設計の確定版は cc-memory M#179、実装計画は task-plan の plan.md（PR分割 a/b/c/d）に集約されている。
 
@@ -32,7 +32,7 @@ Claude Code の `Monitor`（persistent）でこのスクリプトの stdout を�
 
 ```bash
 # Monitor(persistent) で受信待ち起動
-./recv_monitor.sh --powwow=abc123 --host=powwow
+./recv_monitor.sh --channel=abc123 --host=relay
 ```
 
 接続断時は自動再接続する（1 秒インターバル）。取りこぼしは MCP ツール `GetHistory(since=N)` で回収する設計のため、スクリプト側は単純再接続のみで十分（D#2257）。
@@ -41,8 +41,8 @@ Claude Code の `Monitor`（persistent）でこのスクリプトの stdout を�
 
 | オプション | 説明 | デフォルト |
 |---|---|---|
-| `--powwow=CODE` | powwow コード（必須） | — |
-| `--host=HOST` | SSH ホスト | `powwow` |
+| `--channel=CODE` | channel コード（必須） | — |
+| `--host=HOST` | SSH ホスト | `relay` |
 | `--no-reconnect` | 接続断時に再接続しない（デバッグ用） | false |
 | `--filter-only` | stdin を読んで `data:` 行のみ流す（テスト用） | false |
 
@@ -63,11 +63,11 @@ bridge-connect が受け付けるサブコマンド（SSH forced command 経由�
 
 | サブコマンド | 用途 | 主な引数 |
 |---|---|---|
-| `bridge recv --powwow=X` | SSE 購読（受信モード） | `--powwow` |
-| `bridge send --powwow=X --body=Y` | メッセージ送信 | `--powwow`, `--body`, `--needs-reply`, `--in-reply-to` |
-| `bridge create` | powwow 作成 | なし |
-| `bridge history --powwow=X` | メッセージ履歴取得 | `--powwow`, `--since`, `--limit` |
-| `bridge presence --powwow=X` | 接続中 handle 一覧取得 | `--powwow` |
+| `bridge recv --channel=X` | SSE 購読（受信モード） | `--channel` |
+| `bridge send --channel=X --body=Y` | メッセージ送信 | `--channel`, `--body`, `--needs-reply`, `--in-reply-to` |
+| `bridge create` | channel 作成 | なし |
+| `bridge history --channel=X` | メッセージ履歴取得 | `--channel`, `--since`, `--limit` |
+| `bridge presence --channel=X` | 接続中 handle 一覧取得 | `--channel` |
 
 MCP サーバー（`mcp_server.py`）は内部でこれらのサブコマンドを SSH 越しに呼び出す。
 
@@ -99,7 +99,7 @@ A#765（PR-c/d/final）完走後の別フェーズで、ホストをインター
    friends のCC                                     ホストPC（isizono）
    ──────────                                       ────────────────
         │                                          ┌────────────┐
-        │  ssh powwow bridge recv --powwow=X       │ cloudflared │
+        │  ssh relay bridge recv --channel=X       │ cloudflared │
         ├────────────────────────────────────────▶│ (launchd 常駐)│
         │  ProxyCommand cloudflared access ssh     └─────┬──────┘
         │                                                │ localhost:22
@@ -121,7 +121,7 @@ A#765（PR-c/d/final）完走後の別フェーズで、ホストをインター
 **初回セットアップ**
 
 1. `brew install cloudflared`
-2. Cloudflare Zero Trust ダッシュボードで Tunnel を作成し、`ssh.powwow.example.com` を `localhost:22` にルーティング
+2. Cloudflare Zero Trust ダッシュボードで Tunnel を作成し、`ssh.relay.example.com` を `localhost:22` にルーティング
 3. `cloudflared tunnel run` を launchd で常駐起動
 4. `sshd` を起動し、`~/.ssh/authorized_keys` 経由の forced command を有効化（既存実装）
 5. `server.py` を launchd で常駐起動
@@ -132,7 +132,7 @@ A#765（PR-c/d/final）完走後の別フェーズで、ホストをインター
 1. `members.txt` に friends の GitHub username を追記
 2. `bash gen_authorized_keys` で `~/.ssh/authorized_keys` を再生成（`github.com/<user>.keys` から公開鍵を fetch し、forced command 付きで書き出す）
 
-friends 側に渡すものは `powwow_code`（out-of-band で DM 等）と、collaborator 招待後の repo URL のみ。
+friends 側に渡すものは `channel_code`（out-of-band で DM 等）と、collaborator 招待後の repo URL のみ。
 
 ### friends 側
 
@@ -141,21 +141,21 @@ friends 側に渡すものは `powwow_code`（out-of-band で DM 等）と、col
 1. `brew install cloudflared`
 2. `~/.ssh/config` に追記:
     ```
-    Host powwow
-        HostName ssh.powwow.example.com
+    Host relay
+        HostName ssh.relay.example.com
         User isizono
         ProxyCommand cloudflared access ssh --hostname %h
     ```
 3. GitHub アカウントに公開鍵が登録済みであることを確認（ホスト側は `github.com/<user>.keys` を流用するため、ここに登録された鍵で接続される）
-4. powwow repo を clone（ホスト側で collaborator として招待されたあと）し、Claude Code の設定に以下を登録:
+4. relay repo を clone（ホスト側で collaborator として招待されたあと）し、Claude Code の設定に以下を登録:
     - MCP server: `mcp_server.py`（送信側ツール群）
     - Monitor: `recv_monitor.sh`（受信デーモン）
 
 **日常運用**
 
-- 送信: CC 内から MCP tool `powwow_send(powwow_code, body)` を呼ぶ。裏で `ssh powwow bridge send --powwow=<code> --body=<text>` が実行される。
+- 送信: CC 内から MCP tool `SendMessage(channel_code, body)` を呼ぶ。裏で `ssh relay bridge send --channel=<code> --body=<text>` が実行される。
 - 受信: `recv_monitor.sh` が SSE を購読し新着を stdout に流す。`Monitor`（persistent）がそれを拾って CC を発火させる。
-- `powwow_code` はホスト側 isizono から out-of-band で受け取り、ツール引数として渡す。
+- `channel_code` はホスト側 isizono から out-of-band で受け取り、ツール引数として渡す。
 
 ### 移行作業（A#765 完了後）
 
