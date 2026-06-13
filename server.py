@@ -116,6 +116,29 @@ def create_channel(db_path: str = DB_PATH) -> str:
         conn.close()
 
 
+def ensure_channel(channel_code: str, db_path: str = DB_PATH) -> str:
+    """指定 channel_code が存在しなければ作成して返す（idempotent）。
+
+    既に存在する場合はそのまま channel_code を返す。
+    """
+    conn = _db_connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT channel_code FROM channels WHERE channel_code = ?", (channel_code,)
+        ).fetchone()
+        if row is not None:
+            return row["channel_code"]
+        now = _now_iso()
+        conn.execute(
+            "INSERT INTO channels (channel_code, created_at, last_activity_at) VALUES (?, ?, ?)",
+            (channel_code, now, now),
+        )
+        conn.commit()
+        return channel_code
+    finally:
+        conn.close()
+
+
 def channel_exists(channel_code: str, db_path: str = DB_PATH) -> bool:
     """channel_code が DB に存在するか確認する。"""
     conn = _db_connect(db_path)
@@ -442,8 +465,21 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
 
     def _handle_create(self) -> None:
-        """channel 作成。"""
-        code = create_channel(DB_PATH)
+        """channel 作成。ボディで channel_code を指定した場合はその値で作成（idempotent）。"""
+        length = int(self.headers.get("Content-Length", 0))
+        channel_code = None
+        if length > 0:
+            raw = self.rfile.read(length).decode("utf-8")
+            try:
+                data = json.loads(raw)
+                channel_code = data.get("channel_code") or None
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+        if channel_code:
+            code = ensure_channel(channel_code, DB_PATH)
+        else:
+            code = create_channel(DB_PATH)
         self._send_json(200, {"channel_code": code})
 
     def _handle_send(self) -> None:
