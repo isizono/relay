@@ -122,6 +122,31 @@ class StreamRegistry:
             if record is not None:
                 record.members[identity] = access
 
+    def put_member_checked(self, stream_id: str, identity: str, access: Access) -> str:
+        """membership 変更を「write 権限を持つ member が 0 人になる操作」を拒否しつつ適用する。
+
+        write 権限（`write` / `read_write`）を持つ member が 1 人も居ない stream は、以後
+        write を要求する全操作（投函 / close / membership 変更）を実行できる identity が
+        存在しなくなり恒久的に操作不能になる（membership は in-memory なので relay 再起動で
+        しか解消しない）。この lockout を防ぐため、適用後に write member が 0 人になる変更を
+        拒否する。判定と適用は同一 lock 下で atomic に行う。
+
+        Returns:
+            "ok"                -- 適用済み
+            "not_found"         -- stream 不在
+            "last_write_member" -- この変更で write member が 0 人になるため未適用
+        """
+        with self._lock:
+            record = self._streams.get(stream_id)
+            if record is None:
+                return "not_found"
+            prospective = dict(record.members)
+            prospective[identity] = access
+            if not any(a in ("write", "read_write") for a in prospective.values()):
+                return "last_write_member"
+            record.members[identity] = access
+            return "ok"
+
     def delete_member(self, stream_id: str, identity: str) -> None:
         with self._lock:
             record = self._streams.get(stream_id)
@@ -461,7 +486,15 @@ async def put_member(request: Request) -> Response:
             400, INVALID_REQUEST, "access は read / write / read_write のいずれかです"
         )
 
-    registry.put_member(stream_id, target_identity, access)
+    result = registry.put_member_checked(stream_id, target_identity, access)
+    if result == "not_found":
+        return error_response(404, STREAM_NOT_FOUND, f"stream '{stream_id}' が見つかりません")
+    if result == "last_write_member":
+        return error_response(
+            400,
+            INVALID_REQUEST,
+            f"stream '{stream_id}' の write 権限を持つ member が 0 人になる membership 変更は許可されません",
+        )
     return JSONResponse({}, status_code=200)
 
 

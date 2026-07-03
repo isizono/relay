@@ -178,8 +178,8 @@ detached 形式）という妥当と考えられる形式を暫定採用した�
   実装済み。
 - `agent_cards` テーブル（外部 agent の AgentCard キャッシュ）の読み書きロジックは
   未実装。schema のみ用意した。
-- `PUT /streams/{stream_id}/members` で write member が 0 人になる操作へのガードは無い
-  （Resources タスクからの申し送り、未解消のまま）。
+- （解消済み）`PUT /streams/{stream_id}/members` で write member が 0 人になる操作への
+  ガードを追加した。詳細は後続の「write member 0 人ガード」節を参照。
 - `GET /status` / `GET /metrics`（wire-api.md §7.1, §7.2）、構造化ログの `level` 統一、
   Prometheus カウンタの各 endpoint への配線は Observability タスクで実装済み
   （詳細は後続の節を参照）。
@@ -247,9 +247,39 @@ read 権限を持つ member でない」を同一の `404 Not Found` と明記�
    汎用バリデーションに転用するのは意味的に不適切と判断したための追加である。
    error_code 一覧を「上限 7 種程度」で運用する方針との整合は、確定 decision 側の
    見直しが必要か検討すべきである。
-5. **同一 stream の write member が 0 人になる操作（自分自身の write 権限を削除する
-   membership 変更等）へのガードは無い**。wire-api.md / identity-authz.md にこの
-   edge case の規定がないため、意図的に制約を追加していない。
+5. **（解消済み）同一 stream の write member が 0 人になる operation へのガードを追加した**。
+   詳細は下記「write member 0 人ガード（`PUT /streams/{stream_id}/members`）」節を参照。
+
+## write member 0 人ガード（`PUT /streams/{stream_id}/members`）
+
+`StreamRegistry.put_member_checked` を追加し、`PUT /streams/{stream_id}/members` の適用後に
+write 権限（`write` / `read_write`）を持つ member が 0 人になる membership 変更を拒否する
+（`400 InvalidRequestError`）。write member が 0 人の stream は、以後 write を要求する全操作
+（`POST .../messages` 投函 / `DELETE /streams/{id}` close / `PUT`・`DELETE .../members`
+membership 変更）を実行できる identity が存在しなくなり、恒久的に操作不能になる（membership は
+in-memory であり relay 再起動でしか解消しない）。この lockout を構造的に防ぐ。
+
+### 仕様上の位置づけ
+
+`relay-v2-wire-api.md` §3.3 / `relay-v2-identity-authz.md` §2.2 にこの edge case の明示規定は
+無い。したがって本ガードは確定仕様の実装ではなく、未規定の edge case に対して relay 側で妥当な
+既定を与えたものである。status code は `400`（`InvalidRequestError`）を採用した。呼び出し元は
+membership 変更の write 権限自体は持つ（`403` 判定は通過済み）ため、権限不足を表す `403` ではなく、
+「要求された終端状態が不正（write member 0 人）」を表す `400` が意味的に妥当と判断した
+（error_code の増殖を避けるため既存の `InvalidRequestError` を再利用し、専用 code は新設しない）。
+
+### `DELETE .../members`（自己離脱）にガードを掛けない理由
+
+ガードは `PUT`（access 変更）にのみ掛け、`DELETE .../members`（member 削除）には掛けない。
+
+- `DELETE` で write member が 0 人に到達する経路は、唯一の write member が自分自身を削除する
+  「自己離脱」の場合に限られる（他 member を削除する呼び出しは write 権限を持つ呼び出し元自身が
+  残るため 0 人にならない）。自己離脱は identity-authz.md §2.2 が「本人であれば常に許可する」と
+  明示規定しており、ガードで覆さない。
+- `PUT` の自己 demote（唯一の write member が自分を `read` に落とす）は「離脱」ではなく access 変更で
+  あり、§2.2 の自己離脱許可の対象外。member として残りつつ stream を操作不能にする事故的な footgun
+  であるため、ガード対象とした。この非対称性（自己離脱は許可 / 自己 demote は拒否）は上記の仕様
+  規定に沿ったものである。
 
 ## `relay/delivery.py` + `relay/subscriptions.py` 実装（outbox dispatcher / SSE / retry / DLQ / cumulative ack / server log）
 
