@@ -299,7 +299,14 @@ write 権限（`write` / `read_write`）を持つ member が 0 人になる memb
 （`400 InvalidRequestError`）。write member が 0 人の stream は、以後 write を要求する全操作
 （`POST .../messages` 投函 / `DELETE /streams/{id}` close / `PUT`・`DELETE .../members`
 membership 変更）を実行できる identity が存在しなくなり、恒久的に操作不能になる（membership は
-in-memory であり relay 再起動でしか解消しない）。この lockout を構造的に防ぐ。
+in-memory であり relay 再起動でしか解消しない）。
+
+**このガードは `PUT` 経由の事故的 demote（唯一の write member が自分の access を `read` に
+落とす等）を防ぐものであり、lockout を構造的に防ぎ切るものではない**。次節の通り
+`DELETE .../members`（自己離脱）は identity-authz.md §2.2 により本人なら常に許可されるため
+ガード対象外であり、(a) 唯一の write member が自己離脱する、(b) 複数 write member が相互に
+demote し合った後に残った 1 人が自己離脱する、のいずれの経路でも write member 0 人の stream に
+今なお到達できる。自己離脱経由の lockout は仕様上残る。
 
 ### 仕様上の位置づけ
 

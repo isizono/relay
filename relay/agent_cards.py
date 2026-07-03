@@ -11,7 +11,8 @@ identity-authz.md §4.2 の通り identity 自体（AgentCard / 公開鍵）は 
 - 保存 / 読み出し: `store_agent_card` / `get_cached_agent_card` / `get_cached_jwks`。TTL
   （`expires_at`）超過は cache miss として扱う。
 - 統合: `get_or_fetch_agent_card`（cache hit ならそれを返し、miss / 期限切れなら fetch → 任意で
-  JWS 署名検証 → store）。
+  JWS 署名検証 → store）。`ttl_seconds` 省略時は `settings.agent_card_cache_ttl_seconds`
+  （既定 1h）を実際に使う。
 - 署名検証: `verify_card_signature`（identity-authz.md §1.2.3、JCS 正規化 + JWS 検証）。
   検証鍵は PEM 直接指定か JWKS（`jku` から取得した KeySet）で与える。
 """
@@ -28,11 +29,16 @@ from joserfc import jws
 from joserfc.jwk import KeySet
 
 from relay import identity as identity_mod
+from relay.config import DEFAULT_AGENT_CARD_CACHE_TTL_SECONDS, Settings
 
 WELL_KNOWN_AGENT_CARD_PATH = "/.well-known/agent-card.json"
 
 # `http_get(url, timeout) -> (status_code, body_bytes)` の注入点。
 HttpGet = Callable[[str, float], "tuple[int, bytes]"]
+
+# `get_or_fetch_agent_card` の `ttl_seconds` 未指定（呼び出し側が明示的に選んでいない）を
+# 「明示的に None（無期限キャッシュ）を渡した」場合と区別するためのセンチネル。
+_TTL_UNSET = object()
 
 
 class AgentCardFetchError(Exception):
@@ -113,6 +119,12 @@ def verify_card_signature(
     - `jwks`: `jku` から取得した JWKS。protected header の `kid` で KeySet から鍵を解決する。
 
     どちらも与えられない場合は検証できないため `False` を返す（fail-closed）。
+
+    `card` は外部 agent から受け取る非信頼入力であり、`signatures` が `{protected, signature}`
+    object の非空 list であることを一切仮定できない（list でなく dict / 要素が非 dict
+    文字列 / 必須キー欠落等の malformed input が来うる）。構造の取り出しから JWS 検証までを
+    単一の try で囲み、KeyError / TypeError / IndexError を含むあらゆる例外を検証失敗として
+    畳む（`relay.identity.verify_agent_card_signature` と同じ fail-closed 方針）。
     """
     if public_key_pem is not None:
         return identity_mod.verify_agent_card_signature(card, public_key_pem=public_key_pem)
@@ -121,13 +133,13 @@ def verify_card_signature(
     signatures = card.get("signatures")
     if not signatures:
         return False
-    sig = signatures[0]
-    payload = identity_mod.canonicalize_agent_card(card)
-    compact = f"{sig['protected']}.{_b64url_encode(payload)}.{sig['signature']}"
     try:
+        sig = signatures[0]
+        payload = identity_mod.canonicalize_agent_card(card)
+        compact = f"{sig['protected']}.{_b64url_encode(payload)}.{sig['signature']}"
         key_set = KeySet.import_key_set(jwks)
         result = jws.deserialize_compact(compact, key_set)
-    except Exception:  # noqa: BLE001 — 鍵解決 / 署名不一致はすべて検証失敗に畳む
+    except Exception:  # noqa: BLE001 — 構造不正 / 鍵解決 / 署名不一致はすべて検証失敗に畳む
         return False
     return result.payload == payload
 
@@ -212,9 +224,10 @@ def get_or_fetch_agent_card(
     base_url: str,
     *,
     http_get: HttpGet | None = None,
-    ttl_seconds: int | None = None,
+    ttl_seconds: Any = _TTL_UNSET,
     timeout: float = 5.0,
     now: datetime | None = None,
+    settings: Settings | None = None,
     verify_public_key_pem: str | None = None,
     verify_jwks: dict | None = None,
 ) -> dict:
@@ -224,6 +237,10 @@ def get_or_fetch_agent_card(
     署名を検証し、検証に失敗したら `AgentCardFetchError` を送出してキャッシュしない
     （fail-closed。identity-authz.md §1.2.3）。どちらも渡さない場合は署名検証をスキップする
     （最小セット AgentCard は署名なしで公開される。§1.2.4）。store 後に commit する。
+
+    `ttl_seconds` を明示的に渡さない場合、`settings.agent_card_cache_ttl_seconds`
+    （`settings` も省略時は `DEFAULT_AGENT_CARD_CACHE_TTL_SECONDS`、既定 1h）を使う。無期限
+    キャッシュにしたい場合は `ttl_seconds=None` を明示的に渡す（省略とは区別される）。
     """
     cached = get_cached_agent_card(db_conn, identity, now=now)
     if cached is not None:
@@ -236,8 +253,22 @@ def get_or_fetch_agent_card(
         ):
             raise AgentCardFetchError("AgentCard の JWS 署名検証に失敗しました")
 
+    if ttl_seconds is _TTL_UNSET:
+        resolved_ttl_seconds = (
+            settings.agent_card_cache_ttl_seconds
+            if settings is not None
+            else DEFAULT_AGENT_CARD_CACHE_TTL_SECONDS
+        )
+    else:
+        resolved_ttl_seconds = ttl_seconds
+
     store_agent_card(
-        db_conn, identity, card, jwks=verify_jwks, ttl_seconds=ttl_seconds, fetched_at=now
+        db_conn,
+        identity,
+        card,
+        jwks=verify_jwks,
+        ttl_seconds=resolved_ttl_seconds,
+        fetched_at=now,
     )
     db_conn.commit()
     return card

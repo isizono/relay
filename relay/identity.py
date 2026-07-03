@@ -206,18 +206,25 @@ def sign_agent_card(card: dict, *, private_key_pem: str, kid: str, jku: str) -> 
 def verify_agent_card_signature(card: dict, *, public_key_pem: str) -> bool:
     """AgentCard の `signatures[0]` を検証する（A2A 1.0 spec §8.4.3 の MUST 手順）。
 
+    `card` は外部 agent から受け取る非信頼入力であり、`signatures` の形が
+    `{protected, signature}` object の非空 list であることを一切仮定できない
+    （list でなく dict / 要素が非 dict 文字列 / 必須キー欠落等の malformed input が来うる）。
+    構造の取り出しから JWS 検証までを単一の try で囲み、KeyError / TypeError / IndexError を
+    含むあらゆる例外を検証失敗として畳む（fail-closed。呼び出し側が期待する「検証鍵が無い /
+    署名不一致はすべて False」という契約を、構造不正の場合にも一貫させる）。
+
     Returns:
         署名が正しく、かつ payload（JCS 正規化した signatures 除外後の AgentCard）と
-        一致する場合に True。
+        一致する場合に True。それ以外（構造不正・鍵不一致・署名不一致）はすべて False。
     """
     signatures = card.get("signatures")
     if not signatures:
         return False
-    sig = signatures[0]
-    payload = canonicalize_agent_card(card)
-    compact = f"{sig['protected']}.{_b64url_encode(payload)}.{sig['signature']}"
-    key = ECKey.import_key(public_key_pem)
     try:
+        sig = signatures[0]
+        payload = canonicalize_agent_card(card)
+        compact = f"{sig['protected']}.{_b64url_encode(payload)}.{sig['signature']}"
+        key = ECKey.import_key(public_key_pem)
         result = jws.deserialize_compact(compact, key)
     except Exception:
         return False

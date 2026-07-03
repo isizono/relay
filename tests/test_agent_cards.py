@@ -252,6 +252,43 @@ class TestVerifyCardSignature:
     def test_unsigned_card_fails(self):
         assert agent_cards.verify_card_signature({"name": "ext"}, jwks={"keys": []}) is False
 
+    @pytest.mark.parametrize(
+        "malformed_signatures",
+        [
+            [{"foo": "bar"}],  # dict だが protected/signature キー欠落
+            {"protected": "x", "signature": "y"},  # list でなく dict（[0] が KeyError）
+            ["garbage"],  # 要素が dict でなく文字列（['protected'] が TypeError）
+        ],
+        ids=["missing_keys", "signatures_is_dict", "element_is_string"],
+    )
+    def test_malformed_signatures_returns_false_not_crash_pem(
+        self, signed_card, malformed_signatures
+    ):
+        """外部 agent から受け取る非信頼 AgentCard の malformed signatures 構造で crash せず
+        fail-closed（False）を返すことを検証する（PEM 経路、回帰: KeyError / TypeError が
+        生の例外として get_or_fetch_agent_card の呼び出し元に漏れていた）。"""
+        _card, pub_pem, _jwks = signed_card
+        malformed_card = {"name": "ext", "signatures": malformed_signatures}
+        assert agent_cards.verify_card_signature(malformed_card, public_key_pem=pub_pem) is False
+
+    @pytest.mark.parametrize(
+        "malformed_signatures",
+        [
+            [{"foo": "bar"}],
+            {"protected": "x", "signature": "y"},
+            ["garbage"],
+        ],
+        ids=["missing_keys", "signatures_is_dict", "element_is_string"],
+    )
+    def test_malformed_signatures_returns_false_not_crash_jwks(
+        self, signed_card, malformed_signatures
+    ):
+        """PEM 経路と同じ malformed input を JWKS 経路（`verify_card_signature` 自前の
+        signatures パース）でも検証する。"""
+        _card, _pub_pem, jwks = signed_card
+        malformed_card = {"name": "ext", "signatures": malformed_signatures}
+        assert agent_cards.verify_card_signature(malformed_card, jwks=jwks) is False
+
 
 class TestGetOrFetchWithVerification:
     def test_valid_signature_is_stored(self, conn, signed_card):
@@ -283,3 +320,95 @@ class TestGetOrFetchWithVerification:
                 verify_jwks=jwks,
             )
         assert agent_cards.get_cached_agent_card(conn, "agent-x") is None
+
+
+# ---------------------------------------------------------------------------
+# ttl_seconds 省略時の既定値配線（Settings.agent_card_cache_ttl_seconds）
+# ---------------------------------------------------------------------------
+
+
+class TestTtlDefaultWiring:
+    """`ttl_seconds` を明示的に渡さなかったとき、実際に `Settings.agent_card_cache_ttl_seconds`
+    （settings 省略時は `DEFAULT_AGENT_CARD_CACHE_TTL_SECONDS`）が使われることを検証する
+    （回帰: config 値が定義されているだけで一切参照されておらず、実質「既定は無期限キャッシュ」に
+    なっていた）。
+    """
+
+    def test_no_settings_no_ttl_falls_back_to_module_default_and_expires(self, conn):
+        past = datetime.now(timezone.utc) - timedelta(
+            seconds=agent_cards.DEFAULT_AGENT_CARD_CACHE_TTL_SECONDS + 1
+        )
+        agent_cards.get_or_fetch_agent_card(
+            conn,
+            "agent-x",
+            "https://ex.test",
+            http_get=_stub_http_get(200, {"name": "v1"}),
+            now=past,
+        )
+        # モジュール既定 TTL（1h）を過ぎているので cache miss になり、再 fetch が走って
+        # 新しい内容に更新される。ttl_seconds を明示していないのに無期限キャッシュのままなら
+        # ここで "v1" のままになってしまう（回帰対象そのもの）。
+        refreshed = agent_cards.get_or_fetch_agent_card(
+            conn, "agent-x", "https://ex.test", http_get=_stub_http_get(200, {"name": "v2"})
+        )
+        assert refreshed["name"] == "v2"
+
+    def test_settings_ttl_is_honored_when_no_explicit_ttl_seconds(self, conn):
+        """`Settings.agent_card_cache_ttl_seconds` を短く設定すると、その値どおり早く失効する。"""
+        short_ttl_settings = Settings(db_path=":memory:", agent_card_cache_ttl_seconds=1)
+        past = datetime.now(timezone.utc) - timedelta(seconds=2)
+
+        agent_cards.get_or_fetch_agent_card(
+            conn,
+            "agent-x",
+            "https://ex.test",
+            http_get=_stub_http_get(200, {"name": "v1"}),
+            settings=short_ttl_settings,
+            now=past,
+        )
+        # settings.agent_card_cache_ttl_seconds=1 秒はとうに過ぎているので再 fetch が走る。
+        refreshed = agent_cards.get_or_fetch_agent_card(
+            conn,
+            "agent-x",
+            "https://ex.test",
+            http_get=_stub_http_get(200, {"name": "v2"}),
+            settings=short_ttl_settings,
+        )
+        assert refreshed["name"] == "v2"
+
+    def test_explicit_ttl_seconds_none_still_means_infinite(self, conn):
+        """`ttl_seconds=None` を明示的に渡した場合は「省略」と区別され、無期限キャッシュのまま。"""
+        very_old = datetime.now(timezone.utc) - timedelta(days=3650)
+        agent_cards.get_or_fetch_agent_card(
+            conn,
+            "agent-x",
+            "https://ex.test",
+            http_get=_stub_http_get(200, {"name": "v1"}),
+            ttl_seconds=None,
+            now=very_old,
+        )
+        still_cached = agent_cards.get_or_fetch_agent_card(
+            conn, "agent-x", "https://ex.test", http_get=_raising_http_get
+        )
+        assert still_cached["name"] == "v1"
+
+    def test_explicit_ttl_seconds_overrides_settings(self, conn):
+        """`ttl_seconds` を明示的に渡した場合は `settings` より優先される。"""
+        long_ttl_settings = Settings(db_path=":memory:", agent_card_cache_ttl_seconds=1)
+        agent_cards.get_or_fetch_agent_card(
+            conn,
+            "agent-x",
+            "https://ex.test",
+            http_get=_stub_http_get(200, {"name": "v1"}),
+            ttl_seconds=3600,
+            settings=long_ttl_settings,
+        )
+        # settings 側は 1 秒だが明示 ttl_seconds=3600 が勝つので、まだ cache hit のまま。
+        still_cached = agent_cards.get_or_fetch_agent_card(
+            conn,
+            "agent-x",
+            "https://ex.test",
+            http_get=_raising_http_get,
+            settings=long_ttl_settings,
+        )
+        assert still_cached["name"] == "v1"
