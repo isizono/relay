@@ -530,11 +530,14 @@ TTL（既定 90 日）を過ぎた行は `purge_expired_server_log` で間引く
    未着手**。現状の実装は正しく動作する（各 target は個別の delivery target として
    cumulative ack される）が、性能最適化（大量 target 保持時の dispatcher 1 cycle の
    処理時間）は検証していない。
-6. **subscription レーンの `POST /publish` に対する subset マッチング性能
-   （wire-api.md §10「10,000 subscriptions × 100 labels で p99 200ms」）は未検証**。
-   現状の実装は `SubscriptionRegistry.matching()` で全 subscription を線形走査する素朴な
-   実装であり、性能 SLO 検証・最適化（inverted index 等）は T7（observability /
-   性能）相当のタスクに委ねる。
+6. **（検証済み）subscription レーンの subset マッチング性能を実測した**。
+   `SubscriptionRegistry.matching()` は全 subscription を線形走査する素朴な実装だが、
+   10,000 subscriptions × publish labels 100 の条件で per-call p99 が sub-millisecond
+   （開発機実測で約 0.3〜0.4ms、SLO の 200ms に対し 2〜3 桁の余裕）であり、全 subscription が
+   マッチする最悪ケースでも同程度だった。したがって inverted index 等の最適化は現時点で過剰
+   実装であり、実装しない。ベンチマークは `tests/test_subscriptions.py` の
+   `TestMatchingPerformance` に残した（実測値の記録 + O(n^2) 化のような致命的性能退化を SLO
+   200ms を上限として検知する回帰ガード）。実測環境・条件は当該 test を参照。
 
 ## Subscriptions タスク: `SubscriptionRegistry` の無制限メモリ増加を解消
 
