@@ -47,7 +47,7 @@ relay_sdk/                     # 配布パッケージ名（暫定）
 │   └── dispatcher.py          # daemon entrypoint
 ├── client/                    # subscriber 側
 │   ├── __init__.py            # subscribe() の re-export
-│   ├── subscription.py        # Subscription / Event クラス
+│   ├── subscription.py        # Subscription / Event / EventDisplay クラス
 │   ├── sse.py                 # SSE 接続管理（再接続・heartbeat）
 │   └── reconcile.py           # retain 切れ時の publisher 直接 pull
 ├── http/                      # protocol 層
@@ -261,7 +261,7 @@ def mark_delivered(conn: Connection, ids: Sequence[int]) -> None:
 
 ```python
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 def subscribe(
     *,
@@ -273,6 +273,7 @@ def subscribe(
     lease_ttl_seconds: int = 300,
     retain_seconds: int | None = None,
     auto_ack: bool = True,
+    on_display: Callable[["EventDisplay"], None] | None = None,
     reconnect_max_attempts: int | None = None,
 ) -> "Subscription":
     """
@@ -282,10 +283,15 @@ def subscribe(
         subscriber_identity: 認証済みハンドル文字列。AgentCard と整合する必要がある。
         labels: AND set として扱われる。空配列は relay 側で 400 になるので呼び出し前に ValueError。
         lease_ttl_seconds: 機能要件 v3 FR-3.2 で min 30, max 86400。
-        retain_seconds: SSE 切断中の outbox 保持秒数。省略時は lease_ttl_seconds と同じ。
-        auto_ack: True なら Subscription.receive() の各 yield 直前に内部で ack を予約し、
-                  次の receive() 呼び出しまたは close() 時に cumulative ack を送る。
-                  False なら呼び出し側が Subscription.ack(publish_id) を明示的に呼ぶ。
+        retain_seconds: SSE 切断中の outbox 保持秒数。省略時は relay 既定（24h）。
+                        lease_ttl とは独立した軸で、大小制約はない（retain > lease は正当）。
+        auto_ack: True なら receive() のイテレーションが次に進んだ時点（= 直前に yield した
+                  event の処理が完了したとみなせる時点）で、その publish_id を cumulative ack
+                  のバッファに積み、次の relay 通信（ack flush / lease renew / close）で送る
+                  （§3.3）。False なら呼び出し側が Subscription.ack(publish_id) を明示的に呼ぶ。
+        on_display: 表示・通知用 callback。各 event の yield 直前に EventDisplay を渡して
+                    呼ばれる（§3.2.1）。callback 内の例外は SDK が捕捉してログに記録し、
+                    配達・ack 進行には影響しない。
         reconnect_max_attempts: SSE 切断時の再接続最大回数。None なら無限。
 
     Returns:
@@ -308,13 +314,29 @@ from typing import Iterator
 
 @dataclass(frozen=True)
 class Event:
+    """receive() が yield する業務判定用イベント。
+
+    分岐・判定に使ってよいのは ref_type / ref_id / labels のみ。
+    publish_id は ack カーソル、delivered_at は reconcile の since_ts（§3.5）に使う。
+    title は意図的に持たない（§3.2.1）。
+    """
     publish_id: int
     subscription_id: str
     ref_type: str
     ref_id: str | int
     labels: list[str]
-    title: str | None
     delivered_at: str
+
+@dataclass(frozen=True)
+class EventDisplay:
+    """ロギング・通知表示専用のイベントメタデータ。業務判定に使ってはならない。
+
+    subscribe(on_display=...) の callback と SDK 内部ログにのみ流れる。
+    """
+    publish_id: int
+    ref_type: str
+    ref_id: str | int
+    title: str | None
 
 class Subscription(AbstractContextManager["Subscription"]):
     @property
@@ -328,13 +350,15 @@ class Subscription(AbstractContextManager["Subscription"]):
         SSE から event を 1 件ずつ yield する。
 
         振る舞い:
-            - 1 イベント受信 → caller に yield。
+            - 1 イベント受信 → EventDisplay を SDK 内部 logger に記録し、
+              on_display が指定されていれば呼ぶ → caller に yield（§3.2.1）。
             - caller がループを次に進めた瞬間、auto_ack=True なら直前 yield 分の publish_id を
               cumulative ack の up_to_publish_id 候補としてバッファし、次の relay 通信 (lease renew /
               次の ack flush / close) で送る。
             - SSE 切断検知 → 内部で再接続。subscription_id が relay 側でまだ生きていれば
               GET /events に再接続し直し、relay が未 ack outbox を黙って再 push する。
-            - 410 Gone（subscription_id 失効）→ 新規 POST /subscriptions で再 subscribe し、
+            - 404 / 410（subscription_id 失効・不明。relay 再起動による registry 消失を含む）
+              → 新規 POST /subscriptions で再 subscribe し、
               subscription_id を更新、SSE を張り直す。受信再開後は relay 再起動跨ぎになっているため、
               retain 切れ分は publisher 直接 pull で別途回収する責務が caller 側にある（§3.5）。
             - lease 切れ間近（lease_ttl_seconds の 1/3 以下）になると裏で PUT lease を打って renew する。
@@ -366,6 +390,23 @@ class Subscription(AbstractContextManager["Subscription"]):
         """
 ```
 
+#### 3.2.1 Event から title を分離する型設計
+
+`Event` は wire payload 上の `title` を保持しない。title は `EventDisplay` に分離し、後述の 2 経路（SDK 内部ログ / `on_display` callback）にのみ流す。subscriber の業務判定コード（`receive()` ループの body）から title に触れる経路を型レベルで塞ぐためである。
+
+**title を業務判定に使えない根拠**:
+
+- title は publisher 責任のベストエフォートな表示ヒントである。relay は truncate も正規化もしない（§2.2）ため、publisher 側の生成ロジック変更だけで文字列内容が変わる。
+- at-least-once 再送では publish 時点の title がそのまま再配達される。title の文字列内容を entity の現在状態の判定に使うと、再送で届いた古い title に基づく鮮度バグになる。
+- 実際に、title の文字列内容（"done" を含むか等）で完了判定を行った subscriber が、publisher 側の truncation によって event を見落とす障害が観察されている。
+
+以上から、「業務判定は ref + labels のみで行う」は運用規約ではなく型で強制すべきである。`Event` に title 属性が存在しないため、title 分岐は静的型チェックまたは AttributeError として即座に顕在化する。event 起因の判定キーが必要な場合は、publisher が labels に載せる（publisher 側設計の責務）か、subscriber が ref で publisher から entity を読み直す。
+
+**title の流通経路（次の 2 つのみ）**:
+
+1. **SDK 内部ログ**: dedup を通過した event を yield する直前に、logger `relay_sdk.client.events` へ INFO で 1 レコード記録する（`publish_id` / `ref_type` / `ref_id` / `labels` / `title` を含む）。dedup で破棄した再送 frame は同 logger に DEBUG で記録する。caller の処理（yield 後の handler 実行）より前に記録するため、handler が例外で落ちても title を含む受信文脈がログに残る。
+2. **`on_display` callback**: 通知バナー等の人間向け表示に title を使うアプリは、`subscribe(on_display=...)` で `EventDisplay` を受け取る。callback は対応する `Event` の yield 直前に受信スレッド上で 1 回だけ呼ばれる。callback 内の例外は SDK が捕捉してログに記録し、配達・ack 進行に影響させない。戻り値も無視する。表示専用であり、処理結果を受信ループや ack に反映する経路を持たない。
+
 ### 3.3 auto_ack の意味と注意
 
 `auto_ack=True` は「caller が `for event in sub.receive(): handle(event)` を素直に書くだけで at-least-once が成立する」糖衣である。**handle が成功した直後の event だけが ack されるよう、yield 後 next() が呼ばれた時点を「処理完了」とみなす**。途中で例外が出た場合、最後に成功した event までしか cumulative ack に進めないため、未処理 event は次回再接続で再 push される。
@@ -376,7 +417,7 @@ caller 側で「複数 event をバッチして処理してから 1 度に ack �
 
 - SSE 切断（TCP close / heartbeat 30s 不在 / EOF）を検知。
 - 即時で 1 回 retry、失敗したら指数バックオフ（1s, 2s, 4s, 8s, 16s, 30s で頭打ち）。
-- `reconnect_max_attempts` に達するか、`410 Gone`（subscription_id 失効）を受け取ったら新規 subscribe に切り替える。
+- `reconnect_max_attempts` に達するか、subscription 操作への `404` / `410`（subscription_id 失効・不明）を受け取ったら新規 subscribe に切り替える（relay 再起動で registry が消えた場合は `404` が返るため、`410` だけを分岐キーにしない）。
 - 再接続後は relay が自動的に未 ack 分を再 push するため、SDK 側で resume を申告する経路は持たない（`Last-Event-ID` ヘッダは送らない）。
 
 ### 3.5 retain 切れ時の fallback は publisher 直接 pull
@@ -450,7 +491,7 @@ class TransientError(Exception):
     """5xx / 接続不能 / timeout。dispatcher は指数バックオフで retry、subscriber は SSE 再接続で復帰。"""
 
 class PermanentError(Exception):
-    """relay が dead と判定した状態（subscription_id 不存在 410 等）。caller 側で再 subscribe が必要。"""
+    """subscription が失効・不明になった状態（subscription 操作への 404 / 410）。caller 側で再 subscribe が必要。"""
 ```
 
 dispatcher 側のリトライ判定:
@@ -458,10 +499,10 @@ dispatcher 側のリトライ判定:
 | HTTP 応答 | 分類 | 振る舞い |
 |---|---|---|
 | `2xx` | success | `processed_at` を更新 |
-| `400 / 403 / 404` | `RelayProtocolError` | 即 `dead_at` セット、retry しない |
+| `400 / 403 / 404`（`POST /publish` への応答） | `RelayProtocolError` | 即 `dead_at` セット、retry しない |
 | `429` | `TransientError` | `Retry-After` ヘッダ尊重、retry_count を進める |
 | `5xx` / timeout / TCP RST | `TransientError` | 指数バックオフで retry |
-| `410 Gone`（subscription レーンのみ）| `PermanentError` | dispatcher 側では発生しないが、subscriber 側で受領したら新規 subscribe に切り替え |
+| `404 / 410`（subscription 操作: lease renew / `GET /events` / ack への応答）| `PermanentError` | dispatcher 側では発生しない。subscriber 側で受領したら新規 subscribe に切り替え |
 
 ---
 
@@ -514,10 +555,13 @@ dispatcher は別プロセスで `python -m relay_sdk.outbox` を上げておく
 
 ```python
 from pathlib import Path
-from relay_sdk.client import subscribe, Event
+from relay_sdk.client import subscribe, Event, EventDisplay
 
 def handle(event: Event) -> None:
     print(f"received: ref={event.ref_type}:{event.ref_id} labels={event.labels}")
+
+def show_banner(meta: EventDisplay) -> None:
+    print(f"[relay] {meta.ref_type}:{meta.ref_id} {meta.title or '(no title)'}")
 
 def main() -> None:
     with subscribe(
@@ -527,6 +571,7 @@ def main() -> None:
         agent_card_path=Path("/etc/relay/agent-card.json"),
         jws_key_path=Path("/etc/relay/jws.pem"),
         auto_ack=True,
+        on_display=show_banner,
     ) as sub:
         for event in sub.receive():
             handle(event)
@@ -621,9 +666,16 @@ def test_subscriber_receives_published_event() -> None:
 - subset マッチング（機能要件 v3 FR-3.3 と同じ）
 - cumulative ack（FR-3.10 と同じ）
 - ack 前切断 → 再接続で再 push（FR-4.8）
-- `fake.simulate_outage()` / `fake.simulate_410(subscription_id)` 等のフォールト注入 API
+- `fake.simulate_outage()` / `fake.simulate_subscription_loss(subscription_id)`（subscription 操作への 404 / 410 応答の注入）等のフォールト注入 API
 
 ただし relay の永続性 / DLQ / 7 日 GC / SSE keepalive 30 秒は模さない。これらは integration test 側で見る。
+
+FakeRelay を使う unit test では、§3.2.1 の型分離を回帰から守るため少なくとも次を固定する:
+
+- `Event` の dataclass fields に `title` が存在しないこと
+- title 付きで publish した event が yield される際、同じ `publish_id` の `EventDisplay` が `on_display` に yield 前に 1 回だけ渡ること
+- `on_display` callback が例外を投げても `receive()` の yield と ack 進行が継続すること
+- yield 直前に logger `relay_sdk.client.events` へ title を含む INFO レコードが出ること、および dedup 破棄された再送 frame が DEBUG で記録されること
 
 ### 7.2 integration test（real relay 起動）
 

@@ -122,7 +122,7 @@ sequenceDiagram
 
 relay 再起動を跨いだ場合、subscription registry が in-memory なので消失する（relay の disk 永続は outbox のみ）。再起動前の subscription_id 宛に残っていた outbox エントリは「subscription_id 不存在」状態となり、dispatcher は当該エントリを **DLQ 経路** に倒す（`dead_at` をセットして polling 対象から外す）。dead エントリは 7 日後に物理 DELETE される。
 
-DLQ 入りは relay 再起動以外にも発生する。push retry が累積上限（3.1 秒）に達した後 retain 期間内に再接続なし、retain 期間（default 24h）超過、subscriber identity 削除済み、subscription の明示 unsubscribe / lease 切れによる自然消滅、いずれも同じ DLQ 経路を通る。subscriber は新しい subscription_id で再 subscribe するため、旧 subscription_id 宛の dead エントリは新経路で再配達されない。
+DLQ 入りは relay 再起動以外にも発生する。push retry が累積上限（3.1 秒）に達した後 retain 期間内に再接続なし、retain 期間（default 24h）超過、subscriber identity 削除済み、lease 切れによる自然消滅、いずれも同じ DLQ 経路を通る。明示 unsubscribe だけは DLQ を通らず、未 ack エントリは unsubscribe と同一 transaction で即時削除される（意図的な関心放棄は事故ではないため、DLQ と warn ログは意図しない消滅の観測専用に保つ）。subscriber は新しい subscription_id で再 subscribe するため、旧 subscription_id 宛の dead エントリは新経路で再配達されない。
 
 この設計は「subscriber 履歴中立性」の必然的な帰結である。relay は旧 subscription_id と新 subscription_id を結びつける ledger を持たないため、relay 再起動を跨いだ取りこぼしの回収は publisher 直接 pull に責務分離される。
 
@@ -141,7 +141,7 @@ sequenceDiagram
     Note over Outbox: (S1, 200), (S1, 201) は disk に残存
 
     Sub->>Relay: GET /events?subscription_ids=S1 (旧 id)
-    Relay-->>Sub: 410 Gone (S1 不存在)
+    Relay-->>Sub: 404 Not Found (S1 不明。registry 消失後は存在事実を持たない)
     Sub->>Relay: POST /subscriptions { subscriber, labels }
     Relay-->>Sub: 201 Created { subscription_id: S2 }
     Sub->>Relay: GET /events?subscription_ids=S2
@@ -178,7 +178,7 @@ sequenceDiagram
     Sub->>Relay: POST /subscriptions { subscriber, labels: [X, Y], lease_ttl?: 300 }
     Relay->>Relay: generate subscription_id (UUID)
     Relay->>Relay: register in in-memory subscription registry
-    Relay-->>Sub: 201 Created { subscription_id, lease_expires_at, push_endpoint_url }
+    Relay-->>Sub: 201 Created { subscription_id, lease_expires_at }
 
     Sub->>Relay: GET /events?subscription_ids=<id>
     Note over Sub,Relay: SSE 接続確立 (keepalive 30s)
@@ -228,7 +228,7 @@ sequenceDiagram
     Note over Outbox: (S1, 500) は disk に残存
 
     Sub->>Relay: GET /events?subscription_ids=S1
-    Relay-->>Sub: 410 Gone (S1 不存在)
+    Relay-->>Sub: 404 Not Found (S1 不明。registry 消失後は存在事実を持たない)
     Note over Sub: subscriber は ow 側で「同じ自分」を識別
     Note over Sub: relay にとっては別人として再 subscribe する
 
@@ -257,7 +257,7 @@ sequenceDiagram
 
 - outbox エントリのキーは `(subscription_id, publish_id)`
 - `publish_id` は relay 全体で global に単調増加する（stream 内 seq / subscription 内 seq は存在しない）
-- relay が disk で持つ永続データは outbox のみ。subscription registry / lease / presence / identity→role 束縛 は in-memory に置く
+- relay が disk で持つ永続データは outbox のみ。subscription registry / lease / presence / stream membership は in-memory に置く
 
 ### at-least-once が効くポイント
 
@@ -273,5 +273,5 @@ sequenceDiagram
 
 - subscriber 識別の経時的同一性管理（再接続 = 新規 subscriber）
 - 場（stream）のメッセージ永続化（pass-through）
-- fine-grained authZ（特定 labels への subscribe 可否、close / cancel 可否）
+- semantic authZ（特定 labels への subscribe 可否、close / cancel 可否などの意味判定）
 - retain 切れ以降の取りこぼし回収（publisher 直接 pull が source of truth）

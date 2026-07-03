@@ -24,7 +24,7 @@
 | **`GET /history?since=N`** | **削除**。再生台帳が無いので since=N の引く先が無い |
 | **場 close 後の archive + TTL 90日** | **廃止**。場 close は「新規投函を止める」だけ。archive 概念は消える |
 | **resume（取りこぼし回収）** | 購読者が Last-Event-ID で replay 申告する経路を廃し、**relay が当該購読の未 ack outbox を再 push** する動作に一本化 |
-| **substrate** | disk（SQLite）で守るのは **outbox のみ**。presence / subscription registry / lease / identity→role 束縛 は in-memory（liveness クラス）。relay 再起動は re-subscribe + heartbeat で自己修復 |
+| **substrate** | disk（SQLite）で守るのは **outbox のみ**。presence / subscription registry / lease / stream membership は in-memory（liveness クラス）。relay 再起動は re-subscribe + heartbeat で自己修復 |
 | **サーバーログ** | relay 自身のデバッグ用 append-only sink を追加（§7）。**購読者向け endpoint は持たない**（since=N を生やすと裏口から場 history が復活するため禁止） |
 
 ### 0.1 本書で確定した未決項目（R1 が実装計画 T0 送りにした論点）
@@ -34,9 +34,9 @@ R1-5 ほかで「未決」とされた IF レベルの論点を、本書作成�
 
 | 論点 | 決定 | 理由 |
 |---|---|---|
-| **stream_seq（場ごと単調 seq）** | **廃止**。3系統 → 2系統（`publish_seq` / `subscription_seq`）に畳む | 主用途だった history pull(since=N) が消滅。永続台帳が無い以上「歯抜けなし per-stream」を保証できず、中途半端な seq は嘘になる。場内順序は `publish_seq` の相対順序で足りる |
-| **ack 方式** | **明示 ack API**（subscriber が `publish_id` を ack、relay が outbox から削除） | R1 の「per-購読 ack 状態がカーソルそのもの」を素直に実装。push 成功＝削除の暗黙 ack より配達確証が強い |
-| **SSE `id:`** | publish_seq を **`id:` 行と payload の両方に載せる** | 重複検知・subscriber 間の発生順比較に使える。実装コストはほぼゼロ。ただし relay の resume は `Last-Event-ID` を見ず、**ack カーソルを真実源**とする |
+| **seq 体系** | **`publish_id` 1 系統に畳む**（`stream_seq` / `subscription_seq` は廃止） | 主用途だった history pull(since=N) が消滅。永続台帳が無い以上「歯抜けなし per-stream」を保証できず、中途半端な seq は嘘になる。場内順序は `publish_id` の相対順序で足り、per-target の gap 検知も relay 側 outbox の未 ack 再 push（§6.5）で構造的に代替される |
+| **ack 方式** | **cumulative ack API**（subscriber が `up_to_publish_id` を送り、relay が当該 delivery target の `publish_id <= N` を outbox から一括削除） | R1 の「per-購読 ack 状態がカーソルそのもの」を素直に実装。push 成功＝削除の暗黙 ack より配達確証が強い。cumulative なので ack コストは push 頻度に対して O(1) |
+| **SSE `id:`** | publish_id を **`id:` 行と payload の両方に載せる** | 重複検知・subscriber 間の発生順比較に使える。実装コストはほぼゼロ。ただし relay の resume は `Last-Event-ID` を見ず、**ack カーソルを真実源**とする |
 
 ---
 
@@ -46,10 +46,10 @@ relay は 2 つの **publish 源**を、共通の **outbox 配達メカ**で at-
 
 | publish 源 | 配達先の決まり方 | endpoint |
 |---|---|---|
-| **場 (stream)** | 場の **membership**（writer/reader 集合） | `POST /streams/{id}/messages` |
+| **場 (stream)** | 場の **membership**（read 権限を持つ member 集合） | `POST /streams/{id}/messages` |
 | **subscription** | **labels の subset マッチ** | `POST /publish` |
 
-- 両系統とも内部 outbox を経由 → SSE で push → subscriber が明示 ack → outbox から削除。
+- 両系統とも内部 outbox を経由 → SSE で push → subscriber が cumulative ack（§5.6）→ outbox から削除。
 - 場 membership と subscription は**独立**（場のメンバーは自動 subscribe されない。逆も同様）。
 - subscriber 種別（ow agent / 一般 session / 外部 UI / 外部 bot）を relay は**区別しない**。
 
@@ -77,14 +77,15 @@ SSE 接続（`GET /events`）は **認証済み identity の単一多重化接�
 | `PUT /streams/{stream_id}/members` | membership 付与/更新 | `200` |
 | `DELETE /streams/{stream_id}/members?identity=` | membership 削除 | `204` |
 | `GET /streams/{stream_id}/members` | membership 一覧 | `200 { members: [...] }` |
+| `POST /streams/{stream_id}/ack` | 場レーンの cumulative ack（呼び出し identity 宛） | `200` |
 | **subscription** | | |
 | `POST /subscriptions` | subscribe（関心宣言） | `201 { subscription_id, lease_expires_at }` |
 | `PUT /subscriptions/{subscription_id}/lease` | lease renew | `200 { lease_expires_at }` |
 | `DELETE /subscriptions/{subscription_id}` | unsubscribe | `204` |
+| `POST /subscriptions/{subscription_id}/ack` | subscription レーンの cumulative ack | `200` |
 | `POST /publish` | subscription レーン publish | `202 { publish_id, matched_subscriptions }` |
 | **配達 (delivery)** | | |
 | `GET /events?subscription_ids=` | SSE 多重化購読 | `text/event-stream` |
-| `POST /events/ack` | 配達済み `publish_id` の明示 ack | `204` |
 | **observability** | | |
 | `GET /status` | 運用スナップショット | `200 {...}`（§7.1） |
 | `GET /metrics` | Prometheus 互換 | `200`（§7.2） |
@@ -110,6 +111,9 @@ Body: { stream_id: <string>, default_ttl?: <seconds> }
 
 - `stream_id` は呼び出し側が決める文字列（識別子）。
 - `default_ttl` は場メッセージの outbox retain default（省略時は relay 既定、§6.4）。
+- 作成者 identity は当該場の write 権限を持つ member（`access: "write"`）として自動登録される
+  （bootstrap。これがないと最初の member を追加できる identity が存在しない。identity 別書 §2.2。
+  受信も必要なら作成後に自分の access を `read_write` に更新する）。
 - **archive_ttl は廃止**（R1: archive 概念なし）。
 
 ### 3.2 `POST /streams/{stream_id}/messages` — 場への投函
@@ -117,35 +121,42 @@ Body: { stream_id: <string>, default_ttl?: <seconds> }
 ```
 POST /streams/{stream_id}/messages
 Body: { body: <bytes | UTF-8 text>, ttl?: <seconds>, idempotency_key?: <string> }
-→ 202 Accepted { publish_id, publish_seq, matched_members: <int> }
-→ 403 Forbidden   (投函者が writer membership を持たない)
+→ 202 Accepted { publish_id, matched_members: <int> }
+→ 403 Forbidden   (投函者が write 権限を持つ member でない)
 → 404 Not Found   (場が存在しない / close 済みで露呈回避)
 → 410 Gone        (場が close 済み、新規投函拒否)
 ```
 
 - 投函者 identity は HTTP 認証で確定（§identity 別書 FR-5）。
+- `202 Accepted` は outbox 永続化完了が条件（§6.1）。subscription publish（§5.4）と受理 semantics は
+  同一（受理 = relay が忘れない、配達は非同期）。
 - `body` は relay にとって不透明（bytes / UTF-8）。
 - `idempotency_key` 指定時は同一 stream 内で 15 分 dedup。省略時は relay が擬似キー補完（§6.3）。
-- relay は場の writer member（reader を除く）に対し outbox エントリを作成し、`matched_members` を返す。
-- **stream_seq は付与しない**（廃止）。場メッセージも配達時に `publish_seq`（グローバル単調）+
-  `subscription_seq` 相当の per-target 連番を持つ（§4）。
+- relay は場の **read 権限を持つ member**（`access: "read" | "read_write"`）に対し outbox エントリを
+  作成し、`matched_members` を返す。write 権限は投函権、read 権限は受信権であり、配達先は受信権で
+  決まる。投函者自身も read 権限を持てば配達対象に含む（自己メッセージの無視は subscriber 側の判断）。
+- **stream_seq は付与しない**（廃止）。場メッセージも subscription レーンと同じ `publish_id`
+  （グローバル単調）で識別・順序づけされる（§4）。
 
 ### 3.3 membership API
 
 ```
 PUT /streams/{stream_id}/members
-Body: { identity: <string>, role: "writer" | "reader" | "both" }
+Body: { identity: <string>, access: "read" | "write" | "read_write" }
 → 200 OK
 
 DELETE /streams/{stream_id}/members?identity=<id>
 → 204 No Content
 
 GET /streams/{stream_id}/members
-→ 200 OK { members: [ { identity, role }, ... ] }
+→ 200 OK { members: [ { identity, access }, ... ] }
 ```
 
-- membership = coarse-grained authZ（誰が writer / reader か）のみ。
-- 「誰が close してよいか」「誰が cancel してよいか」等の fine-grained 判定は relay は持たない（ow 側）。
+- membership = structural authZ の判定材料（誰が read / write 権限を持つか）のみ。write = 投函権、
+  read = 受信権。field 名は `role` ではなく `access` とする（role 概念を relay の状態モデルに
+  乗せない、identity 別書 §2.2）。
+- 「誰が close してよいか」「誰が cancel してよいか」等の semantic な判定は relay は持たない
+  （ow 側。identity 別書 §2.5）。
 
 ### 3.4 `DELETE /streams/{stream_id}` — 場の close
 
@@ -160,20 +171,20 @@ DELETE /streams/{stream_id}
 
 ---
 
-## 4. seq 体系（2 系統）
+## 4. seq 体系（`publish_id` 1 系統）
 
-R1 + 本書 §0.1 により **2 系統**に確定。
+R1 + 本書 §0.1 により **`publish_id` 1 系統**に確定。
 
-| seq | スコープ | 単調性 | 用途 | どこに出るか |
-|---|---|---|---|---|
-| **`publish_seq`** | relay 全体 | グローバル単調 | subscriber 間で発生順を比較可能。SSE `id:` に載せ、重複検知に使う | SSE `id:` 行 + payload |
-| **`subscription_seq`** | 1 delivery target 内 | target ごと単調 | subscriber 側の gap 検知（target 単位の取りこぼし検出） | payload |
-
-- `subscription_seq` は subscription レーンだけでなく **場メンバー配達**にも付く（delivery target =
-  `sub:<id>` でも `stream:<id>` でも、target 内で 1,2,3,... の連番）。名称は歴史的経緯で `subscription_seq`
-  のままだが「per-delivery-target seq」と読む。
-- **stream_seq は存在しない**。場内順序が必要な subscriber は、同一 `stream_id` 宛イベントの
-  `publish_seq` 昇順で並べる（同一場宛の投函は relay 採番順 = `publish_seq` 単調）。
+- **`publish_id`** は relay 全体で global に単調増加する**整数**通番。publish（場 / subscription
+  両レーン）ごとに relay が採番する。
+- 1 つの `publish_id` が 3 役を兼ねる:
+  1. **ack の cumulative カーソル**（`up_to_publish_id`、§5.6）
+  2. **outbox エントリのキーの一部**（delivery target × `publish_id`、§6）
+  3. **SSE `id:` 行**（重複検知、subscriber 間の発生順比較、§5.5）
+- **`stream_seq` / `subscription_seq` は存在しない**。場内順序が必要な subscriber は、同一
+  `stream_id` 宛イベントの `publish_id` 昇順で並べる（同一場宛の投函は relay 採番順 = `publish_id`
+  単調）。per-target の gap 検知用 seq も持たない — 取りこぼしは relay 側 per-target outbox の
+  未 ack 再 push（§6.5）で構造的に回収されるため、subscriber 側の gap 検知を前提にしない。
 
 ---
 
@@ -188,7 +199,7 @@ Body: {
   labels: [<string>, ...],           // 順序無視・重複削除して set 扱い。空配列は 400
   lease_ttl?: <seconds>,             // default 300, min 30, max 86400
   delivery_options?: {
-    retain_seconds?: <int>           // SSE 切断中の outbox 保持秒数。default 86400(24h)。ただし retain_seconds <= lease_ttl
+    retain_seconds?: <int>           // outbox エントリの保持上限秒数。default 86400(24h), min 60, max 86400（§6.4）
   }
 }
 → 201 Created { subscription_id, lease_expires_at }
@@ -196,8 +207,16 @@ Body: {
 ```
 
 - relay が `subscription_id`（UUID）を採番して返す。labels 変更は「新 subscribe + 旧 unsubscribe」で表現。
+- `subscriber` は呼び出し元の認証済み identity と一致しなければならない（不一致は `403`。代理 subscribe
+  は認めない）。以後この subscription への操作はこの identity に限定される（§5.7）。
 - 同一 `(subscriber, labels)` でも複数 subscription を持てる（独立 lease）。
 - `initial_replay` 系のオプションは **持たない**（R1: 取りこぼしは未 ack outbox 再 push で回収）。
+- `lease_ttl` と `retain_seconds` は**独立した軸**であり、大小制約を置かない。lease は subscription の
+  生存（renew で延命し続ける liveness）、retain は outbox エントリ 1 件の保持上限（durability）。
+  短い lease を renew し続ける長寿命 subscriber が retain=24h の再送猶予を持つのが標準の姿で、
+  `retain_seconds > lease_ttl` は正当。lease が renew されず切れると、retain の残りに関係なく当該
+  subscription の未 ack エントリは配達対象から外れる（§6.4 の動的規則）。実効 replay 窓は
+  min(retain, subscription が生存した期間)。
 
 ### 5.2 マッチング規則（subset / AND）
 
@@ -212,11 +231,16 @@ Body: {
 PUT /subscriptions/{subscription_id}/lease
 Body: { lease_ttl?: <seconds> }     // 省略時は subscribe 時の値を再適用
 → 200 OK { lease_expires_at }
-→ 410 Gone   (期限切れ subscription)
+→ 404 Not Found   (subscription 不在、または呼び出し元が subscriber でない。§5.7)
+→ 410 Gone   (lease 切れ済み subscription が registry に残存。§5.7)
 
 DELETE /subscriptions/{subscription_id}
 → 204 No Content
+→ 404 Not Found   (subscription 不在、または呼び出し元が subscriber でない。§5.7)
 ```
+
+- unsubscribe は当該 subscription の未 ack outbox エントリを同一 transaction で削除する（明示的な
+  関心放棄であり DLQ には送らない。lease 切れとの扱いの差は §6.6）。
 
 > lease / subscription registry は in-memory（R1: liveness クラス）。relay 再起動で消えるため、
 > subscriber は再接続時に **re-subscribe（idempotent な使い方）+ heartbeat** で自己修復する。
@@ -231,7 +255,7 @@ Body: {
   title?: <string>,                  // max 200 UTF-8 chars, relay は truncate しない（publisher 責任）
   idempotency_key?: <string>         // 15 分内同一キーは dedup
 }
-→ 202 Accepted { publish_id, publish_seq, matched_subscriptions: <int> }
+→ 202 Accepted { publish_id, matched_subscriptions: <int> }
 → 429 Too Many Requests { Retry-After }   (publisher ごと rate limit 超過, default 100 req/sec)
 ```
 
@@ -247,12 +271,10 @@ Accept: text/event-stream
 → 200 text/event-stream
 
 event: notification
-id: <publish_seq>
+id: <publish_id>
 data: {
   delivery_target,        // "sub:<subscription_id>" | "stream:<stream_id>"
-  subscription_seq,       // delivery target ごと単調
-  publish_id,
-  publish_seq,            // グローバル単調（id: と同値）
+  publish_id,             // int、グローバル単調（id: 行と同値）
   ref?,                   // subscription レーンのとき
   labels?,                // subscription レーンのとき
   body?,                  // 場レーンのとき（不透明 body）
@@ -261,26 +283,66 @@ data: {
 }
 ```
 
-- 1 つの SSE 接続が複数 `subscription_id` を多重化。**加えて**、接続した identity が member である
-  場のメッセージも同じ接続に流れる（delivery_target で判別）。
-- SSE `id:` に `publish_seq` を載せる（重複検知用）。**relay は `Last-Event-ID` を resume に使わない**
+- 1 つの SSE 接続が複数 `subscription_id` を多重化。**加えて**、接続した identity が read 権限を持つ
+  member である場のメッセージも同じ接続に流れる（delivery_target で判別）。
+- SSE `id:` に `publish_id` を載せる（重複検知用）。**relay は `Last-Event-ID` を resume に使わない**
   — 再接続時は per-購読 ack カーソルに基づき未 ack outbox を黙って再 push する（§6.5）。
-- keepalive: push が無い間も 30 秒ごとに `: keepalive` コメント行（proxy 切断防止）。
+- keepalive: push が無い間も 30 秒ごとに `: keepalive` コメント行（proxy 切断防止）。keepalive の
+  write 失敗は当該接続の強制切断トリガーになる（§6.4）。
+- `subscription_ids=` の各 id には ownership 検証が掛かる（§5.7）。呼び出し元 identity の所有でない /
+  存在しない id が 1 つでも含まれる場合、接続確立前に `404 Not Found`。relay 再起動で registry が
+  消えた後も同じ応答になる（§5.7）。所有する subscription の lease が切れて registry に残っている
+  場合は `410 Gone`。subscriber は `404` / `410` のいずれも「re-subscribe せよ」のシグナルとして扱う。
 
-### 5.6 `POST /events/ack` — 明示 ack（本書で新設）
+### 5.6 cumulative ack（レーン別 endpoint）
 
 ```
-POST /events/ack
-Body: { acks: [ { delivery_target: <string>, publish_id: <string> }, ... ] }
-→ 204 No Content
+POST /subscriptions/{subscription_id}/ack        // subscription レーン
+Body: { up_to_publish_id: <int> }
+→ 200 OK
+→ 404 Not Found   (subscription 不在、または呼び出し元が subscriber でない。§5.7)
+→ 410 Gone        (lease 切れ済み subscription が registry に残存。§5.7)
+
+POST /streams/{stream_id}/ack                    // 場レーン
+Body: { up_to_publish_id: <int> }
+→ 200 OK
+→ 404 Not Found   (場が不在、または呼び出し元が read 権限を持つ member でない。露呈回避)
 ```
 
-- subscriber が受信・処理済みの配達を ack する。relay は対応する outbox エントリを削除する。
+- ack は per-message ではなく **cumulative**。relay は当該 delivery target の outbox から
+  `publish_id <= up_to_publish_id` のエントリを一括削除する。subscriber は都度 ack しても、
+  batch 処理後に最大の `publish_id` を 1 回だけ ack してもよい（ack コストは O(1)）。
+- 場レーンの delivery target は「場 × 呼び出し元 identity」に解決される。member は自分宛エントリ
+  しか ack できず、他 member 宛エントリは構造上指定できない（§5.7）。場レーンは subscription を
+  介さないため lease を持たず、membership の存在自体が配達継続の条件になる。
 - **ack されるまで outbox エントリは残る**（push 成功だけでは削除しない）。これにより subscriber が
   受信後・処理前にクラッシュしても、再接続時に再 push される（at-least-once の確証を ack に置く）。
-- ack はバッチ可（複数 `publish_id` を 1 リクエストで）。
-- 冪等: 既に削除済みの `publish_id` への ack は no-op で `204`。
-- 重複配達（再 push）を subscriber が落とすのは `(delivery_target, publish_seq)` の組で行う。
+- 冪等: 同じ `up_to_publish_id` を 2 回送っても削除対象ゼロ件の no-op で `200 OK`。
+- 重複配達（再 push）の排除は subscriber が `(subscription_id, publish_id)` の組で行う（SDK 別書
+  §4.2 と整合）。場レーンは subscription_id を持たないため `(stream_id, publish_id)` の組で同様に行う。
+
+### 5.7 subscription 操作の ownership 検証
+
+`subscription_id` を参照するすべての operation — lease renew / unsubscribe（§5.3）、`GET /events` の
+`subscription_ids=`（§5.5）、cumulative ack（§5.6 の `POST /subscriptions/{id}/ack`）— で、relay は
+**呼び出し元の認証済み identity が当該 subscription の `subscriber` と一致すること**を検証する。
+この検証は当事者性（ownership）という relay 内部の構造的事実のみに基づく判定であり、
+**structural authZ の一部**である（identity 別書 §2.2）。
+
+- 不一致は `404 Not Found`。存在しない subscription_id と**同一応答**とし、subscription の存在自体を
+  第三者に露呈しない（§8 の露呈回避原則）。検証順序は ownership（404）→ lease 状態（410）。
+  非所有者に `410` を返して存在を推測させることもしない。
+- `410 Gone` は「所有者本人の subscription が lease 切れ済みで registry にまだ残っている」場合にのみ
+  返る。relay 再起動で registry が消えた後は「かつて存在した」事実を relay が持たないため `404` に
+  なる（`410` は返せるときだけ返す best-effort のヒント）。subscriber は `404` / `410` のどちらも
+  「re-subscribe せよ」のシグナルとして同一に扱う（SDK 別書 §3.4）。
+- subscription_id（UUID）は secret ではなく単なる識別子として扱う。ログ・観測系への露出を前提とし、
+  「id を知っていること」を authZ にしない（capability URL 方式を採らない）。この検証が無い場合、
+  露出した id 1 つで第三者が unsubscribe / ack を撃ち、正当な subscriber には「何も届かない」だけで
+  異常の手がかりが残らない**無音の配達妨害**が成立してしまう。
+- 場レーンの ack（`POST /streams/{id}/ack`、§5.6）は、呼び出し元 identity 宛のエントリ
+  （target = 場 × 当該 identity）だけに解決される。他 member 宛のエントリは構造上指定できないため
+  場レーンに ownership 違反は存在せず、該当エントリが無ければ冪等 no-op（§5.6）。
 
 ---
 
@@ -308,29 +370,50 @@ Body: { acks: [ { delivery_target: <string>, publish_id: <string> }, ... ] }
 
 ### 6.4 retain / push retry
 
-- subscription outbox の retain default = 24h（subscribe 時 override 可、ただし `retain_seconds <= lease_ttl`）。
-- 場 outbox の retain default = 場の `default_ttl`（§3.1）。
-- push 失敗時は指数バックオフ retry（初回 100ms, 係数 2, 最大 5 回 ≒ 累積 3.1s）。超過後は outbox に戻し再接続/再 push を待つ。
+- subscription outbox の retain default = 24h（subscribe 時 `retain_seconds` で override 可、§5.1）。
+- 場 outbox の retain default = 場の `default_ttl`（§3.1、未指定なら relay 既定 24h）。
+- retain の許容域は両レーン共通で min 60 / max 86400（24h）。上限 24h は R1 の「relay は history を
+  持たない」原則による — それを超える範囲の回収は publisher pull の責務（§6.7）。
+- **`retain_seconds <= lease_ttl` のような静的制約は置かない**。outbox エントリが配達対象から外れる
+  条件は、次のうち**最初に起きた事象**という動的規則に一本化する:
+  - (a) subscriber の明示 ack（§5.6）→ エントリ削除
+  - (b) retain 超過 → dead 化（§6.6）
+  - (c) delivery target の消滅 — lease 切れ / relay 再起動による registry 消失（permanent error）→
+    dead 化（§6.6）。unsubscribe は dead 化ではなく即時削除（§5.3）
+- push 失敗時は指数バックオフ retry（初回 100ms, 係数 2, 最大 5 回 ≒ 累積 3.1s）。
+- **retry 超過時、relay は当該 SSE 接続を強制切断する**（slow consumer 切断）。TCP 上は生存したまま
+  write だけ失敗し続ける接続（受信側 buffer 詰まり等）を「切断」に正規化し、配達再開のトリガーを
+  「再接続時 resume（§6.5）」の 1 系統に保つ。これにより「切断イベントが発生せず再 push が無期限に
+  始まらない」状態を構造的に排除する。エントリは outbox に残り、再接続時に再 push される。
+- push が発生しない間の zombie 接続は keepalive（§5.5、30 秒毎）の write 失敗で検出し、同じく強制
+  切断する。強制切断は構造化ログ + `relay_sse_slow_consumer_disconnects_total`（§7.2）で観測する。
 
 ### 6.5 resume（再接続時の再 push）— R1 一本化
 
 - subscriber 再接続（`GET /events`）時、relay は当該購読の **未 ack outbox エントリを古い順に再 push** する。
 - subscriber は `Last-Event-ID` を送ってよいが、relay はそれを無視する（ack カーソルが真実源）。
-- subscriber は重複を `(delivery_target, publish_seq)` で吸収し、処理後に `POST /events/ack`。
+- subscriber は重複を delivery target ごとの `publish_id`（subscription レーンは
+  `(subscription_id, publish_id)`、場レーンは `(stream_id, publish_id)` の組）で吸収し、処理後に
+  cumulative ack を返す（§5.6）。
 
 ### 6.6 DLQ（dead letter）
 
 - outbox エントリは以下で `dead` 化し polling 対象外に:
   - retain 期間（default 24h / 場は default_ttl）超過、未 ack のまま
-  - permanent error（subscriber identity 削除済み / subscription_id 不存在 等）
+  - permanent error = delivery target の消滅（subscriber identity 削除済み / subscription の lease 切れ /
+    relay 再起動による registry 消失 等）
+- unsubscribe（§5.3）は dead 化ではなく未 ack エントリの**即時削除**。明示的な関心放棄は事故ではない
+  ため、DLQ と warn ログは意図しない消滅（lease 切れ / registry 消失）の観測専用に保つ。
 - dead 化時に warn 構造化ログ（§7.3）。`dead` から 7 日後に物理削除。
 - `/status` に件数、`/metrics` に `relay_outbox_dead_total`。
 
 ### 6.7 retain 切れ時の fallback
 
-- retain を超えて offline だった subscriber は relay outbox から replay 不可。
+- retain 超過、または subscription 消滅（lease 切れ / registry 消失）で dead 化したエントリは
+  relay outbox から replay 不可。
 - subscriber は publisher（cc-memory 等）へ直接 pull して取りこぼしを回収する
-  （責務境界: relay は ≤retain の便利再送、それ以前は publisher が source of truth）。
+  （責務境界: relay は **subscription 生存中かつ retain 内**の便利再送、それを超える範囲は
+  publisher が source of truth）。
 - 再接続時、relay 側に該当 outbox が無ければ単に再 push 対象ゼロ（無音）。subscriber は別途
   定期 full reconciliation で publisher に当たる（SDK 側 3 段階 reconciliation、別書）。
 
@@ -355,10 +438,14 @@ Body: { acks: [ { delivery_target: <string>, publish_id: <string> }, ... ] }
 
 ### 7.2 `GET /metrics`（Prometheus 互換）
 
-`relay_publish_received_total{publisher_identity}` / `relay_push_delivered_total{delivery_target}` /
+`relay_publish_received_total{publisher_identity}` / `relay_push_delivered_total{lane}` /
 `relay_outbox_depth` / `relay_outbox_dead_total` / `relay_sse_connections` /
 `relay_subscription_lease_expirations_total` / `relay_publish_failed_total{failure_reason}` /
-`relay_ack_received_total`。
+`relay_ack_received_total` / `relay_sse_slow_consumer_disconnects_total`。
+
+- label に `subscription_id` や `delivery_target` を**使わない**（`lane` = `stream` | `subscription`）。
+  metrics 経由の subscription_id 露出（§5.7 が防ぐ攻撃の前提になる）と label cardinality 爆発の両方を
+  避ける。per-target の追跡は構造化ログ（§7.3、`publish_id` trace）で行う。
 
 ### 7.3 構造化ログ + サーバーログ
 
@@ -374,15 +461,15 @@ Body: { acks: [ { delivery_target: <string>, publish_id: <string> }, ... ] }
 
 | code | 意味 | 主な発生箇所 |
 |---|---|---|
-| `200` | 取得 / 更新成功 | GET 系, lease renew, membership |
+| `200` | 取得 / 更新成功 | GET 系, lease renew, membership, cumulative ack |
 | `201` | 生成成功 | 場作成, subscribe |
 | `202` | 受理（配達は非同期） | 場投函, publish |
-| `204` | 成功・本文なし | unsubscribe, member 削除, ack, 場 close |
+| `204` | 成功・本文なし | unsubscribe, member 削除, 場 close |
 | `400` | 不正リクエスト | labels==[], 必須欠落 |
-| `403` | 認可なし | membership 不足 |
-| `404` | 不存在（露呈回避含む） | 場 / subscription 不在 |
+| `403` | 認可なし | membership 不足, subscribe の `subscriber` ≠ 認証 identity |
+| `404` | 不存在（露呈回避含む） | 場 / subscription 不在, 非所有 subscription への操作（§5.7） |
 | `409` | 競合 | stream_id 既存 |
-| `410` | 消滅 / 期限切れ | close 済み場への投函, lease 切れ renew |
+| `410` | 消滅 / 期限切れ | close 済み場への投函, 所有者本人による lease 切れ subscription への操作（registry 残存時のみ。§5.7） |
 | `429` | rate limit | publisher ごと publish 上限 |
 | `503` | 一時不能 | outbox 障害（disk full / DB corrupt） |
 
@@ -396,11 +483,11 @@ Body: { acks: [ { delivery_target: <string>, publish_id: <string> }, ... ] }
 
 ```
 member A → POST /streams/{X}/messages
-  → relay: 場 X の writer membership 検証
-  → relay: publish_seq 採番、場 X の各 member の outbox にエントリ作成（単一 tx）
-  → relay: 202 { publish_id, publish_seq, matched_members }
+  → relay: 場 X の write 権限（membership）検証
+  → relay: publish_id 採番、場 X の read 権限を持つ各 member の outbox にエントリ作成（単一 tx）
+  → relay: 202 { publish_id, matched_members }
   → dispatcher: outbox polling → 接続中 member の SSE へ push（delivery_target="stream:X"）
-  → member: 受信 → 処理 → POST /events/ack
+  → member: 受信 → 処理 → POST /streams/{X}/ack { up_to_publish_id }
   → 切断中 member: retain まで outbox 保持 → 再接続で未 ack 再 push
 ```
 
@@ -409,9 +496,9 @@ member A → POST /streams/{X}/messages
 ```
 publisher → POST /publish { ref, labels, title?, idempotency_key? }
   → relay: idempotency dedup（15分）→ subset マッチ算出 → 各 subscription の outbox にエントリ作成（単一 tx）
-  → relay: 202 { publish_id, publish_seq, matched_subscriptions }
+  → relay: 202 { publish_id, matched_subscriptions }
   → dispatcher: outbox polling → 接続中 subscriber の SSE へ push（delivery_target="sub:<id>"）
-  → subscriber: 受信 → 処理 → POST /events/ack
+  → subscriber: 受信 → 処理 → POST /subscriptions/{id}/ack { up_to_publish_id }
   → 切断中 / retain 切れ: 未 ack 再 push、または publisher 直接 pull で回収（§6.7）
 ```
 
@@ -420,7 +507,6 @@ publisher → POST /publish { ref, labels, title?, idempotency_key? }
 ## 10. 残置（実装段階で詰める）
 
 - **マッチング性能**: subset 判定を 10,000 subscriptions × 100 labels で p99 200ms に収める（inverted index 等）。
-- **多重化時の ack 整合**: 1 SSE 接続で多 target を多重化した際の ack バッチ境界・部分 ack の扱い。
 - **場メンバーの SSE 受信開始**: `GET /events` に member の場を自動含めるか、明示 `stream_ids=` も受けるか（本書は「認証 identity の member 場を自動含む」前提。明示指定オプションは実装段階で要否判断）。
 - **物理 schema / engine**: outbox table 定義・SQLite vs LMDB（A#1193 確定待ち）。
 - **rate limit の場投函への適用**: §5.4 の publisher rate limit を場投函にも掛けるか。

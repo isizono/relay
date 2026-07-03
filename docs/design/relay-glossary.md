@@ -35,8 +35,8 @@ relay v2 は、エージェント間で非同期に流れるメッセージを a
 - 名前付きの共有空間で、`stream_id`（文字列）で識別する。
 - メッセージは投函された瞬間にメンバーへの配達経路（outbox）に転写されるだけで、
   stream という場所には永続蓄積されない（pass-through）。
-- stream は membership（writer / reader の集合）を持ち、これが場固有の coarse-grained
-  authZ として機能する。
+- stream は membership（identity ごとの read / write access の集合）を持ち、これが場固有の
+  structural authZ の判定材料として機能する。
 - stream の close は「新規投函を止める」ことだけを意味し、過去メッセージのアーカイブを
   作らない。close 後も outbox に残った未配達分は retain 期間まで配達を継続する。
 - 機能要件文書の本文では日本語の「場」と表記される箇所が残るが、relay v2 のドキュメント
@@ -75,9 +75,9 @@ relay v2 は、エージェント間で非同期に流れるメッセージを a
 **詳細**:
 
 - subscribe API を呼んで subscription を作り、その後 SSE 接続を張って push を受ける。
-- stream のメンバーとして配達を受ける場合は、subscribe を呼ばなくても membership が
-  あれば配達対象になる（stream のメンバーは自動 subscribe されないが、メンバー宛
-  push は届く）。
+- stream のメンバーとして配達を受ける場合は、subscribe を呼ばなくても read 権限を持つ
+  membership があれば配達対象になる（stream のメンバーは自動 subscribe されないが、
+  メンバー宛 push は届く）。
 - 種別（ow エージェント、一般 claude セッション、外部 UI、外部 bot など）を relay は
   区別しない。subscriber 種別中立性と呼ぶ。
 - subscriber identity の経時的同一性は relay の責務外である。再接続した subscriber は
@@ -122,7 +122,10 @@ relay v2 は、エージェント間で非同期に流れるメッセージを a
 - subscriber が持参して継続する経路を持たない。再接続時は新規 subscribe を呼んで
   新しい subscription_id を得る。
 - relay 再起動で in-memory な subscription registry が消失するため、再起動後に旧
-  subscription_id を持参しても `410 Gone` が返る。
+  subscription_id を持参しても `404 Not Found` が返る（relay は「かつて存在した」事実を
+  持たないため `410` を返せない。`410 Gone` は lease 切れ済み subscription が registry に
+  残っている間だけ返る best-effort のヒントで、subscriber はどちらも re-subscribe の
+  シグナルとして扱う）。
 - 旧 subscription_id 宛に残った outbox エントリは「subscription_id 不存在」を理由に
   permanent error 経路で DLQ に倒され、時間経過で消滅する。
 - subscription_id の経時同一性管理（再起動前後で「同じ subscriber」とみなすか）は
@@ -137,20 +140,24 @@ relay v2 は、エージェント間で非同期に流れるメッセージを a
 
 ### membership
 
-**一行定義**: stream ごとに保持される「誰が writer で誰が reader か」の集合。
+**一行定義**: stream ごとに保持される「誰が write 権限（投函）/ read 権限（受信）を
+持つか」の集合。
 
 **詳細**:
 
-- relay は stream ごとに `(identity, role)` の集合を持ち、`role` は
-  `writer` / `reader` / `both` のいずれかを取る。
-- これは coarse-grained authZ の一部で、relay が直接判定する。
+- relay は stream ごとに `(identity, access)` の集合を持ち、`access` は
+  `read` / `write` / `read_write` のいずれかを取る。write = 投函権、read = 受信権で、
+  場レーンの配達先は read 権限を持つ member 集合で決まる。
+- field 名は `role` ではなく `access` とする（role 概念を relay の状態モデルに乗せない）。
+- これは structural authZ の判定材料で、relay が直接照合する。
 - 「誰がこの stream を close してよいか」「誰が cancel を投げてよいか」のような操作
-  権限は relay は判定しない（細粒度判定は relay 外、後述の cc-memory MCP handler
+  権限は relay は判定しない（semantic authZ は relay 外、後述の cc-memory MCP handler
   同期ゲートに寄せる）。
 - stream の membership と subscription は独立で、メンバーは自動 subscribe されないし、
   subscription だけで stream のメンバーになることもない。
+- stream 作成者は作成時に write 権限を持つ member として自動登録される（bootstrap）。
 
-**関連用語**: stream / authZ 境界 / coarse-grained authZ
+**関連用語**: stream / authZ 境界 / structural authZ
 
 **出典**: 機能要件文書、ワイヤ / API 仕様
 
@@ -164,7 +171,7 @@ relay v2 は、エージェント間で非同期に流れるメッセージを a
 **詳細**:
 
 - relay が disk に永続化する唯一のデータが outbox である。subscription registry、
-  lease、SSE 接続状態、identity → role 束縛などはすべて in-memory に置き、relay 再起動
+  lease、SSE 接続状態、stream membership などはすべて in-memory に置き、relay 再起動
   時には消える設計を取る。
 - outbox エントリのキーは `(subscription_id, publish_id)`（または stream メンバー宛の
   場合は配達ターゲットごと）で、relay 全体で global に単調な publish_id によって順序が
@@ -193,8 +200,11 @@ relay v2 は、エージェント間で非同期に流れるメッセージを a
     再接続なし
   - retain 期間（subscription レーンは default 24 時間、stream レーンは stream の
     `default_ttl`）超過
-  - permanent error（subscriber identity 削除済み、subscription_id 不存在、relay 再起動に
-    よる in-memory registry 消失、明示 unsubscribe による自然消滅など）
+  - permanent error（subscriber identity 削除済み、subscription_id 不存在、lease 切れ、
+    relay 再起動による in-memory registry 消失など、意図しない delivery target の消滅）
+- 明示 unsubscribe は DLQ を通らない。未 ack エントリは unsubscribe と同一 transaction で
+  即時削除される（明示的な関心放棄は事故ではないため、DLQ と warn ログは意図しない消滅の
+  観測専用に保つ）。
 - dead 化時には warn 構造化ログを 1 件出力する。
 - dead エントリは `dead_at` から 7 日後に物理 DELETE される（運用観察期間）。
 - `/status` で件数が、`/metrics` で `relay_outbox_dead_total` カウンタが exposure される。
@@ -238,7 +248,7 @@ relay v2 は、エージェント間で非同期に流れるメッセージを a
 
 - 1 つの publish_id は次の 3 役を兼ねる。
   - **ack の cumulative カーソル**: `POST /subscriptions/{id}/ack { up_to_publish_id: N }`
-    の N がそのまま publish_id である。
+    （場レーンは `POST /streams/{id}/ack`）の N がそのまま publish_id である。
   - **outbox エントリのキーの一部**: `(subscription_id, publish_id)` の組で outbox
     エントリを一意に識別する。
   - **SSE event の `id:` 行**: subscriber 側の重複検知や、subscription 間での発生順
@@ -263,9 +273,12 @@ relay v2 は、エージェント間で非同期に流れるメッセージを a
 
 - subscribe 時に `lease_ttl` を秒で指定する（default 300 秒、min 30 秒、max 86400 秒）。
 - subscriber は `PUT /subscriptions/{id}/lease` で renew する。期限切れの subscription
-  に対する renew は `410 Gone` が返り、subscriber は新規 subscribe を呼ぶ。
-- lease 切れの subscription への push は破棄される（`retain_seconds <= lease_ttl` の
-  制約があるため、retain も lease を超えない）。
+  に対する renew は `410 Gone`（registry 消失後は `404 Not Found`）が返り、subscriber は
+  新規 subscribe を呼ぶ。
+- lease と retain は独立した軸で、大小制約は置かない（`retain_seconds > lease_ttl` は正当。
+  短い lease を renew し続ける長寿命 subscriber が retain=24h の再送猶予を持つのが標準の姿）。
+  lease が renew されず切れると、retain の残りに関係なく当該 subscription の未 ack エントリ
+  は DLQ 経路に倒される。実効 replay 窓は min(retain, subscription が生存した期間)。
 - lease / subscription registry は in-memory に保持され、relay 再起動で消失する。
   再起動後は re-subscribe + heartbeat による自己修復に依存する設計である。
 - lease TTL の min / max は subscriber 種別に依存させず固定する（subscriber 種別中立性）。
@@ -285,14 +298,17 @@ relay v2 は、エージェント間で非同期に流れるメッセージを a
 
 **詳細**:
 
-- `POST /subscriptions/{id}/ack { up_to_publish_id: N }` で送る。
-- relay は受領した subscription の outbox から `publish_id <= N` のエントリを一括削除
+- subscription レーンは `POST /subscriptions/{id}/ack { up_to_publish_id: N }` で送る。
+  stream レーンは `POST /streams/{id}/ack { up_to_publish_id: N }` で送り、対象は
+  「場 × 呼び出し identity」宛のエントリに解決される。
+- relay は当該 delivery target の outbox から `publish_id <= N` のエントリを一括削除
   する（cumulative ack、後述）。
 - **TCP write 完了は ack ではない**。relay が SSE で push し終わっても outbox エントリは
   消えず、subscriber が application-level ack を返したときに初めて消える。これは
   subscriber プロセスが SSE 受信後に crash する構造的穴を防ぐためである。
 - 同じ `(subscription_id, up_to_publish_id)` を 2 回送っても `200 OK` で冪等。
-- 不存在 subscription_id への ack は `410 Gone` が返る。
+- 非所有・不存在の subscription_id への ack は `404 Not Found` が返る（存在露呈回避。
+  所有者本人の lease 切れ subscription が registry に残っている間のみ `410 Gone`）。
 
 **関連用語**: cumulative ack / at-least-once / outbox / 暗黙再 push
 
@@ -371,7 +387,7 @@ relay v2 は、エージェント間で非同期に流れるメッセージを a
 **詳細**:
 
 - subscription レーンは default 24 時間。subscribe 時に `delivery_options.retain_seconds`
-  で override 可能。ただし `retain_seconds <= lease_ttl` の制約がある。
+  で override 可能（min 60 / max 86400）。lease_ttl とは独立した軸で、大小制約はない。
 - stream レーンは stream の `default_ttl` を使う。
 - retain 期間を超えた未 ack エントリは DLQ 経路に倒され、7 日後に物理 DELETE される。
 - 「relay は短期の便利な再送装置、長期の真実源は publisher」という責務境界を明示する
@@ -392,13 +408,11 @@ relay v2 は、エージェント間で非同期に流れるメッセージを a
 
 **詳細**:
 
-- 「誰が publish したか」「誰が subscribe したか」「誰が command を投げたか」を判定する
-  ための基本単位である。
+- 「誰が publish したか」「誰が subscribe したか」を判定するための基本単位である。
 - relay v2 では A2A 1.0 spec の AgentCard を identity の公開記述子として採用し、認証
   方式は SecurityScheme で宣言される。
 - identity の真正性検証は relay が責任を持つ（authN）。「特定 identity が特定操作を
-  してよいか」の細粒度判定は relay 外（cc-memory MCP handler）に寄せる（fine-grained
-  authZ）。
+  してよいか」の意味判定は relay 外（cc-memory MCP handler）に寄せる（semantic authZ）。
 - subscriber identity の経時的同一性は relay の責務外で、ow / publisher 側ポリシーで
   担保する。
 
@@ -496,27 +510,31 @@ relay v2 は、エージェント間で非同期に流れるメッセージを a
 
 ### authZ 境界
 
-**一行定義**: relay 側 authZ は command（close / cancel / spawn 等）認可に限定し、
-read / publish / subscribe は relay 側 authZ の対象外とする方針。
+**一行定義**: relay 側 authZ は structural authZ（構造判定）に限定し、semantic authZ
+（意味判定）は relay の外（cc-memory MCP handler 同期ゲート）に置く方針。
 
 **詳細**:
 
 - read 系 endpoint（GET 各種）は authN のみで通す。「特定 entity の閲覧禁止」のような
   細粒度 read filter は relay は持たない。必要なら publisher 側で公開 / 非公開を分けて
-  publish する。
+  publish する。ただし `GET /events` の `subscription_ids=` に列挙した各 id には
+  ownership 検証（structural authZ の一部）が掛かる。
 - publish は authN のみで通す。「この labels への publish は禁止」のような細粒度 filter は
-  relay は持たない。ただし stream への投函は writer membership を要求する
-  （coarse-grained authZ の一部）。
+  relay は持たない。ただし stream への投函は write 権限の membership を要求する
+  （structural authZ の一部）。
 - subscribe は authZ 対象外で、認証済み identity であれば任意の labels セットで subscribe
   できる。漏れてはならない情報は subscribe filter ではなく publish gate で担保する。
-- command 系（`DELETE /streams/{id}` などの破壊的変更）に対しては relay 側で
-  coarse-grained authZ table（identity → 許可 command 集合）を引いて許可 / 拒否する。
-- 細粒度判定（「この identity がこの場の close を呼んでよいか」「この spawn を許可すべき
+- relay は command（close / cancel / spawn 等の ow 命令語彙）を認識しない。
+  「identity → 許可 command 集合」の authZ table も持たない（それは事実上の role 定義で
+  あり、role 概念を relay に持ち込まないという責務境界に反する）。`DELETE /streams/{id}`
+  などの状態変更系は write 権限の membership / subscriber 当事者性という構造的事実の照合
+  だけで通す。
+- 意味判定（「この identity がこの場の close を呼んでよいか」「この spawn を許可すべき
   状況か」など）は relay の外で、かつ操作の実行と同じプロセス内で同期に行う
   （cc-memory MCP handler 同期ゲート）。これにより「relay が close を受理したが ow 側で
   禁止判定が後追いで出る」のような race を構造的に消す。
 
-**関連用語**: authN / coarse-grained authZ / fine-grained authZ / membership
+**関連用語**: authN / structural authZ / semantic authZ / membership
 
 **出典**: identity / authZ 仕様、機能要件文書
 
@@ -540,41 +558,44 @@ read / publish / subscribe は relay 側 authZ の対象外とする方針。
 
 ---
 
-### coarse-grained authZ
+### structural authZ（構造判定）
 
-**一行定義**: 「この identity が relay の特定 API を呼んでよいか」の粗粒度判定。relay が
+**一行定義**: relay 自身が resource 管理の過程で機械的に記録した構造的事実（stream の
+membership、subscription の subscriber identity）との照合のみで決まる可否判定。relay が
 担当する。
 
 **詳細**:
 
-- 具体的には command 系 endpoint へのアクセス可否、および stream の writer / reader
-  membership を指す。
-- 「特定操作の対象 entity に対する判定」は coarse-grained authZ には含まれない
-  （fine-grained authZ として relay 外に寄せる）。
-- relay の認可 table は粒度を「command 系 endpoint に対する全体的 access 可否」までに
-  留める。
+- 具体的には、stream への投函 / close / membership 変更に対する write 権限の membership
+  照合と、subscription を名指しする操作（unsubscribe / lease renew / SSE 受信 / ack）に
+  対する subscriber 当事者性（ownership）照合を指す。
+- message body の解釈、ow の状態、操作の意味（それが task の cancel なのか worker の
+  spawn なのか）を判定材料にした時点で semantic authZ であり、relay の外に置く。
+- 「identity → 許可操作集合」のような authZ table は持たない。
+- 機能要件文書の「coarse-grained authZ」に対応する（旧称。§5 参照）。
 
-**関連用語**: authZ 境界 / membership / fine-grained authZ
+**関連用語**: authZ 境界 / membership / semantic authZ
 
 **出典**: identity / authZ 仕様
 
 ---
 
-### fine-grained authZ
+### semantic authZ（意味判定）
 
 **一行定義**: 「この identity がこの特定 stream / 特定 subscription / 特定 entity に
-対する操作をしてよいか」の細粒度判定。relay の外で行う。
+対する操作をしてよいか」を ow の状態・ポリシーに照らして行う判定。relay の外で行う。
 
 **詳細**:
 
 - 判定は cc-memory MCP handler 内で **同期判定 → 状態変更 → relay への publish** を 1
   つの transaction として扱う（cc-memory MCP handler 同期ゲート）。
-- 非同期構造（「relay 経由で command を投げてから後で別経路で authZ 結果を反映する」）
+- 非同期構造（「relay 経由で操作を投げてから後で別経路で authZ 結果を反映する」）
   は race condition を呼び込むため採らない。
-- 結果として relay 側 authZ table は粗粒度に留まり、relay が close / cancel / spawn の
+- 結果として relay 側は構造判定に留まり、relay が close / cancel / spawn の
   意味判定をしないという責務境界が成立する。
+- 機能要件文書の「fine-grained authZ」に対応する（旧称。§5 参照）。
 
-**関連用語**: authZ 境界 / coarse-grained authZ / cc-memory MCP handler 同期ゲート
+**関連用語**: authZ 境界 / structural authZ / cc-memory MCP handler 同期ゲート
 
 **出典**: identity / authZ 仕様
 
@@ -634,9 +655,9 @@ read / publish / subscribe は relay 側 authZ の対象外とする方針。
 **詳細**:
 
 - relay が持つもの（メカニズム）: 配達経路（outbox / push / retry / retain）、配達の
-  at-least-once 保証、送信者の真正性検証（authN）、coarse-grained authZ。
+  at-least-once 保証、送信者の真正性検証（authN）、structural authZ。
 - relay が持たないもの（ポリシー）: メッセージ本文の意味解釈、ロール概念
-  （orch / dispatcher / worker などの認識）、fine-grained authZ、関心領域の述語評価
+  （orch / dispatcher / worker などの認識）、semantic authZ、関心領域の述語評価
   （複雑な AND / OR / NOT の合成）、subscriber identity の経時的同一性管理。
 - ポリシーは時とともに揺れる（誰がどの操作をしてよいか、述語の意味、ロールの粒度）が、
   メカニズムは比較的安定する（配達は配達であって、再送と ack で閉じる）。
@@ -687,7 +708,7 @@ read / publish / subscribe は relay 側 authZ の対象外とする方針。
 - 202 が返った時点で「publish は relay の outbox に永続化済み」が保証されるため、以降
   relay が再起動しても当該 publish は失われない。
 - relay が disk で守るのは outbox のみで、subscription registry / lease / presence /
-  identity → role 束縛 は in-memory に置く設計と整合する。
+  stream membership は in-memory に置く設計と整合する。
 - publisher 側 SDK（`relay_sdk.outbox`）も同パターンを採用し、業務 write と outbox INSERT
   を同一 SQLite transaction に乗せる。dispatcher が outbox を polling して relay の
   `POST /publish` を呼ぶ。
@@ -749,8 +770,8 @@ single-direction streaming protocol。
 
 - subscriber は `GET /events?subscription_ids=<id1>,<id2>,...` で SSE 接続を開く。
 - 1 つの SSE 接続に複数の subscription_id を多重化できる。同時に、接続した identity が
-  member である stream のメッセージも同じ接続に流れる（payload 内の `delivery_target`
-  で判別する）。
+  read 権限を持つ member である stream のメッセージも同じ接続に流れる（payload 内の
+  `delivery_target` で判別する）。
 - SSE event の `id:` 行には `publish_id` が乗る。relay は subscriber 側の
   `Last-Event-ID` ヘッダを resume には使わない（ack カーソルが真実源）。
 - 30 秒ごとに `: keepalive` コメント行を送って、proxy / load balancer の close を防ぐ。
@@ -788,7 +809,7 @@ single-direction streaming protocol。
 ### relay 再起動と自己修復
 
 **一行定義**: relay が disk で守るのは outbox のみで、subscription registry / lease /
-presence / identity → role 束縛は in-memory に置く設計の帰結。
+presence / stream membership は in-memory に置く設計の帰結。
 
 **詳細**:
 
@@ -827,6 +848,11 @@ presence / identity → role 束縛は in-memory に置く設計の帰結。
 | archive / archive_ttl（stream 単位） | （廃止） | stream の永続蓄積廃止に伴い archive 概念が消滅 |
 | fire-and-forget | at-least-once + cumulative ack | v1 の配達保証の表記。v2 では outbox + retry + ack で確定的に保証する |
 | TCP write 完了 = 配達完了 | application-level ack | TCP write 完了は ack ではない |
+| `role`（membership の field / writer / reader / both） | `access`（read / write / read_write） | role 概念を relay の状態モデルに乗せない。write = 投函権、read = 受信権 |
+| coarse-grained authZ | structural authZ | 構造判定。relay が担当（membership / ownership の照合） |
+| fine-grained authZ | semantic authZ | 意味判定。relay 外（cc-memory MCP handler 同期ゲート） |
+| command（relay の語彙として） | （廃止） | relay は close / cancel / spawn 等の命令語彙を認識しない。relay 上では不透明 body の stream 投函として流れるだけ |
+| `POST /events/ack`（per-message バッチ ack） | `POST /subscriptions/{id}/ack` / `POST /streams/{id}/ack` | cumulative ack（`up_to_publish_id`）にレーン別 endpoint で一本化 |
 
 ---
 

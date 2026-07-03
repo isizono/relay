@@ -9,12 +9,12 @@
 >
 > - AgentCard / JWS / JCS / SecurityScheme（A2A 1.0 spec 準拠）
 > - relay の認証フロー（publisher / subscriber の identity 確立）
-> - relay 側 authZ 境界（**command 認可に限定**、subscribe は authZ 対象外）
+> - relay 側 authZ 境界（**構造判定に限定**、subscribe は authZ 対象外）
 > - relay 再起動と identity の関係
 >
 > **本書のスコープ外**:
 >
-> - ow（cc-memory / orch / worker）側の fine-grained authZ ポリシー本体。本書は relay 側の認可ゲート
+> - ow（cc-memory / orch / worker）側の semantic authZ ポリシー本体。本書は relay 側の認可ゲート
 >   と ow 側 MCP handler 同期ゲートの**境界**だけを書く。ow 側の判定ロジックは ow 側設計に閉じる
 > - ワイヤプロトコルの endpoint / payload / status code 全集
 >   → `relay-v2-wire-api.md`
@@ -28,9 +28,11 @@
 ## 0. 一行で言うと
 
 **relay の identity は A2A 1.0 spec の AgentCard + SecurityScheme + （任意で）JWS 署名で閉じる。
-relay 側 authZ は coarse-grained に限定する: read は全許可、subscribe は authZ 対象外、command 系
-（close / cancel / spawn 等）だけに認可ゲートをかける。fine-grained な「この identity がこの操作を
-してよいか」の最終判定は relay 内ではなく cc-memory MCP handler 内で同期判定する。**
+relay 側 authZ は構造判定（structural authZ）に限定する: read は全許可、subscribe（labels 宣言）は
+authZ 対象外、relay 自身の resource を変更する操作と `subscription_id` を名指しで参照する操作は
+membership / 当事者性（ownership）という relay 内部の構造的事実のみで判定する。relay は command
+（close / cancel / spawn 等の ow 命令語彙）を認識しない。「この identity がこの操作をしてよいか」
+という意味判定（semantic authZ）はすべて relay の外、cc-memory MCP handler 内で同期判定する。**
 
 ---
 
@@ -220,25 +222,33 @@ A2A 1.0 spec の canonical JSON は OpenAPI flat 形（`{"type": "http", "scheme
 - A2A 1.0 spec docs / proto に flat `"type": "http"` 形は出現しない。relay 実装の AgentCard
   シリアライザはこの canonical JSON 形で出力する。
 - `security` requirement object の各エントリの「array に列挙される文字列」は scope または role 名を
-  指す（OpenAPI 3.2.0 では bearer の場合 in-band 非交換の advisory role 名扱い）。relay は scope を
-  AgentCard.security で広告するだけでなく、JWS token 内の `scope` / `scp` claim を自前で検証する
-  必要がある（§3.4）。
+  指す（OpenAPI 3.2.0 では bearer の場合 in-band 非交換の advisory role 名扱い）。relay v2 は authZ
+  判定に token 内 scope を用いないため、この array は空とする（§3.4）。
 
 ---
 
 ## 2. authZ（認可）境界
 
-relay v2 の authZ は **3 軸分離**で定義する（機能要件文書 FR-5.5）。
+relay v2 の authZ は **3 軸分離**で定義する。
 
 | 軸 | 担当 | 内容 |
 |---|---|---|
 | **authN（identity 真正性）** | **relay** | 全 API はこれを最低限通る。Bearer token 検証 / JWS 検証等 |
-| **coarse-grained authZ** | **relay** | 「この identity が relay の特定 API を呼んでよいか」の粗粒度判定。具体的には **command 系 endpoint への access**（§2.2） |
-| **fine-grained authZ** | **relay 外**（cc-memory MCP handler） | 「この identity がこの **特定 stream / 特定 subscription / 特定 entity** に対する操作をしてよいか」の細粒度判定 |
+| **structural authZ（構造判定）** | **relay** | relay 自身が resource 管理の過程で機械的に記録した**構造的事実**（stream の membership、subscription の subscriber identity）との照合のみで決まる可否判定（§2.2） |
+| **semantic authZ（意味判定）** | **relay 外**（cc-memory MCP handler） | 「この identity がこの **特定 stream / 特定 subscription / 特定 entity** に対する操作をしてよいか」を ow の状態・ポリシーに照らして行う判定 |
+
+両者の境界は判定材料の**質**で引く: **message body の解釈、ow の状態、操作の意味（それが task の
+cancel なのか worker の spawn なのか）を判定材料にした時点で semantic authZ であり、relay の外に
+置く**。relay が判定に使ってよい材料は、relay 自身が記録した構造的事実のみである。
+
+> **用語 note**: 機能要件文書 FR-5.5 の「coarse-grained authZ」は本書の structural authZ に、
+> 「fine-grained authZ」は semantic authZ に対応する。ただし FR-5.5 の「command（close / cancel /
+> spawn 等）の発行可否ゲート」という表現は、relay が ow の命令語彙を認識するかのように読めるため
+> 本書では採らない（§2.2）。FR-5.5 側の表現は本書に合わせて更新すべきである。
 
 ### 2.1 read は全許可
 
-GET 系 endpoint（`GET /streams/{id}`、`GET /streams/{id}/members`、`GET /events`、`GET /status`、
+GET 系 endpoint（`GET /streams/{id}`、`GET /streams/{id}/members`、`GET /status`、
 `GET /metrics`、`GET /.well-known/agent-card.json` 等）は **authN（identity 確認）のみで authZ なし**
 で通す。
 
@@ -246,25 +256,46 @@ GET 系 endpoint（`GET /streams/{id}`、`GET /streams/{id}/members`、`GET /eve
 - 認証済み identity であれば、relay が公開する read 系 endpoint には誰でも access できる。
 - 「特定 entity の閲覧禁止」のような細粒度 read filter は relay は持たない。必要なら publisher 側
   （cc-memory 側）で公開 vs 非公開を分けて publish する。
+- **例外は `GET /events`**: endpoint 自体は認証のみで開けるが、query の `subscription_ids=` に列挙した
+  各 id には ownership 検証（structural authZ の一部、§2.2）が掛かる。非所有・不明の id を 1 つでも
+  含む接続はワイヤ仕様 §5.5 / §5.7 に従い `404 Not Found` で拒否される。
 
-### 2.2 command 認可に限定
+### 2.2 状態変更系は構造判定のみ（relay に command 概念は存在しない）
 
-relay 側 authZ は **command 系 endpoint のみ**にかける。
+relay は「command」という概念を持たない。close / cancel / spawn は ow の命令語彙であり、relay 上
+では「特定 stream への投函」（`POST /streams/{id}/messages`、body は relay にとって不透明）として
+流れるだけである。command の発行可否の認可は 100% cc-memory MCP handler 同期ゲート（§2.5）が担う。
 
-- relay が「command」として扱うのは、relay 自身の状態または外部状態を破壊的に変更する操作で、
-  かつ relay が直接実行するもの:
-  - **場 (stream) の close**（`DELETE /streams/{id}`）
-  - **場のメンバーシップ削除**（`DELETE /streams/{id}/members?identity=`）
-  - **subscription の unsubscribe**（他者の subscription を切ろうとするケース。自分の subscription を
-    切るのは authZ 対象外）
-- これらは relay 設定で「identity → 許可 command 集合」のマッピング（coarse-grained authZ table）に
-  従って許可 / 拒否する。
-- 「特定の close 操作対象が cancel すべきかどうか」「spawn を許してよい状況か」のような
-  状況依存判定は relay の外（cc-memory MCP handler）で行う（§2.5）。
+relay 自身の resource を変更する endpoint、および特定 resource を名指しで参照する endpoint には、
+以下の**構造判定**をかける。
 
-> **note**: 機能要件文書 FR-5.5 は「coarse-grained authZ は relay の責務」と定めるが、本書はその
-> coarse-grained authZ の適用範囲を **read を除く command 系のみ**に絞ることを明示する。
-> publish / subscribe / read は coarse-grained authZ の対象から外す（§2.3 / §2.4）。
+| endpoint | 構造判定 |
+|---|---|
+| `POST /streams/{id}/messages`（場への投函） | 投函者が当該 stream の **write 権限を持つ member**（`access: "write" \| "read_write"`）であること |
+| `DELETE /streams/{id}`（stream の close） | 呼び出し identity が当該 stream の write 権限を持つ member であること |
+| `PUT /streams/{id}/members` / `DELETE /streams/{id}/members`（membership 変更） | 呼び出し identity が当該 stream の write 権限を持つ member であること。ただし自分自身の membership 削除（離脱）は本人であれば常に許可する |
+| `DELETE /subscriptions/{id}`（unsubscribe）/ `PUT /subscriptions/{id}/lease`（lease renew）/ `GET /events` の `subscription_ids=` / `POST /subscriptions/{id}/ack`（ack） | 呼び出し identity がその subscription の **subscriber 本人**であること（ownership 検証、ワイヤ仕様 §5.7）。非所有・不明の id は `404 Not Found`（存在露呈回避） |
+| `POST /streams/{id}/ack`（場レーン ack） | 対象エントリが「場 × 呼び出し identity」に解決される。他 member 宛のエントリは構造上指定できないため ownership 違反が存在しない（ワイヤ仕様 §5.6 / §5.7） |
+
+- いずれも relay が resource 作成時に機械的に記録した構造的事実との照合であり、意味解釈を含まない。
+- membership の field は `access`（`"read" | "write" | "read_write"`。write = 投函権、read = 受信権）
+  であり、`role` という語彙は relay の状態モデルに置かない（下記の authZ table 不採用と同根）。
+- 「他者の subscription を切る」という操作経路はそもそも存在しない。非所有者からの
+  unsubscribe / lease renew / ack は ownership 検証により `404` で弾かれる（ワイヤ仕様 §5.7）。
+  強制切断が必要な場合は lease renew を止めさせて lease 失効で収束させる（その判断は ow 側
+  ポリシーの管轄）。
+- bootstrap: stream 作成者（`POST /streams` の呼び出し identity）は作成時に write 権限を持つ member
+  （`access: "write"`）として自動登録される。これがないと、空の stream に最初の member を追加できる
+  identity が存在しなくなる。受信も必要なら作成後に自分の access を `read_write` に更新する。
+- 「identity → 許可 command 集合」のマッピング（authZ table）は**持たない**。この table の判定には
+  「この identity は command を発行できる主体か」という identity の分類が必要であり、それは事実上の
+  role 定義である。role 概念を relay に持ち込まないという責務境界（relay = メカニズム / ow =
+  ポリシー）に反するため採らない。
+
+> **note**: 機能要件文書 FR-5.5 は「coarse-grained authZ は relay の責務」と定める。本書はその
+> 実体を上表の構造判定と定義する。publish は構造判定（write 権限の membership）の対象、
+> subscribe は対象外、read は authN のみ（`GET /events` の `subscription_ids=` 参照への ownership
+> 検証を除く）である（§2.1 / §2.3 / §2.4）。
 
 ### 2.3 publish は authN のみ
 
@@ -273,16 +304,17 @@ authN のみで通す。
 
 - 認証済み identity であれば publish できる。
 - 「この labels への publish は禁止」のような細粒度 filter は relay は持たない。
-- ただし `POST /streams/{id}/messages` は「writer membership」を要求する（場固有のアクセス権、
-  機能要件文書 FR-2 の coarse-grained authZ）。membership は relay 側で coarse-grained authZ として
-  保持する（§2.2 と同じ層）。
+- ただし `POST /streams/{id}/messages` は write 権限を持つ membership を要求する（場固有のアクセス権、
+  機能要件文書 FR-2）。membership は relay 側が保持する構造的事実であり、その照合は構造判定
+  （§2.2）の一部である。
 
 ### 2.4 subscribe は authZ 対象外
 
-`POST /subscriptions`（subscribe）および `GET /events?subscription_ids=`（SSE 受信）は authZ 対象外
-とする。
+`POST /subscriptions`（subscribe）は authZ 対象外とする。
 
 - 認証済み identity であれば、誰でも任意の labels セットで subscribe できる。
+- SSE 受信（`GET /events`）は「自分の subscription の受信口」であり、labels の内容による可否判定は
+  行わないが、`subscription_ids=` の各 id への ownership 検証（§2.2 の構造判定）は掛かる。
 - 「特定 labels の subscribe を禁止する」「特定 entity の通知を受け取れる identity を限定する」の
   ような細粒度 authZ は relay は持たない（機能要件文書 FR-5.5 と整合）。
 - これは「subscribe は labels セットの意図的宣言であって、relay は配達経路だけを持つ」という
@@ -293,7 +325,7 @@ authN のみで通す。
 
 ### 2.5 cc-memory MCP handler 同期ゲート
 
-fine-grained authZ（「この identity がこの **特定 stream / 特定 subscription / 特定 entity** に対する
+semantic authZ（「この identity がこの **特定 stream / 特定 subscription / 特定 entity** に対する
 操作をしてよいか」の判定）は **relay の外で、かつ操作の実行と同じプロセス内で同期に行う**。
 
 具体的には:
@@ -302,12 +334,13 @@ fine-grained authZ（「この identity がこの **特定 stream / 特定 subsc
   変更 → relay への publish** を一つの transaction として扱う。
 - 「relay 経由で command を投げてから後で別経路で authZ 結果を反映する」ような非同期構造は採らない
   （race condition が発生する）。
-- relay は cc-memory MCP handler が**判定を済ませた command** を受け取って配達するだけ。
-  relay 自身が close / cancel / spawn の意味判定を行うことはない。
+- relay は cc-memory MCP handler が**判定を済ませた message** を（不透明な body のまま）受け取って
+  配達するだけ。relay 自身が close / cancel / spawn の意味判定を行うことはない。
 
 設計帰結:
 
-- relay 側 authZ table は粒度を「command 系 endpoint に対する全体的 access 可否」までに留める。
+- relay 側の authZ 判定材料は membership / 当事者性という構造的事実までに留める
+  （identity → 操作種別の認可 table を持たない、§2.2）。
 - 細粒度判定（「この identity がこの場の close を呼んでよいか」）は cc-memory プロセス内 handler に
   寄せ、judgment lookup と state mutation を atomic に行う。
 - これにより「relay が close を受理したが ow 側で禁止判定が後追いで出る」「逆に ow 側で禁止判定が
@@ -347,41 +380,44 @@ fine-grained authZ（「この identity がこの **特定 stream / 特定 subsc
 6. subscriber は POST /subscriptions/{id}/ack で cumulative ack を返す
 ```
 
-### 3.3 command 系（authZ 経路）
+### 3.3 破壊的操作（cc-memory 同期ゲート経路）
 
 ```
-1. command を出す側（例えば orch）は cc-memory MCP handler を呼ぶ
+1. close / cancel / spawn 等の操作を出す側（例えば orch）は cc-memory MCP handler を呼ぶ
    （relay 直接ではなく cc-memory プロセス内 handler 経由）
 2. cc-memory MCP handler は同期で:
    a. 呼び出し identity の authN 結果を確認
-   b. 操作対象（場 / subscription / entity）に対する fine-grained authZ を判定
+   b. 操作対象（場 / subscription / entity）に対する semantic authZ を判定
    c. 許可なら状態変更を実行
    d. 必要に応じて relay に publish して通知を流す
-3. relay は cc-memory から received した publish を identity 真正性のみ確認して配達
-   （relay 側 fine-grained 判定なし）
+3. relay は cc-memory から received した publish を identity 真正性 +（場への投函の場合）
+   write 権限の membership 構造判定のみ確認して配達（relay 側の意味判定なし、body は不透明）
 ```
 
-`DELETE /streams/{id}` のような relay 直接 endpoint を経由する command も同様で、relay 側
-coarse-grained authZ は「この identity が delete API を呼んでよいか」までを判定し、
-「この場を delete してよい状況か」は cc-memory 側の同期 handler が事前判定したうえで relay を呼ぶ。
+`DELETE /streams/{id}` のような relay 直接 endpoint を経由する操作も同様で、relay 側の構造判定は
+「この identity がこの stream の write 権限を持つ member か」までを判定し、「この場を close してよい
+状況か」は cc-memory 側の同期 handler が事前判定したうえで relay を呼ぶ。この経路が成立するには、
+同期ゲートを担う cc-memory の identity が対象 stream の write 権限を持つ member である必要がある
+（membership の配線は ow 側の責務）。
 
-### 3.4 JWS token 内の scope 検証
+### 3.4 token 内 scope claim は authZ に用いない
 
-A2A 1.0 spec の bearer scheme で AgentCard.security に列挙された scope は in-band 非交換の advisory
-role 名扱いとなる（§1.5.2）。relay は JWS bearer token 内の `scope` / `scp` claim を自前抽出して
-照合する。
+relay v2 の authZ 判定材料は relay 内部の構造的事実（membership / subscriber 当事者性、§2.2）で
+あり、token 内の claim ではない。したがって relay は JWS bearer token 内の `scope` / `scp` claim を
+authZ 判定に用いない（token 検証は authN としての真正性確認のみ）。
 
-- token 形式の細部（claim 名 / 形式 / rfc-9068 採用可否）は relay 実装で確定する。本書では
-  「scope claim を JWS token に乗せ、relay 側 coarse-grained authZ table 引きと突き合わせる」までを
-  規定する。
-- scope の具体命名（`relay:command.close` 等）は議論中（§7）。
+- AgentCard の `security` requirement に列挙する scope array は空とする（§1.5.2 の例と整合）。
+- `relay:command.close` のような操作語彙 scope は定義しない。この種の scope は「identity → 許可
+  操作集合」の分類（事実上の role）を token に埋め込むものであり、authZ table を持たないと定めた
+  判断（§2.2）と同根で採らない。
+- 将来 labels ベース authZ（§5.1）を導入する場合、scope 設計はそのとき再検討する。
 
 ---
 
 ## 4. relay 再起動と identity
 
 relay v2 の永続層は **outbox のみ**（機能要件文書 FR-4.1）であり、subscription registry / lease /
-identity → role 束縛は **in-memory** に置く。これにより identity の経時挙動に以下の特徴が出る。
+stream membership は **in-memory** に置く。これにより identity の経時挙動に以下の特徴が出る。
 
 ### 4.1 in-memory state 喪失後の subscriber 再接続
 
@@ -414,7 +450,7 @@ identity → role 束縛は **in-memory** に置く。これにより identity �
 | 状況 | relay の振る舞い |
 |---|---|
 | 同じ identity が新しい subscription_id で再接続 | relay は完全な別人として扱う。labels セットも新規宣言を要求する |
-| 旧 subscription_id 持参で再接続要求 | relay は受理しない。subscriber は新規 subscribe を呼び直す |
+| 旧 subscription_id 持参で再接続要求 | relay は受理しない（registry 消失後は「かつて存在した」事実を持たないため `404 Not Found`。ワイヤ仕様 §5.7）。subscriber は新規 subscribe を呼び直す |
 | relay 再起動を跨いだ未配達 outbox エントリ | subscription_id 不存在 → DLQ 行き → 時間経過で物理削除（機能要件文書 FR-4.7） |
 | 取りこぼし回収 | 機能要件文書 FR-4.8 に従い、publisher（cc-memory 等）直接 pull で subscriber 側が補完する |
 
@@ -428,7 +464,7 @@ identity → role 束縛は **in-memory** に置く。これにより identity �
 
 現状の relay v2 は subscribe を authZ 対象外としている（§2.4）が、将来多テナント運用で「組織 A の
 identity は組織 B のみが publish した labels を subscribe できない」のような要件が出たとき、relay
-内に **labels ベースの fine-grained authZ** を導入する余地がある。
+内に **labels ベースの authZ**（構造判定を超える判定）を導入する余地がある。
 
 検討すべき点:
 
@@ -447,8 +483,8 @@ identity は組織 B のみが publish した labels を subscribe できない�
 
 - 通常 token と「危険操作用の追加 credential」を分けて持つ A2A 1.0 spec の in-task auth フローは、
   現状 relay v2 では採用しない。
-- command 系の fine-grained 判定は cc-memory MCP handler 同期ゲート（§2.5）で済ませる方針なので、
-  in-task auth を入れる動機は薄い。
+- close / cancel / spawn 等の意味判定は cc-memory MCP handler 同期ゲート（§2.5）で済ませる方針
+  なので、in-task auth を入れる動機は薄い。
 - 将来 cross-org delegation が要件化したとき検討する。
 
 ---
@@ -474,6 +510,5 @@ identity は組織 B のみが publish した labels を subscribe できない�
 | AgentCard の `provider` / `documentationUrl` の最終 URL | 未定 | relay リポ確定後に埋める |
 | 公開 vs extended AgentCard の field 切り分け | 推測 | 運用要件が出てきたとき確定する |
 | Bearer token 発行主体（relay 自前 vs 外部 IdP） | 推測 | 運用判断、本書では「relay 設定で選択」と書くに留める |
-| coarse-grained authZ table の具体スキーマ | 未定 | 実装計画 IF 凍結時に確定する |
-| scope 命名規則（`relay:command.close` 等） | 議論中 | 先行設計議論で 5 scope 案が出ているが、本書では「command 認可に限定」の境界だけを書き、scope 命名の最終 freeze は別議論 |
+| stream 作成者の write member 自動登録のワイヤ仕様反映 | 反映済み | §2.2 bootstrap 要件。`relay-v2-wire-api.md` §3.1 に反映済み |
 | JWS 鍵ローテーション運用手順 | 未定 | 運用ドキュメント側 |

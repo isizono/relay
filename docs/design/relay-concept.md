@@ -180,8 +180,9 @@ relay に明示し、relay はその範囲を outbox から削除する。TCP wr
 ### DLQ（dead letter queue）
 
 permanent error 状態の outbox エントリを退避する場所。
-代表例は、subscription_id が不存在になった（lease 切れ、明示 unsubscribe、
-relay 再起動による in-memory registry 消失など）ケース。
+代表例は、subscription_id が不存在になった（lease 切れ、
+relay 再起動による in-memory registry 消失など、意図しない消滅）ケース。
+明示 unsubscribe は DLQ を通らず、未 ack エントリは同一 transaction で即時削除される。
 DLQ 行きしたエントリは時間で物理 GC され、自然消滅する。
 
 ### labels（ラベル）
