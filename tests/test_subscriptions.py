@@ -147,6 +147,82 @@ class TestSubscriptionRegistry:
 
 
 # ---------------------------------------------------------------------------
+# matching() 性能ベンチマーク（wire-api.md §10: 10,000 subs × 100 labels で p99 200ms）
+# ---------------------------------------------------------------------------
+
+
+class TestMatchingPerformance:
+    """`matching()` の線形走査が §10 の性能 SLO を満たすかを実測で確認する。
+
+    ARCHITECTURE.md に「10,000 subscriptions × 100 labels で未検証」と明記されていた点の実測。
+    測定結果（開発機で p99 が sub-millisecond）から、inverted index 等の最適化は現時点で
+    過剰実装と判断できる。この test は実測を残すと同時に、O(n^2) 化のような致命的な性能退化を
+    SLO（200ms）を上限として検知する回帰ガードでもある（実測はその 2〜3 桁下で通る）。
+    """
+
+    SUBSCRIPTION_COUNT = 10_000
+    PUBLISH_LABEL_COUNT = 100
+    SLO_P99_MS = 200.0
+
+    def test_matching_meets_p99_slo_at_scale(self, capsys):
+        import random
+        import time
+
+        rng = random.Random(42)
+        vocab = [f"label:{i}" for i in range(500)]
+
+        registry = SubscriptionRegistry()
+        for _ in range(self.SUBSCRIPTION_COUNT):
+            k = rng.randint(1, 5)
+            registry.create("agent-x", frozenset(rng.sample(vocab, k)), 300, 86400)
+
+        publish_labels = frozenset(rng.sample(vocab, self.PUBLISH_LABEL_COUNT))
+
+        registry.matching(publish_labels)  # warmup（import / branch prediction 平準化）
+
+        samples_ms: list[float] = []
+        for _ in range(50):
+            start = time.perf_counter()
+            matches = registry.matching(publish_labels)
+            samples_ms.append((time.perf_counter() - start) * 1000)
+
+        samples_ms.sort()
+        p50 = samples_ms[len(samples_ms) // 2]
+        p99 = samples_ms[min(len(samples_ms) - 1, int(len(samples_ms) * 0.99))]
+        with capsys.disabled():
+            print(
+                f"\n[matching bench] subs={self.SUBSCRIPTION_COUNT}"
+                f" publish_labels={self.PUBLISH_LABEL_COUNT} matched={len(matches)}"
+                f" | per-call ms: p50={p50:.3f} p99={p99:.3f} max={samples_ms[-1]:.3f}"
+            )
+
+        assert p99 < self.SLO_P99_MS
+
+    def test_matching_worst_case_all_match(self):
+        """全 subscription が publish にマッチする最悪ケースでも SLO を満たすことを確認する。"""
+        import random
+        import time
+
+        rng = random.Random(7)
+        vocab = [f"label:{i}" for i in range(self.PUBLISH_LABEL_COUNT)]
+        publish_labels = frozenset(vocab)
+
+        registry = SubscriptionRegistry()
+        for _ in range(self.SUBSCRIPTION_COUNT):
+            # 各 subscription は publish labels の subset（= 必ずマッチ）。
+            registry.create("agent-x", frozenset({rng.choice(vocab)}), 300, 86400)
+
+        registry.matching(publish_labels)  # warmup
+
+        start = time.perf_counter()
+        matches = registry.matching(publish_labels)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+        assert len(matches) == self.SUBSCRIPTION_COUNT
+        assert elapsed_ms < self.SLO_P99_MS
+
+
+# ---------------------------------------------------------------------------
 # HTTP 統合テスト
 # ---------------------------------------------------------------------------
 

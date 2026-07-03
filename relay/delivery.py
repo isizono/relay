@@ -42,6 +42,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator
@@ -99,6 +100,12 @@ class Connection:
     queue: "asyncio.Queue[dict | None]"
     cursor: dict[str, int] = field(default_factory=dict)
     closed: asyncio.Event = field(default_factory=asyncio.Event)
+    # ack 未着タイムアウト検知用（`_enforce_ack_timeouts`）。この接続に push 済み
+    # （publish_id <= cursor）だが未 ack のまま outbox に残る最古 publish_id と、その floor を
+    # 最初に観測した monotonic 時刻。ack が進んで floor が上がる / 全部 ack されて None になると
+    # 張り直され、floor が動かないまま猶予を過ぎたら stuck とみなして強制切断する。
+    unacked_floor: int | None = None
+    unacked_since: float | None = None
 
 
 class ConnectionManager:
@@ -387,6 +394,85 @@ async def _dispatch_to_connections(app_state, db_conn: sqlite3.Connection) -> No
 
 
 # ---------------------------------------------------------------------------
+# ack 未着タイムアウト（push 済みだが ack が進まない接続の強制切断）
+# ---------------------------------------------------------------------------
+
+
+def _connection_unacked_floor(
+    db_conn: sqlite3.Connection, conn: Connection, targets: list[tuple[str, str, dict]]
+) -> int | None:
+    """`conn` に push 済み（publish_id <= cursor）で未 ack のまま outbox に残る最古 publish_id。
+
+    ack は当該エントリを outbox から削除するため、「push 済み（cursor が越えた）なのに
+    まだ outbox に居る」= 未 ack である。全 target を通じた最小値を返す（無ければ None）。
+    """
+    floor: int | None = None
+    for target_key, target_type, params in targets:
+        cursor = conn.cursor.get(target_key, 0)
+        if cursor <= 0:
+            continue
+        if target_type == "subscription":
+            row = db_conn.execute(
+                "SELECT MIN(publish_id) FROM outbox"
+                " WHERE target_type = 'subscription' AND subscription_id = ? AND publish_id <= ?",
+                (params["subscription_id"], cursor),
+            ).fetchone()
+        else:
+            row = db_conn.execute(
+                "SELECT MIN(publish_id) FROM outbox"
+                " WHERE target_type = 'stream' AND stream_id = ? AND member_identity = ?"
+                " AND publish_id <= ?",
+                (params["stream_id"], params["member_identity"], cursor),
+            ).fetchone()
+        val = row[0] if row is not None else None
+        if val is not None:
+            floor = val if floor is None else min(floor, val)
+    return floor
+
+
+async def _enforce_ack_timeouts(app_state, db_conn: sqlite3.Connection, settings: Settings) -> None:
+    """push は成功しているが ack が進まない接続を強制切断する（wire-api.md §6.4 の別障害モード）。
+
+    slow consumer 切断（`_push_with_retry`、queue backpressure ベース）は「SSE queue に積めない」
+    ケースを見るのに対し、こちらは「queue には積めている（= SSE 送信は進んでいる）が subscriber
+    側の受信 / ack ループがスタックして ack が返ってこない」ケースを見る。接続ごとに「push 済み
+    未 ack エントリの最古 publish_id（floor）」を毎 cycle 観測し、floor が `ack_timeout_seconds`
+    の間 1 度も進まない（= その間 1 件も ack されていない）接続を stuck とみなして切断する。
+    エントリは outbox に残るため再接続時に resume（§6.5）で回収される。強制切断は warning 構造化
+    ログで観測する（Prometheus metric は wire-api.md §7.2 の固定 9 種に含まれないため増設しない）。
+    """
+    timeout = settings.ack_timeout_seconds
+    manager = _get_connection_manager(app_state)
+    stream_registry = streams.get_registry_from_state(app_state)
+    now = time.monotonic()
+    for _identity, conns in manager.snapshot().items():
+        for conn in conns:
+            if conn.closed.is_set():
+                continue
+            targets = _targets_for_connection(conn, stream_registry)
+            floor = _connection_unacked_floor(db_conn, conn, targets)
+            if floor is None:
+                # 未 ack の push 済みエントリが無い（全部 ack された / まだ何も push されていない）。
+                conn.unacked_floor = None
+                conn.unacked_since = None
+                continue
+            if conn.unacked_floor != floor:
+                # floor が動いた = ack 進捗があった or 新たに未 ack エントリを観測した。timer を張り直す。
+                conn.unacked_floor = floor
+                conn.unacked_since = now
+                continue
+            if conn.unacked_since is not None and (now - conn.unacked_since) >= timeout:
+                await _force_disconnect(conn)
+                observability.record_event(
+                    app_state,
+                    "sse_ack_timeout_disconnect",
+                    level="warning",
+                    identity=conn.identity,
+                    oldest_unacked_publish_id=floor,
+                )
+
+
+# ---------------------------------------------------------------------------
 # DLQ sweep
 # ---------------------------------------------------------------------------
 
@@ -499,6 +585,7 @@ async def dispatch_once(app) -> None:
     db_conn = _get_db_connection(settings)
     try:
         await _dispatch_to_connections(app.state, db_conn)
+        await _enforce_ack_timeouts(app.state, db_conn, settings)
         _sweep_retain_exceeded(db_conn, app_state=app.state)
         _sweep_permanent_errors(db_conn, sub_registry, app_state=app.state)
         _sweep_dlq_physical_delete(db_conn, settings)

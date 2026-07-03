@@ -59,6 +59,31 @@ class TestStreamRegistry:
         registry.put_member("s1", "agent-a", "read_write")
         assert registry.get("s1").members["agent-a"] == "read_write"
 
+    def test_put_member_checked_applies_when_write_member_remains(self):
+        registry = StreamRegistry()
+        registry.create("s1", "agent-a", None)
+        registry.put_member("s1", "agent-b", "write")
+        # agent-a を read に落としても agent-b が write なので許可される。
+        assert registry.put_member_checked("s1", "agent-a", "read") == "ok"
+        assert registry.get("s1").members["agent-a"] == "read"
+
+    def test_put_member_checked_rejects_last_write_member(self):
+        registry = StreamRegistry()
+        registry.create("s1", "agent-a", None)  # agent-a が唯一の write member
+        assert registry.put_member_checked("s1", "agent-a", "read") == "last_write_member"
+        # 拒否された変更は適用されない（agent-a は write のまま）。
+        assert registry.get("s1").members["agent-a"] == "write"
+
+    def test_put_member_checked_read_write_keeps_write(self):
+        registry = StreamRegistry()
+        registry.create("s1", "agent-a", None)
+        assert registry.put_member_checked("s1", "agent-a", "read_write") == "ok"
+        assert registry.get("s1").members["agent-a"] == "read_write"
+
+    def test_put_member_checked_missing_stream(self):
+        registry = StreamRegistry()
+        assert registry.put_member_checked("nope", "agent-a", "read") == "not_found"
+
     def test_delete_member_removes_access(self):
         registry = StreamRegistry()
         registry.create("s1", "agent-a", None)
@@ -274,6 +299,34 @@ class TestMembers:
             headers=_auth("tok-a"),
         )
         assert r.status_code == 404
+
+    def test_demoting_last_write_member_returns_400(self, client):
+        """唯一の write member を read に落とす操作は 400 で拒否する（write member 0 人ガード）。"""
+        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        r = client.put(
+            "/streams/s1/members",
+            json={"identity": "agent-a", "access": "read"},
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 400
+        assert r.json()["code"] == "InvalidRequestError"
+        # 拒否後も agent-a は write のままで、stream は操作可能。
+        members = client.get("/streams/s1/members", headers=_auth("tok-a")).json()["members"]
+        assert {"identity": "agent-a", "access": "write"} in members
+
+    def test_demoting_write_member_allowed_when_another_write_exists(self, client):
+        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        client.put(
+            "/streams/s1/members",
+            json={"identity": "agent-b", "access": "write"},
+            headers=_auth("tok-a"),
+        )
+        r = client.put(
+            "/streams/s1/members",
+            json={"identity": "agent-a", "access": "read"},
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 200
 
     def test_write_member_can_remove_other_member(self, client):
         client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
@@ -553,9 +606,11 @@ class TestAckStream:
 
     def test_invalid_up_to_publish_id_returns_400(self, client):
         client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        # 唯一の write member を read に落とすと write member 0 人ガードで拒否されるため、
+        # read 権限（ack に必要）は read_write で付与する（write は維持）。
         client.put(
             "/streams/s1/members",
-            json={"identity": "agent-a", "access": "read"},
+            json={"identity": "agent-a", "access": "read_write"},
             headers=_auth("tok-a"),
         )
         r = client.post(

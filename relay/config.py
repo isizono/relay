@@ -31,6 +31,15 @@ DEFAULT_SSE_SEND_TIMEOUT_SECONDS = 5.0
 DEFAULT_DLQ_RETENTION_DAYS = 7
 DEFAULT_PUBLISH_RATE_LIMIT_PER_SECOND = 100
 
+# push は成功している（SSE queue には積めている）が subscriber 側の受信 / ack ループが
+# スタックして ack が進まない接続を強制切断するまでの猶予秒数。queue backpressure ベースの
+# slow consumer 切断（`delivery._push_with_retry`）とは別の障害モードを検知する。
+DEFAULT_ACK_TIMEOUT_SECONDS = 60.0
+
+# 外部 agent の AgentCard キャッシュ（agent_cards table）の TTL 既定値。
+# identity-authz.md §4.2: identity 自体は relay 再起動を跨いで disk 永続化される。
+DEFAULT_AGENT_CARD_CACHE_TTL_SECONDS = 3600  # 1h
+
 # lease 切れ済み subscription を in-memory registry に残しておく猶予秒数
 # （relay-v2-wire-api.md §5.7 の 410 ヒントを再接続の遅い subscriber にも
 # 一定時間だけ提供するため）。この猶予を過ぎたら registry から物理的に除去する
@@ -69,6 +78,8 @@ class Settings:
     sse_send_timeout_seconds: float = DEFAULT_SSE_SEND_TIMEOUT_SECONDS
     dlq_retention_days: int = DEFAULT_DLQ_RETENTION_DAYS
     publish_rate_limit_per_second: int = DEFAULT_PUBLISH_RATE_LIMIT_PER_SECOND
+    ack_timeout_seconds: float = DEFAULT_ACK_TIMEOUT_SECONDS
+    agent_card_cache_ttl_seconds: int = DEFAULT_AGENT_CARD_CACHE_TTL_SECONDS
     subscription_registry_retention_seconds: float = (
         DEFAULT_SUBSCRIPTION_REGISTRY_RETENTION_SECONDS
     )
@@ -127,6 +138,14 @@ def load_settings_from_env() -> Settings:
             os.environ.get(
                 "RELAY_PUBLISH_RATE_LIMIT_PER_SECOND",
                 DEFAULT_PUBLISH_RATE_LIMIT_PER_SECOND,
+            )
+        ),
+        ack_timeout_seconds=float(
+            os.environ.get("RELAY_ACK_TIMEOUT_SECONDS", DEFAULT_ACK_TIMEOUT_SECONDS)
+        ),
+        agent_card_cache_ttl_seconds=int(
+            os.environ.get(
+                "RELAY_AGENT_CARD_CACHE_TTL_SECONDS", DEFAULT_AGENT_CARD_CACHE_TTL_SECONDS
             )
         ),
         subscription_registry_retention_seconds=float(

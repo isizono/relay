@@ -257,6 +257,27 @@ class TestJwsSignAndVerify:
         card = {"name": "relay", "version": "2.0.0"}
         assert verify_agent_card_signature(card, public_key_pem=pub_pem) is False
 
+    @pytest.mark.parametrize(
+        "malformed_card",
+        [
+            # signatures[0] は dict だが必須キー（protected/signature）が欠落。
+            {"name": "relay", "signatures": [{"foo": "bar"}]},
+            # signatures が list でなく dict（int キー 0 で解決できず KeyError）。
+            {"name": "relay", "signatures": {"protected": "x", "signature": "y"}},
+            # signatures[0] が dict でなく文字列（sig['protected'] が TypeError）。
+            {"name": "relay", "signatures": ["garbage"]},
+        ],
+        ids=["missing_keys", "signatures_is_dict", "element_is_string"],
+    )
+    def test_verify_returns_false_for_malformed_signatures_structure(
+        self, ec_key_pair, malformed_card
+    ):
+        """外部 agent から受け取る非信頼 AgentCard の malformed signatures 構造で
+        crash せず fail-closed（False）を返すことを検証する（回帰: KeyError / TypeError
+        が生の例外として漏れていた）。"""
+        _priv_pem, pub_pem = ec_key_pair
+        assert verify_agent_card_signature(malformed_card, public_key_pem=pub_pem) is False
+
 
 # ---------------------------------------------------------------------------
 # MEDIA_TYPE_AGENT_CARD 定数
