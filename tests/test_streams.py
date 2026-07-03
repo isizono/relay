@@ -378,6 +378,77 @@ class TestMembers:
         )
         assert r.status_code == 404
 
+    def _stream_outbox_dlq_counts(self, settings, stream_id, member_identity):
+        import sqlite3
+
+        conn = sqlite3.connect(settings.db_path)
+        try:
+            outbox = conn.execute(
+                "SELECT COUNT(*) FROM outbox"
+                " WHERE target_type = 'stream' AND stream_id = ? AND member_identity = ?",
+                (stream_id, member_identity),
+            ).fetchone()[0]
+            dlq = conn.execute(
+                "SELECT COUNT(*) FROM dlq WHERE stream_id = ? AND member_identity = ?",
+                (stream_id, member_identity),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        return outbox, dlq
+
+    def test_self_departure_immediately_deletes_outbox_and_skips_dlq(self, client, settings):
+        """自己離脱（本人による DELETE self）は未 ack outbox を即時削除し DLQ を経由しない。
+
+        subscription レーンの unsubscribe と同型（wire-api.md §5.3 / §6.6）。明示的な関心放棄なので
+        DLQ・warn ログを汚さず、エントリは痕跡なく消える（outbox 0 件・dlq 0 件）。
+        """
+        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        client.put(
+            "/streams/s1/members",
+            json={"identity": "agent-b", "access": "read"},
+            headers=_auth("tok-a"),
+        )
+        client.post("/streams/s1/messages", json={"body": "m1"}, headers=_auth("tok-a"))
+
+        # 送信直後は agent-b（read member）宛 outbox エントリが 1 件ある。
+        outbox_before, _ = self._stream_outbox_dlq_counts(settings, "s1", "agent-b")
+        assert outbox_before == 1
+
+        r = client.delete(
+            "/streams/s1/members", params={"identity": "agent-b"}, headers=_auth("tok-b")
+        )
+        assert r.status_code == 204
+
+        # 即時削除で outbox からも消え、DLQ にも入らない（痕跡なし）。
+        outbox_after, dlq_after = self._stream_outbox_dlq_counts(settings, "s1", "agent-b")
+        assert outbox_after == 0
+        assert dlq_after == 0
+
+    def test_removal_by_other_member_preserves_entry_for_sweep(self, client, settings):
+        """他 member による除去は即時削除せず、エントリを DLQ sweep 経路に残す（wire-api.md §6.6）。
+
+        自己離脱と対照的に、involuntary な read 権限喪失は観測対象として保全される。エントリは除去直後
+        なら outbox に、dispatcher の DLQ sweep が走った後なら dlq に居る（どちらでも合計 1 件は保たれ、
+        自己離脱のように痕跡なく消えることはない）。この合計での検証は背景 dispatcher の sweep timing に
+        依存しない（レース耐性）。
+        """
+        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        client.put(
+            "/streams/s1/members",
+            json={"identity": "agent-b", "access": "read"},
+            headers=_auth("tok-a"),
+        )
+        client.post("/streams/s1/messages", json={"body": "m1"}, headers=_auth("tok-a"))
+
+        # agent-a（write member）が agent-b を除去（本人以外による解除）。
+        r = client.delete(
+            "/streams/s1/members", params={"identity": "agent-b"}, headers=_auth("tok-a")
+        )
+        assert r.status_code == 204
+
+        outbox_after, dlq_after = self._stream_outbox_dlq_counts(settings, "s1", "agent-b")
+        assert outbox_after + dlq_after == 1
+
     def test_list_members_open_to_non_members(self, client):
         client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
         r = client.get("/streams/s1/members", headers=_auth("tok-b"))

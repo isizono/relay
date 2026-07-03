@@ -70,6 +70,11 @@ _DISABLE_BUILTIN_PING_INTERVAL_SECONDS = 10_000_000
 
 DLQ_ERROR_RETAIN_EXCEEDED = "RetainExceeded"
 DLQ_ERROR_SUBSCRIPTION_UNAVAILABLE = "SubscriptionUnavailable"
+# 場（stream）レーンの permanent error: 場は生存しているが member が read 権限を喪失した
+# （除去された / read_write→write に降格した）ため配達も ack も不能になった状態
+# （wire-api.md §6.6）。dlq.error_code 列の値であり、errors.py の HTTP error envelope 用
+# error_code（A2A 8 種 + relay 固有最小集合）とは別 namespace。
+DLQ_ERROR_STREAM_READ_ACCESS_REVOKED = "StreamReadAccessRevoked"
 
 
 def _now() -> datetime:
@@ -545,6 +550,56 @@ def _sweep_permanent_errors(db_conn: sqlite3.Connection, sub_registry, app_state
             )
 
 
+def _sweep_stream_permanent_errors(
+    db_conn: sqlite3.Connection, stream_registry, app_state=None
+) -> None:
+    """stream lane の permanent error（場は生存するが member が read 権限を喪失）を DLQ に倒す。
+
+    subscription lane（`_sweep_permanent_errors`）は subscription_id が registry から消えた
+    ことを target 消滅の指標にできるが、stream lane の member_identity は subscription_id
+    （再接続毎に使い捨てる UUID）と違い relay 再起動を跨いで安定する識別子であり、「registry に
+    居ない」だけでは配達不能を定義できない。そこで「**場が registry に生存しているのに、その
+    member が read 権限を持たない**（除去された / read_write→write に降格した）」状態だけを
+    permanent error とする（wire-api.md §6.6）。この member 宛の未 ack エントリは §5.6「場レーンは
+    membership の存在自体が配達継続の条件」に照らして配達継続の資格を失っており、read 権限が無い
+    ため ack（`POST /streams/{id}/ack` は read 権限必須で 404）もできず、放置すると retain 上限まで
+    無音の死重として残る。
+
+    「場が registry に生存」を AND 条件に含むことが restart-safe 性の核心である: relay 再起動直後は
+    membership registry が空なので `stream_registry.get(stream_id)` が常に None になり、この sweep は
+    未配達 outbox を 1 件も dead 化しない（§6.1「再起動でも未配達エントリは保持される」を破らない）。
+    判定は毎 sweep cycle の registry 現在値を参照するため、降格直後に cycle が走ると（直後に再昇格
+    しても）1 cycle 内で dead 化しうる — lease のような時間的猶予帯は場レーンには無い（§6.6 の
+    flapping トレードオフ）。
+
+    自己離脱（本人による membership 解除）はこの sweep の対象ではなく、DELETE handler 側で unsubscribe
+    と同型に即時削除される（`relay.streams.delete_member`、wire-api.md §5.3 / §6.6）。ここで dead 化
+    するのは他 member による除去・降格という involuntary な read 権限喪失だけである。
+    """
+    pairs = db_conn.execute(
+        "SELECT DISTINCT stream_id, member_identity FROM outbox WHERE target_type = 'stream'"
+    ).fetchall()
+    for pair in pairs:
+        stream_id = pair["stream_id"]
+        member_identity = pair["member_identity"]
+        if stream_registry.get(stream_id) is None:
+            continue  # 場が registry に不在（再起動直後の空 registry を含む）→ 誤爆回避。
+        if stream_registry.has_read_access(stream_id, member_identity):
+            continue  # まだ read 権限を持つ → 配達継続。
+        rows = db_conn.execute(
+            "SELECT * FROM outbox"
+            " WHERE target_type = 'stream' AND stream_id = ? AND member_identity = ?",
+            (stream_id, member_identity),
+        ).fetchall()
+        for row in rows:
+            _move_to_dlq(
+                db_conn,
+                row,
+                error_code=DLQ_ERROR_STREAM_READ_ACCESS_REVOKED,
+                app_state=app_state,
+            )
+
+
 def _sweep_dlq_physical_delete(db_conn: sqlite3.Connection, settings: Settings) -> None:
     cutoff = (_now() - timedelta(days=settings.dlq_retention_days)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
@@ -581,6 +636,7 @@ async def dispatch_once(app) -> None:
     """dispatcher の 1 polling cycle。push 試行 + DLQ sweep + DLQ 物理削除を行う。"""
     settings: Settings = app.state.settings
     sub_registry = subscriptions.get_registry_from_state(app.state)
+    stream_registry = streams.get_registry_from_state(app.state)
 
     db_conn = _get_db_connection(settings)
     try:
@@ -588,6 +644,7 @@ async def dispatch_once(app) -> None:
         await _enforce_ack_timeouts(app.state, db_conn, settings)
         _sweep_retain_exceeded(db_conn, app_state=app.state)
         _sweep_permanent_errors(db_conn, sub_registry, app_state=app.state)
+        _sweep_stream_permanent_errors(db_conn, stream_registry, app_state=app.state)
         _sweep_dlq_physical_delete(db_conn, settings)
         db_conn.commit()
         _sweep_expired_subscription_registry(sub_registry, settings, app_state=app.state)

@@ -538,6 +538,234 @@ class TestDlqSweep:
         assert remaining == {"recent-sub"}
 
 
+def _insert_stream_outbox_row(
+    settings: Settings,
+    stream_id: str,
+    member_identity: str,
+    publish_id: int,
+    *,
+    body: bytes = b"hello",
+    expires_at=None,
+) -> None:
+    conn = db.get_connection(settings.db_path)
+    try:
+        conn.execute(
+            "INSERT INTO publish_log (lane, stream_id, publisher_identity, enqueued_at)"
+            " VALUES ('stream', ?, 'agent-a', ?)",
+            (stream_id, delivery._now_iso()),
+        )
+        conn.execute(
+            "INSERT INTO outbox"
+            " (target_type, stream_id, member_identity, publish_id, payload, enqueued_at,"
+            " expires_at)"
+            " VALUES ('stream', ?, ?, ?, ?, ?, ?)",
+            (
+                stream_id,
+                member_identity,
+                publish_id,
+                body,
+                delivery._now_iso(),
+                # retain sweep に先に消されないよう既定は未来。stream permanent-error sweep のみを検証する。
+                expires_at if expires_at is not None else _future_iso(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestStreamDlqSweep:
+    """場（stream）レーンの permanent error 検出（`_sweep_stream_permanent_errors`）。
+
+    subscription レーンと非対称: 「場が registry に生存 AND member が read 権限を持たない」を
+    permanent error とする。restart-safe 性（registry が空では誤爆しない）が核心（wire-api.md §6.6）。
+    """
+
+    def _dlq_error_codes(self, settings, stream_id, member_identity):
+        conn = db.get_connection(settings.db_path)
+        try:
+            return [
+                r[0]
+                for r in conn.execute(
+                    "SELECT error_code FROM dlq WHERE stream_id = ? AND member_identity = ?",
+                    (stream_id, member_identity),
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+
+    def _outbox_publish_ids(self, settings, stream_id, member_identity):
+        conn = db.get_connection(settings.db_path)
+        try:
+            return [
+                r[0]
+                for r in conn.execute(
+                    "SELECT publish_id FROM outbox"
+                    " WHERE target_type = 'stream' AND stream_id = ? AND member_identity = ?"
+                    " ORDER BY publish_id",
+                    (stream_id, member_identity),
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+
+    def test_removed_member_moves_to_dlq(self, settings):
+        """場が生存し member が除去された（read 権限喪失）エントリは DLQ 化される。"""
+        db.init_db(settings.db_path)
+        registry = StreamRegistry()
+        registry.create("s1", "agent-a", None)
+        registry.put_member("s1", "agent-b", "read")
+        _insert_stream_outbox_row(settings, "s1", "agent-b", 1)
+
+        registry.delete_member("s1", "agent-b")  # 他 member による involuntary な read 権限喪失
+
+        conn = db.get_connection(settings.db_path)
+        try:
+            delivery._sweep_stream_permanent_errors(conn, registry)
+            conn.commit()
+        finally:
+            conn.close()
+
+        assert self._outbox_publish_ids(settings, "s1", "agent-b") == []
+        assert self._dlq_error_codes(settings, "s1", "agent-b") == [
+            delivery.DLQ_ERROR_STREAM_READ_ACCESS_REVOKED
+        ]
+
+    def test_demoted_read_write_to_write_moves_to_dlq(self, settings):
+        """read_write → write への降格（read 権限を落とす access 変更）も DLQ 化される。"""
+        db.init_db(settings.db_path)
+        registry = StreamRegistry()
+        registry.create("s1", "agent-a", None)
+        registry.put_member("s1", "agent-b", "read_write")
+        _insert_stream_outbox_row(settings, "s1", "agent-b", 1)
+
+        registry.put_member("s1", "agent-b", "write")  # read を落とす降格
+
+        conn = db.get_connection(settings.db_path)
+        try:
+            delivery._sweep_stream_permanent_errors(conn, registry)
+            conn.commit()
+        finally:
+            conn.close()
+
+        assert self._dlq_error_codes(settings, "s1", "agent-b") == [
+            delivery.DLQ_ERROR_STREAM_READ_ACCESS_REVOKED
+        ]
+
+    def test_live_read_member_not_moved_to_dlq(self, settings):
+        """read 権限を保持している member のエントリは DLQ 化されない。"""
+        db.init_db(settings.db_path)
+        registry = StreamRegistry()
+        registry.create("s1", "agent-a", None)
+        registry.put_member("s1", "agent-b", "read")
+        _insert_stream_outbox_row(settings, "s1", "agent-b", 1)
+
+        conn = db.get_connection(settings.db_path)
+        try:
+            delivery._sweep_stream_permanent_errors(conn, registry)
+            conn.commit()
+        finally:
+            conn.close()
+
+        assert self._outbox_publish_ids(settings, "s1", "agent-b") == [1]
+        assert self._dlq_error_codes(settings, "s1", "agent-b") == []
+
+    def test_restart_safe_empty_registry_does_not_move_to_dlq(self, settings):
+        """relay 再起動直後（registry が空）を模したケース: 未配達 outbox を誤って DLQ 化しない。
+
+        再起動で membership registry は揮発するが outbox は disk 永続化されて残る（§6.1）。sweep 条件は
+        「場が registry に生存」を AND に含むため `registry.get(stream_id)` が None になり、1 件も
+        dead 化しない（wire-api.md §6.6）。判定を「member が registry に居ない」だけにすると、ここで
+        未配達エントリが全件 dead 化してしまう。
+        """
+        db.init_db(settings.db_path)
+        # 再起動直後を模す: outbox には stream エントリが残っているが registry は空。
+        _insert_stream_outbox_row(settings, "s1", "agent-b", 1)
+        _insert_stream_outbox_row(settings, "s1", "agent-b", 2)
+        empty_registry = StreamRegistry()
+
+        conn = db.get_connection(settings.db_path)
+        try:
+            delivery._sweep_stream_permanent_errors(conn, empty_registry)
+            conn.commit()
+        finally:
+            conn.close()
+
+        assert self._outbox_publish_ids(settings, "s1", "agent-b") == [1, 2]
+        assert self._dlq_error_codes(settings, "s1", "agent-b") == []
+
+    def test_flapping_demote_then_repromote_before_sweep_not_moved(self, settings):
+        """降格 → sweep 前に再昇格（flapping）。sweep は現在の registry state を見るため DLQ 化しない。"""
+        db.init_db(settings.db_path)
+        registry = StreamRegistry()
+        registry.create("s1", "agent-a", None)
+        registry.put_member("s1", "agent-b", "read")
+        _insert_stream_outbox_row(settings, "s1", "agent-b", 1)
+
+        registry.put_member("s1", "agent-b", "write")  # 降格
+        registry.put_member("s1", "agent-b", "read")  # sweep が走る前に再昇格
+
+        conn = db.get_connection(settings.db_path)
+        try:
+            delivery._sweep_stream_permanent_errors(conn, registry)
+            conn.commit()
+        finally:
+            conn.close()
+
+        assert self._outbox_publish_ids(settings, "s1", "agent-b") == [1]
+        assert self._dlq_error_codes(settings, "s1", "agent-b") == []
+
+    def test_flapping_demote_caught_by_sweep_moves_to_dlq(self, settings):
+        """降格中に sweep cycle が走ると、直後に再昇格しても 1 cycle 内で DLQ 化しうる（§6.6 の代償）。
+
+        場レーンは lease のような時間的猶予帯を持たないため、降格を挟んだ 1 sweep cycle でも
+        permanent error として dead 化される。既に dead 化したエントリは再昇格しても outbox へ戻らない。
+        """
+        db.init_db(settings.db_path)
+        registry = StreamRegistry()
+        registry.create("s1", "agent-a", None)
+        registry.put_member("s1", "agent-b", "read")
+        _insert_stream_outbox_row(settings, "s1", "agent-b", 1)
+
+        registry.put_member("s1", "agent-b", "write")  # 降格（read 喪失）中に sweep が走る
+
+        conn = db.get_connection(settings.db_path)
+        try:
+            delivery._sweep_stream_permanent_errors(conn, registry)
+            conn.commit()
+        finally:
+            conn.close()
+
+        registry.put_member("s1", "agent-b", "read")  # sweep 後の再昇格は dead を巻き戻さない
+
+        assert self._outbox_publish_ids(settings, "s1", "agent-b") == []
+        assert self._dlq_error_codes(settings, "s1", "agent-b") == [
+            delivery.DLQ_ERROR_STREAM_READ_ACCESS_REVOKED
+        ]
+
+    def test_dispatch_once_wires_stream_sweep(self, settings):
+        """dispatch_once の polling cycle に stream permanent-error sweep が組み込まれている。"""
+        asyncio.run(self._run_dispatch_once(settings))
+
+    async def _run_dispatch_once(self, settings):
+        db.init_db(settings.db_path)
+        app = create_app(settings)
+        stream_registry = StreamRegistry()
+        app.state.stream_registry = stream_registry
+        stream_registry.create("s1", "agent-a", None)
+        stream_registry.put_member("s1", "agent-b", "read")
+        _insert_stream_outbox_row(settings, "s1", "agent-b", 1)
+
+        stream_registry.delete_member("s1", "agent-b")  # read 権限喪失
+
+        await delivery.dispatch_once(app)
+
+        assert self._outbox_publish_ids(settings, "s1", "agent-b") == []
+        assert self._dlq_error_codes(settings, "s1", "agent-b") == [
+            delivery.DLQ_ERROR_STREAM_READ_ACCESS_REVOKED
+        ]
+
+
 class TestAckTimeout:
     """push 済みだが ack が進まない接続の強制切断（`_enforce_ack_timeouts`）。
 

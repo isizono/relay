@@ -455,16 +455,33 @@ lock 競合を避けている（デフォルト値のまま複数 app を並行�
 
 ### DLQ sweep の実装
 
-`_sweep_retain_exceeded`（`outbox.expires_at` 経過）と `_sweep_permanent_errors`
-（subscription lane で `subscription_id` が registry に存在しない、または lease 切れ）の
-2 経路で `outbox` → `dlq` へ行を移す（`_move_to_dlq`、INSERT + DELETE を同一 transaction
+`_sweep_retain_exceeded`（`outbox.expires_at` 経過）・`_sweep_permanent_errors`
+（subscription lane で `subscription_id` が registry に存在しない、または lease 切れ）・
+`_sweep_stream_permanent_errors`（stream lane の permanent error、下記）の 3 経路で
+`outbox` → `dlq` へ行を移す（`_move_to_dlq`、INSERT + DELETE を同一 transaction
 内で実行）。dead 化のたびに `observability.record_event(..., "outbox_dead", ...)` で
 構造化ログを 1 件出す（`publish_id` で trace 可能、wire-api.md §7.3 の要求）。
 `_sweep_dlq_physical_delete` が `dead_at` から `Settings.dlq_retention_days`（既定 7 日）
-経過した行を物理 DELETE する。stream レーンの permanent error（member 削除等）は
-明示的には検出していない（wire-api.md / identity-authz.md にこの edge case の規定が
-無いため、意図的に対象外とした。stream は close されても消滅しないため「target の消滅」
-に相当する事象が subscription レーンほど明確でない）。
+経過した行を物理 DELETE する。
+
+#### stream lane の permanent error 検出（`_sweep_stream_permanent_errors`）
+
+stream lane の permanent error は subscription lane と非対称な条件で判定する
+（wire-api.md §6.6）。subscription lane は `subscription_id` が再接続ごとの使い捨て UUID で
+「registry から消えた」ことが target 消滅を意味するが、stream lane の `member_identity` は
+relay 再起動を跨いで安定するため「membership 不在」だけでは配達不能を定義できない。判定条件は
+**「場が registry に生存 AND `NOT has_read_access(stream_id, member_identity)`」**とし、read 権限を
+失った（他 member による除去 / `read_write` → `write` 降格）member 宛の未 ack エントリを
+`StreamReadAccessRevoked` で dead 化する。
+
+- **restart-safe 性**: 「場が registry に生存」を AND 条件に含むことが核心。relay 再起動直後は
+  membership registry が空なので `stream_registry.get(stream_id)` が常に None を返し、この sweep は
+  1 件も dead 化しない（§6.1「再起動でも未配達エントリは保持される」を破らない）。判定を「member が
+  registry に居ない」だけにすると再起動直後に stream outbox 全件を dead 化する退化があり採らない。
+- **自己離脱は別経路**: 本人による membership 解除（`DELETE /streams/{id}/members?identity=<自分>`）は
+  この sweep の対象外。`relay.streams.delete_member` が subscription lane の unsubscribe と同型に、
+  当該 member 宛の未 ack outbox を同一 transaction で即時削除する（DLQ を経由しない、§5.3 / §6.6）。
+  ここで dead 化するのは他 member による除去・降格という involuntary な read 権限喪失だけである。
 
 ### idempotency dedup（`relay/idempotency.py`）
 
@@ -523,8 +540,10 @@ TTL（既定 90 日）を過ぎた行は `purge_expired_server_log` で間引く
   固定 9 種に ack 未着タイムアウト用の counter は無く、仕様の metric 集合を拡張しないため）。
 
 ### 既知のギャップ / 後続タスクへの申し送り
-2. **stream レーンの permanent error 検出（DLQ sweep）は未実装**。上記 DLQ sweep の節
-   参照。
+2. **（解消済み）stream レーンの permanent error 検出（DLQ sweep）を実装した**。
+   上記「stream lane の permanent error 検出」の節と `_sweep_stream_permanent_errors` を参照。
+   自己離脱の即時削除（`relay.streams.delete_member`）と合わせて対応した。実装にあたり
+   解釈の余地があった点・残るトレードオフを下記「stream lane DLQ 実装で判断した点」に記録する。
 3. **TCP keepalive（`TCP_KEEPIDLE` / `TCP_KEEPINTVL` / `TCP_KEEPCNT`）は未設定**。
    cc-memory 側の関連 decision は具体値（60 秒 / 10 秒 / 3 回）を確定しているが、これは
    ASGI アプリケーションコードの層ではなく uvicorn の起動オプション
@@ -545,6 +564,39 @@ TTL（既定 90 日）を過ぎた行は `purge_expired_server_log` で間引く
    実装であり、実装しない。ベンチマークは `tests/test_subscriptions.py` の
    `TestMatchingPerformance` に残した（実測値の記録 + O(n^2) 化のような致命的性能退化を SLO
    200ms を上限として検知する回帰ガード）。実測環境・条件は当該 test を参照。
+
+### stream lane DLQ 実装で判断した点（解釈の余地・トレードオフ）
+
+stream lane permanent error 検出・自己離脱即時削除の実装にあたり、確定仕様の解釈で余地が
+あった点と、設計上残るトレードオフを記録する。実装は下記の判断で確定させたが、後続で見直す
+余地がある。
+
+1. **DLQ error_code は `errors.py` ではなく `delivery.py` に置いた**。依頼は「新しい error_code が
+   必要なら `relay/errors.py` に追加する」だったが、DLQ の `error_code`（`RetainExceeded` /
+   `SubscriptionUnavailable`）は既存実装で `delivery.py` のモジュール定数として `dlq.error_code`
+   列に書かれており、`errors.py` の HTTP error envelope 用 error_code（A2A 8 種 + relay 固有最小集合、
+   §3.3.2）とは別 namespace である。新設した `StreamReadAccessRevoked` も既存 DLQ error_code に
+   倣って `delivery.py` に置いた。これにより、error_code を「上限 7 種程度で運用」する方針が対象と
+   する HTTP error envelope の error_code 数は増えていない（DLQ error_code はその 7 種の外）。
+
+2. **「read 権限を失った状態が一定期間続いたエントリを DLQ 化」の "一定期間" は、多 cycle 継続を
+   測る猶予タイマーではなく「次の dispatcher sweep cycle で判定」と解釈した**。確定仕様の文言は
+   猶予帯（grace period）とも読めるが、restart-safe 性は「場が registry に生存」という構造的 AND
+   条件から導かれる（時間経過ではない）ため、per-member の「read 権限喪失を最初に観測した時刻」を
+   追跡する状態は持たせていない。判定は毎 sweep cycle の registry 現在値を参照する即時方式で、
+   subscription lane の `_sweep_permanent_errors`（lease 切れを即 dead 化、猶予タイマー無し）と対称。
+   帰結として、降格を挟んで 1 sweep cycle が走ると（直後に再昇格しても）その cycle 内で dead 化
+   しうる（access 変更 flapping の誤判定）。これは lease のような時間的猶予帯を場レーンが持たない
+   ことによる既知の代償であり、`tests/test_delivery.py::TestStreamDlqSweep` の flapping 2 ケースで
+   挙動を固定した。多 cycle 猶予が必要と判断されたら、`unacked_since` 方式（`_enforce_ack_timeouts`
+   参照）に倣って per-target の初観測時刻を追跡する拡張余地がある。
+
+3. **自己離脱の即時削除は `DELETE self`（DELETE handler）に限定し、`PUT` による自己降格
+   （`read_write` → `write`）は sweep 経路（DLQ 化）のままにした**。確定仕様は即時削除の対象を
+   「自己離脱（DELETE self、本人による membership 解除）」と明示しており、自分で PUT して read 権限を
+   落とすケースは言及が無い。文言どおり DELETE self のみを即時削除とし、自己降格を含むその他の
+   read 権限喪失は involuntary 扱いで sweep に委ねた。自己降格も「明示的な関心放棄」とみなして即時
+   削除に含めるべきかは仕様の追補待ちの論点として残る。
 
 ## Subscriptions タスク: `SubscriptionRegistry` の無制限メモリ増加を解消
 

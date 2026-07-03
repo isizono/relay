@@ -518,6 +518,23 @@ async def delete_member(request: Request) -> Response:
             403, MEMBERSHIP_REQUIRED, f"stream '{stream_id}' の write 権限がありません"
         )
 
+    # 自己離脱（本人による membership 解除）は subscription レーンの unsubscribe と同型に扱い、
+    # 未 ack outbox エントリを同一 transaction で即時削除する（DLQ を経由しない、wire-api.md
+    # §5.3 / §6.6）。明示的な関心放棄は事故ではないため DLQ・warn ログを汚さない。他 member に
+    # よる除去（involuntary な read 権限喪失）は outbox を残し、dispatcher の DLQ sweep
+    # （`relay.delivery._sweep_stream_permanent_errors`）が dead 化して観測対象に残す。
+    if target_identity == identity.id:
+        conn = _get_connection(request)
+        try:
+            conn.execute(
+                "DELETE FROM outbox"
+                " WHERE target_type = 'stream' AND stream_id = ? AND member_identity = ?",
+                (stream_id, identity.id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     registry.delete_member(stream_id, target_identity)
     return Response(status_code=204)
 
