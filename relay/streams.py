@@ -156,6 +156,11 @@ class StreamRegistry:
                 return []
             return [i for i, a in record.members.items() if a in ("read", "read_write")]
 
+    def count(self) -> int:
+        """現在の stream 数（`GET /status` の `streams_count` 用）。"""
+        with self._lock:
+            return len(self._streams)
+
     def read_streams_for_identity(self, identity: str) -> list[str]:
         """`identity` が read 権限を持つ stream_id の一覧を返す。
 
@@ -318,28 +323,49 @@ async def post_stream_message(request: Request) -> Response:
 
     record = registry.get(stream_id)
     if record is None:
+        observability.inc_metric(
+            request.app.state, "relay_publish_failed_total", failure_reason="stream_not_found"
+        )
         return error_response(404, STREAM_NOT_FOUND, f"stream '{stream_id}' が見つかりません")
     if not registry.has_write_access(stream_id, identity.id):
+        observability.inc_metric(
+            request.app.state, "relay_publish_failed_total", failure_reason="membership_required"
+        )
         return error_response(
             403, MEMBERSHIP_REQUIRED, f"stream '{stream_id}' の write 権限がありません"
         )
     if record.state == "closed":
+        observability.inc_metric(
+            request.app.state, "relay_publish_failed_total", failure_reason="stream_gone"
+        )
         return error_response(410, STREAM_GONE, f"stream '{stream_id}' は close 済みです")
 
     body, err = await _read_json_body(request)
     if err is not None:
+        observability.inc_metric(
+            request.app.state, "relay_publish_failed_total", failure_reason="invalid_request"
+        )
         return err
 
     message_body = body.get("body")
     if not isinstance(message_body, str) or message_body == "":
+        observability.inc_metric(
+            request.app.state, "relay_publish_failed_total", failure_reason="invalid_request"
+        )
         return error_response(400, INVALID_REQUEST, "body は必須の非空文字列です")
 
     _ttl, err = _validate_retain_seconds(body.get("ttl"), field_name="ttl")
     if err is not None:
+        observability.inc_metric(
+            request.app.state, "relay_publish_failed_total", failure_reason="invalid_request"
+        )
         return err
 
     idempotency_key = body.get("idempotency_key")
     if idempotency_key is not None and not isinstance(idempotency_key, str):
+        observability.inc_metric(
+            request.app.state, "relay_publish_failed_total", failure_reason="invalid_request"
+        )
         return error_response(400, INVALID_REQUEST, "idempotency_key は文字列で指定してください")
 
     dedup_key = idempotency.build_key(
@@ -394,6 +420,9 @@ async def post_stream_message(request: Request) -> Response:
         publisher_identity=identity.id,
         stream_id=stream_id,
         matched_members=len(read_members),
+    )
+    observability.inc_metric(
+        request.app.state, "relay_publish_received_total", publisher_identity=identity.id
     )
     return JSONResponse(
         {"publish_id": publish_id, "matched_members": len(read_members)}, status_code=202
@@ -517,6 +546,7 @@ async def ack_stream(request: Request) -> Response:
         member_identity=identity.id,
         up_to_publish_id=up_to_publish_id,
     )
+    observability.inc_metric(request.app.state, "relay_ack_received_total")
     return JSONResponse({}, status_code=200)
 
 

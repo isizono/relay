@@ -21,13 +21,14 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import httpx
 import pytest
 import uvicorn
 from starlette.testclient import TestClient
 
-from relay import db, delivery, subscriptions
+from relay import db, delivery, observability, subscriptions
 from relay.app import create_app
 from relay.config import Settings
 from relay.streams import StreamRegistry
@@ -301,7 +302,7 @@ class TestPushRetryAndSlowConsumer:
         conn = delivery.Connection(
             identity="agent-a", subscription_ids=frozenset(), queue=asyncio.Queue(maxsize=1)
         )
-        ok = await delivery._push_with_retry(conn, {"publish_id": 1, "data": {}})
+        ok = await delivery._push_with_retry(conn, {"publish_id": 1, "data": {}}, None)
         assert ok is True
         assert conn.closed.is_set() is False
 
@@ -320,10 +321,17 @@ class TestPushRetryAndSlowConsumer:
             )
             conn.queue.put_nowait({"publish_id": 0, "data": {}})  # queue を満杯にする
 
-            ok = await delivery._push_with_retry(conn, {"publish_id": 1, "data": {}})
+            app_state = SimpleNamespace()
+            ok = await delivery._push_with_retry(conn, {"publish_id": 1, "data": {}}, app_state)
 
             assert ok is False
             assert conn.closed.is_set() is True
+            # 強制切断は warning ログ + relay_sse_slow_consumer_disconnects_total で観測できる
+            # （wire-api.md §6.4, §7.2）。
+            warnings = list(app_state.recent_warnings)
+            assert any(w["event"] == "sse_slow_consumer_disconnect" for w in warnings)
+            metrics = observability.get_metrics_registry(app_state).snapshot()
+            assert metrics["relay_sse_slow_consumer_disconnects_total"][()] == 1
         finally:
             delivery.PUSH_RETRY_DELAYS_SECONDS = original
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -78,6 +79,9 @@ def create_app(settings: Settings | None = None) -> Starlette:
 
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.settings = resolved_settings
+    # `GET /status` の `uptime_seconds` 用（wire-api.md §7.1）。壁時計のずれに影響されない
+    # `time.monotonic()` を使う。
+    app.state.started_at = time.monotonic()
     return app
 
 

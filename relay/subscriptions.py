@@ -162,6 +162,11 @@ class SubscriptionRegistry:
                 del self._subs[subscription_id]
             return expired_ids
 
+    def count(self) -> int:
+        """現在の subscription 数（`GET /status` の `subscriptions_count` 用）。"""
+        with self._lock:
+            return len(self._subs)
+
     def matching(self, publish_labels: frozenset[str]) -> list[SubscriptionRecord]:
         """`publish_labels` の superset となる labels を持つ、lease 生存中の subscription 一覧。
 
@@ -464,6 +469,7 @@ async def ack_subscription(request: Request) -> Response:
         subscription_id=subscription_id,
         up_to_publish_id=up_to_publish_id,
     )
+    observability.inc_metric(request.app.state, "relay_ack_received_total")
     return JSONResponse({}, status_code=200)
 
 
@@ -480,6 +486,9 @@ async def publish(request: Request) -> Response:
     limiter = _get_rate_limiter(request)
     allowed, retry_after = limiter.allow(identity.id)
     if not allowed:
+        observability.inc_metric(
+            request.app.state, "relay_publish_failed_total", failure_reason="rate_limited"
+        )
         response = error_response(
             429, RATE_LIMIT_EXCEEDED, "publish のレート制限を超過しました"
         )
@@ -488,22 +497,37 @@ async def publish(request: Request) -> Response:
 
     body, err = await _read_json_body(request)
     if err is not None:
+        observability.inc_metric(
+            request.app.state, "relay_publish_failed_total", failure_reason="invalid_request"
+        )
         return err
 
     ref = body.get("ref")
     if not isinstance(ref, dict) or not isinstance(ref.get("type"), str) or "id" not in ref:
+        observability.inc_metric(
+            request.app.state, "relay_publish_failed_total", failure_reason="invalid_request"
+        )
         return error_response(400, INVALID_REQUEST, "ref は { type, id } object で指定してください")
 
     labels = body.get("labels")
     if not isinstance(labels, list) or not all(isinstance(label, str) for label in labels):
+        observability.inc_metric(
+            request.app.state, "relay_publish_failed_total", failure_reason="invalid_request"
+        )
         return error_response(400, INVALID_REQUEST, "labels は文字列の配列で指定してください")
 
     title = body.get("title")
     if title is not None and not isinstance(title, str):
+        observability.inc_metric(
+            request.app.state, "relay_publish_failed_total", failure_reason="invalid_request"
+        )
         return error_response(400, INVALID_REQUEST, "title は文字列で指定してください")
 
     idempotency_key = body.get("idempotency_key")
     if idempotency_key is not None and not isinstance(idempotency_key, str):
+        observability.inc_metric(
+            request.app.state, "relay_publish_failed_total", failure_reason="invalid_request"
+        )
         return error_response(400, INVALID_REQUEST, "idempotency_key は文字列で指定してください")
 
     labels_set = frozenset(labels)
@@ -560,6 +584,9 @@ async def publish(request: Request) -> Response:
         publish_id=publish_id,
         publisher_identity=identity.id,
         matched_subscriptions=len(matches),
+    )
+    observability.inc_metric(
+        request.app.state, "relay_publish_received_total", publisher_identity=identity.id
     )
     return JSONResponse(
         {"publish_id": publish_id, "matched_subscriptions": len(matches)}, status_code=202

@@ -92,6 +92,13 @@ def require_authn(
         try:
             identity = authenticate_request(request, settings)
         except AuthenticationError as exc:
+            # 遅延 import: relay.observability は require_authn（本モジュール）を import
+            # するため、モジュールトップレベルで import すると循環 import になる。
+            from relay import observability
+
+            observability.record_event(
+                request.app.state, "authn_failed", level="warning", reason=str(exc)
+            )
             return JSONResponse({"error": str(exc)}, status_code=401)
         request.state.identity = identity
         return await handler(request, *args, **kwargs)

@@ -18,7 +18,7 @@ relay/
 ├── streams.py         # stream (場) API + membership + structural authZ（実装済み）
 ├── subscriptions.py   # subscription API（実装済み: subscribe / lease / unsubscribe / ack / publish）
 ├── delivery.py         # outbox polling dispatcher / SSE / retry / DLQ（実装済み）
-├── observability.py    # 構造化ログ + サーバーログ sink（実装済み）。/status /metrics は未実装
+├── observability.py    # GET /status・GET /metrics（Prometheus 互換）・構造化ログ + サーバーログ sink（実装済み）
 └── app.py              # Starlette アプリ組み立て（各モジュールの routes を集約 + dispatcher 起動）
 
 migrations/
@@ -178,11 +178,11 @@ detached 形式）という妥当と考えられる形式を暫定採用した�
   実装済み。
 - `agent_cards` テーブル（外部 agent の AgentCard キャッシュ）の読み書きロジックは
   未実装。schema のみ用意した。
-- `GET /status` / `GET /metrics`（observability.md §7.1, §7.2）は未実装
-  （後続タスクの担当分）。`observability.py` は構造化ログ + サーバーログ sink のみ
-  実装済み。
 - `PUT /streams/{stream_id}/members` で write member が 0 人になる操作へのガードは無い
   （Resources タスクからの申し送り、未解消のまま）。
+- `GET /status` / `GET /metrics`（wire-api.md §7.1, §7.2）、構造化ログの `level` 統一、
+  Prometheus カウンタの各 endpoint への配線は Observability タスクで実装済み
+  （詳細は後続の節を参照）。
 
 ## `streams.py` 実装（stream CRUD + membership + structural authZ）
 
@@ -433,8 +433,8 @@ TTL（既定 90 日）を過ぎた行は `purge_expired_server_log` で間引く
    （`--limit-max-requests` 等とは別の socket オプション）で設定するものであり、
    本実装（`relay/` パッケージ内のコード）のスコープ外と判断した。本番運用時の uvicorn
    起動コマンド側で設定する必要がある。
-4. **`GET /status` / `GET /metrics` は未実装**（後続タスクの担当分、observability.md
-   §7.1, §7.2）。`relay/observability.py` は構造化ログ + サーバーログ sink のみ実装した。
+4. **（解消済み、Observability タスクで対応）** `GET /status` / `GET /metrics` は
+   wire-api.md §7.1, §7.2 に従い実装した。詳細は後続の Observability 実装セクションを参照。
 5. **1 SSE 接続で複数 target を多重化する際の ack バッチ境界・部分 ack の最適化は
    未着手**。現状の実装は正しく動作する（各 target は個別の delivery target として
    cumulative ack される）が、性能最適化（大量 target 保持時の dispatcher 1 cycle の
@@ -461,3 +461,91 @@ wire-api.md §5.7 は「所有者本人の lease 切れ subscription への操�
 呼び出すようにした。lease 切れから `Settings.subscription_registry_retention_seconds`
 （既定 1 時間、`RELAY_SUBSCRIPTION_REGISTRY_RETENTION_SECONDS` で override 可）を過ぎた
 subscription を registry から物理的に除去する。除去後は非所有者と同じ `404` になる。
+
+## Observability タスク: `GET /status` / `GET /metrics` / 構造化ログの `level` 統一
+
+`relay/observability.py` に `GET /status`（wire-api.md §7.1）と `GET /metrics`（§7.2、
+Prometheus text exposition format）を実装した。両 endpoint とも他の GET 系 endpoint と同様
+`require_authn` のみを通す（authN のみで authZ なし、identity-authz.md §2.1）。
+
+### 構造化ログへの `level` フィールド追加と `recent_warnings`
+
+`record_event(app_state, event_type, level="info"|"warning", **fields)` に `level` 引数を
+追加した（既定 `"info"`、後方互換）。`level="warning"` の event は、サーバーログへの追記に加えて
+`app_state` 上の in-memory リングバッファ（`collections.deque(maxlen=50)`、
+`RECENT_WARNINGS_MAXLEN`）にも積まれ、`GET /status` の `recent_warnings` はこのバッファを
+そのまま返す。
+
+`level="warning"` を付けた既存 event: `outbox_dead`（DLQ 移動、`delivery.py`）、
+`subscription_registry_evicted`（lease 切れ registry 除去、`delivery.py`）、
+`dispatcher_error`（dispatcher 内部エラー、`delivery.py`）、`sse_slow_consumer_disconnect`
+（新設、下記）。加えて `relay/identity.py` の `require_authn` に認証失敗時の
+`record_event(..., "authn_failed", level="warning", reason=...)` を追加した
+（wire-api.md §7.3 が構造化ログの対象に「認証失敗」を明記しているが、従来は未実装だった）。
+`identity.py` から `observability` への import は関数内 lazy import にしている
+（`observability.py` は自身の `GET /status` / `GET /metrics` 実装のために
+`relay.identity.require_authn` を import 済みであり、モジュールトップレベルで逆方向の
+import を足すと循環 import になるため）。
+
+### `GET /status` の実装
+
+`uptime_seconds`（`app.state.started_at` を `relay/app.py` の `create_app` で
+`time.monotonic()` により記録、壁時計のずれの影響を受けない）、`subscriptions_count` /
+`streams_count`（`SubscriptionRegistry.count()` / `StreamRegistry.count()`、本タスクで追加）、
+`active_sse_connections`（`ConnectionManager.count()`、本タスクで追加）、
+`outbox_pending_count` / `outbox_dead_count`（`outbox` / `dlq` table の `COUNT(*)`）、
+`publish_rate_5min`、`recent_warnings` を返す。
+
+**`publish_rate_5min` の解釈**: wire-api.md §7.1 はフィールド名のみで単位を明記していない。
+「5 分間の publish 件数」（カウント）と「秒あたりレート」（Prometheus `rate()` 相当）のどちらとも
+読めるため、本実装ではフィールド名の `_rate_` を字義通りに取り、直近 5 分間の `publish_log`
+件数を 300 秒で割った秒間レートとして実装した（推測に基づく判断であり、確定仕様ではない）。
+カウントそのものが必要な場合は仕様側で明確化した上で実装を見直すべきである。
+
+### `GET /metrics`（Prometheus 互換）の実装
+
+`MetricsRegistry`（`app_state.metrics_registry`、`dict[str, dict[label_tuple, float]]` +
+`threading.Lock`）が counter 系 7 metric を in-memory で保持する。呼び出し側は
+`observability.inc_metric(app_state, name, **labels)` を該当箇所で呼ぶだけでよく、registry の
+生成・保持は `observability.py` に閉じる（`streams.py` / `subscriptions.py` / `delivery.py` は
+いずれも `observability` を import 済みだが、`observability.py` はそれらを import しない —
+この非対称性で循環 import を避けている）。
+
+gauge 系 2 metric（`relay_outbox_depth` / `relay_sse_connections`）は積算せず、スクレイプ時点で
+DB / `ConnectionManager` から実測して都度計算する（カウンタの drift を防ぐため）。
+
+wire-api.md §7.2 が列挙する 9 metric すべてを実装した。カウンタは未 increment のラベル組み合わせ
+を出力しない（典型的な Prometheus client library の挙動に合わせた）。
+
+| metric | 種別 | 呼び出し箇所 |
+|---|---|---|
+| `relay_publish_received_total{publisher_identity}` | counter | `streams.post_stream_message` / `subscriptions.publish` の成功パス |
+| `relay_publish_failed_total{failure_reason}` | counter | 上記 2 endpoint の各バリデーション失敗パス（`failure_reason` は `stream_not_found` / `membership_required` / `stream_gone` / `invalid_request` / `rate_limited` の snake_case 文字列。error envelope の `code`（`StreamNotFoundError` 等）とは別の namespace として定義した） |
+| `relay_push_delivered_total{lane}` | counter | `delivery._dispatch_to_connections` の push 成功時（`lane` は `target_type` の値 `stream`/`subscription` をそのまま使う） |
+| `relay_ack_received_total` | counter | `streams.ack_stream` / `subscriptions.ack_subscription` の成功パス（label なし、両レーン合算。wire-api.md の記法が `relay_push_delivered_total{lane}` 等と異なり `{}` を伴わないため） |
+| `relay_outbox_dead_total` | counter | `delivery._move_to_dlq`（DLQ 移動のたび） |
+| `relay_subscription_lease_expirations_total` | counter | `delivery._sweep_expired_subscription_registry`（registry から実際に evict された時点。`is_lease_expired()` の個々の観測点では increment しない — 同一 subscription への繰り返しチェックで水増しされるのを避けるため、「evict という 1 回限りの事象」に対応づけた） |
+| `relay_sse_slow_consumer_disconnects_total` | counter | `delivery._push_with_retry`（retry 枯渇 → 強制切断時。呼び出し元は `_force_disconnect` の唯一の呼び出し元でもあるため二重計上の心配はない） |
+| `relay_outbox_depth` | gauge | `GET /metrics` スクレイプ時点で `SELECT COUNT(*) FROM outbox` |
+| `relay_sse_connections` | gauge | `GET /metrics` スクレイプ時点で `ConnectionManager.count()` |
+
+label には `subscription_id` / `delivery_target` を使わない（wire-api.md §7.2 の禁止事項）。
+
+### `_push_with_retry` のシグネチャ変更
+
+`delivery._push_with_retry(conn, event_dict)` に `app_state` 引数を追加した
+（`_push_with_retry(conn, event_dict, app_state=None)`）。強制切断時の構造化ログ + metric
+記録に必要なため。呼び出し元 `_dispatch_to_connections` からは実 `app_state` を渡す。
+既存テスト（`tests/test_delivery.py`）の直接呼び出し箇所は `None` または
+`SimpleNamespace()` を明示的に渡すよう更新した。
+
+### 既知のギャップ / 判断が必要な点
+
+1. **`publish_rate_5min` の単位解釈は推測**（上記）。仕様側での明確化が望ましい。
+2. **`relay_publish_failed_total` の `failure_reason` は error envelope の `code` と別 namespace**
+   （上記表参照）。両者の対応関係はコード内コメントのみで、仕様書には未記載。
+3. **`GET /status` の DB 集計（`outbox_pending_count` 等）はリクエストのたびに `COUNT(*)`
+   を実行する**。outbox 件数が非常に多くなった場合の性能は未検証（性能 SLO 検証自体は
+   本タスクのスコープ外として明示的に見送られている）。
+4. **`recent_warnings` の保持件数（50 件）とバッファのスコープ（app インスタンス単位、
+   relay 再起動で消える）は本タスクでの判断**。wire-api.md は件数・保持期間を規定していない。

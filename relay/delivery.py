@@ -129,6 +129,11 @@ class ConnectionManager:
         with self._lock:
             return {identity: list(conns) for identity, conns in self._by_identity.items()}
 
+    def count(self) -> int:
+        """アクティブな SSE 接続の総数（`GET /status` / `GET /metrics` 用）。"""
+        with self._lock:
+            return sum(len(conns) for conns in self._by_identity.values())
+
 
 def _get_connection_manager(app_state) -> ConnectionManager:
     manager = getattr(app_state, "connection_manager", None)
@@ -327,11 +332,12 @@ async def _force_disconnect(conn: Connection) -> None:
             conn.queue.put_nowait(None)
 
 
-async def _push_with_retry(conn: Connection, event_dict: dict) -> bool:
+async def _push_with_retry(conn: Connection, event_dict: dict, app_state=None) -> bool:
     """`conn.queue` への push を retry-with-backoff する。
 
     5 回のリトライ（初回 push を含めて最大 6 回試行）すべてで queue が詰まっていたら
-    slow consumer とみなし、接続を強制切断する（wire-api.md §6.4）。
+    slow consumer とみなし、接続を強制切断する（wire-api.md §6.4）。強制切断は構造化ログ
+    （warning）+ `relay_sse_slow_consumer_disconnects_total` で観測する（§6.4, §7.2）。
     """
     delays = (0.0, *PUSH_RETRY_DELAYS_SECONDS)
     for delay in delays:
@@ -343,6 +349,11 @@ async def _push_with_retry(conn: Connection, event_dict: dict) -> bool:
         except asyncio.QueueFull:
             continue
     await _force_disconnect(conn)
+    if app_state is not None:
+        observability.record_event(
+            app_state, "sse_slow_consumer_disconnect", level="warning", identity=conn.identity
+        )
+        observability.inc_metric(app_state, "relay_sse_slow_consumer_disconnects_total")
     return False
 
 
@@ -365,9 +376,12 @@ async def _dispatch_to_connections(app_state, db_conn: sqlite3.Connection) -> No
                         "publish_id": row["publish_id"],
                         "data": _build_event_data(target_type, params, row),
                     }
-                    ok = await _push_with_retry(conn, event_dict)
+                    ok = await _push_with_retry(conn, event_dict, app_state)
                     if ok:
                         conn.cursor[target_key] = row["publish_id"]
+                        observability.inc_metric(
+                            app_state, "relay_push_delivered_total", lane=target_type
+                        )
                     else:
                         break  # 接続が切断された。同一 target 内の残りエントリも打ち切る。
 
@@ -403,12 +417,14 @@ def _move_to_dlq(
         observability.record_event(
             app_state,
             "outbox_dead",
+            level="warning",
             publish_id=row["publish_id"],
             target_type=row["target_type"],
             subscription_id=row["subscription_id"],
             stream_id=row["stream_id"],
             error_code=error_code,
         )
+        observability.inc_metric(app_state, "relay_outbox_dead_total")
 
 
 def _sweep_retain_exceeded(db_conn: sqlite3.Connection, app_state=None) -> None:
@@ -462,8 +478,12 @@ def _sweep_expired_subscription_registry(
     if evicted and app_state is not None:
         for subscription_id in evicted:
             observability.record_event(
-                app_state, "subscription_registry_evicted", subscription_id=subscription_id
+                app_state,
+                "subscription_registry_evicted",
+                level="warning",
+                subscription_id=subscription_id,
             )
+            observability.inc_metric(app_state, "relay_subscription_lease_expirations_total")
 
 
 # ---------------------------------------------------------------------------
@@ -497,7 +517,7 @@ async def run_dispatcher_loop(app) -> None:
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — dispatcher は落ちてはいけない常駐処理
-            observability.record_event(app.state, "dispatcher_error")
+            observability.record_event(app.state, "dispatcher_error", level="warning")
         await asyncio.sleep(settings.dispatcher_poll_interval_seconds)
 
 

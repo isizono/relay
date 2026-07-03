@@ -126,6 +126,7 @@ class TestStreamRegistry:
 def settings(tmp_path):
     return Settings(
         db_path=str(tmp_path / "test_relay.db"),
+        server_log_path=str(tmp_path / "test_relay.jsonl"),
         auth_tokens={"tok-a": "agent-a", "tok-b": "agent-b", "tok-c": "agent-c"},
     )
 

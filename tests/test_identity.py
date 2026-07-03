@@ -2,6 +2,8 @@
 
 Bearer token authN、AgentCard 構築、JCS 正規化、JWS 署名/検証を検証する。
 """
+import json
+
 import pytest
 from joserfc.jwk import ECKey
 from starlette.applications import Starlette
@@ -30,8 +32,15 @@ from relay.identity import (
 
 
 @pytest.fixture()
-def settings():
-    return Settings(db_path=":memory:", auth_tokens={"tok-abc": "agent-a"})
+def settings(tmp_path):
+    # server_log_path を tmp_path に向ける。`require_authn` は認証失敗時に
+    # `observability.record_event` を呼ぶため（構造化ログ、`level="warning"`）、
+    # 既定値のままだとリポジトリ直下の `relay-server.jsonl` に書き込んでしまう。
+    return Settings(
+        db_path=":memory:",
+        auth_tokens={"tok-abc": "agent-a"},
+        server_log_path=str(tmp_path / "test-relay-server.jsonl"),
+    )
 
 
 @pytest.fixture()
@@ -109,6 +118,14 @@ class TestRequireAuthnDecorator:
         r = client.get("/protected", headers={"Authorization": "Bearer tok-abc"})
         assert r.status_code == 200
         assert r.json() == {"identity": "agent-a"}
+
+    def test_auth_failure_is_recorded_as_structured_warning(self, client, settings):
+        """認証失敗は構造化ログに warning として残る（wire-api.md §7.3）。"""
+        client.get("/protected", headers={"Authorization": "Bearer wrong"})
+
+        lines = open(settings.server_log_path, encoding="utf-8").readlines()
+        entries = [json.loads(line) for line in lines]
+        assert any(e["event"] == "authn_failed" and e["level"] == "warning" for e in entries)
 
 
 # ---------------------------------------------------------------------------
