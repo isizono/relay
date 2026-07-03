@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import socket
 import sqlite3
@@ -189,7 +190,7 @@ class TestEventStream:
 
 
 def _insert_subscription_outbox_row(
-    settings: Settings, subscription_id: str, publish_id: int, *, labels=("x",)
+    settings: Settings, subscription_id: str, publish_id: int, *, labels=("x",), expires_at=None
 ) -> None:
     conn = db.get_connection(settings.db_path)
     try:
@@ -209,12 +210,18 @@ def _insert_subscription_outbox_row(
                 payload,
                 json.dumps(list(labels)),
                 delivery._now_iso(),
-                delivery._now_iso(),  # 呼び出し側で上書きする場合あり
+                # 既定は now（呼び出し側で上書きする場合あり）。retain sweep に消されず残す
+                # テストは未来の expires_at を渡す。
+                expires_at if expires_at is not None else delivery._now_iso(),
             ),
         )
         conn.commit()
     finally:
         conn.close()
+
+
+def _future_iso(seconds: int = 3600) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class TestDispatchOnce:
@@ -529,6 +536,110 @@ class TestDlqSweep:
         finally:
             conn.close()
         assert remaining == {"recent-sub"}
+
+
+class TestAckTimeout:
+    """push 済みだが ack が進まない接続の強制切断（`_enforce_ack_timeouts`）。
+
+    queue backpressure ベースの slow consumer 切断とは別の障害モード（SSE 送信は進むが
+    subscriber 側の受信 / ack ループがスタックして ack が返らない）を検知する。
+    """
+
+    def test_unacked_floor_returns_oldest_pushed_unacked_entry(self, settings):
+        db.init_db(settings.db_path)
+        _insert_subscription_outbox_row(settings, "sub-1", 3)
+        _insert_subscription_outbox_row(settings, "sub-1", 5)
+
+        conn = delivery.Connection(
+            identity="agent-b", subscription_ids=frozenset({"sub-1"}), queue=asyncio.Queue()
+        )
+        target_key = delivery._subscription_target_key("sub-1")
+        targets = [(target_key, "subscription", {"subscription_id": "sub-1"})]
+
+        db_conn = db.get_connection(settings.db_path)
+        try:
+            # 両方 push 済み（cursor=5）→ 最古の未 ack は 3。
+            conn.cursor[target_key] = 5
+            assert delivery._connection_unacked_floor(db_conn, conn, targets) == 3
+            # publish_id 5 のみ push 済み扱い（cursor=3）→ pid 3 が floor（pid 5 は未 push）。
+            conn.cursor[target_key] = 3
+            assert delivery._connection_unacked_floor(db_conn, conn, targets) == 3
+            # 何も push していない（cursor=0）→ floor なし。
+            conn.cursor[target_key] = 0
+            assert delivery._connection_unacked_floor(db_conn, conn, targets) is None
+        finally:
+            db_conn.close()
+
+    def test_stuck_subscriber_is_force_disconnected(self, settings):
+        asyncio.run(self._run_stuck(settings))
+
+    async def _run_stuck(self, settings):
+        settings = dataclasses.replace(settings, ack_timeout_seconds=0.0)
+        db.init_db(settings.db_path)
+        app = create_app(settings)
+        sub_registry = subscriptions.get_registry_from_state(app.state)
+        record = sub_registry.create("agent-b", frozenset({"x"}), 300, 86400)
+        _insert_subscription_outbox_row(
+            settings, record.subscription_id, 1, expires_at=_future_iso()
+        )
+
+        manager = delivery._get_connection_manager(app.state)
+        conn = delivery.Connection(
+            identity="agent-b",
+            subscription_ids=frozenset({record.subscription_id}),
+            queue=asyncio.Queue(),
+        )
+        manager.register(conn)
+
+        # cycle 1: push + floor 初観測（timer 起動、まだ切断しない）。
+        await delivery.dispatch_once(app)
+        assert conn.closed.is_set() is False
+        assert conn.unacked_floor == 1
+
+        # cycle 2: floor が動かないまま timeout(0) 経過 → 強制切断 + warning ログ。
+        await delivery.dispatch_once(app)
+        assert conn.closed.is_set() is True
+        warnings = list(app.state.recent_warnings)
+        assert any(w["event"] == "sse_ack_timeout_disconnect" for w in warnings)
+
+    def test_ack_progress_resets_timer_and_keeps_connection(self, settings):
+        asyncio.run(self._run_ack_progress(settings))
+
+    async def _run_ack_progress(self, settings):
+        settings = dataclasses.replace(settings, ack_timeout_seconds=0.0)
+        db.init_db(settings.db_path)
+        app = create_app(settings)
+        sub_registry = subscriptions.get_registry_from_state(app.state)
+        record = sub_registry.create("agent-b", frozenset({"x"}), 300, 86400)
+        _insert_subscription_outbox_row(
+            settings, record.subscription_id, 1, expires_at=_future_iso()
+        )
+
+        manager = delivery._get_connection_manager(app.state)
+        conn = delivery.Connection(
+            identity="agent-b",
+            subscription_ids=frozenset({record.subscription_id}),
+            queue=asyncio.Queue(),
+        )
+        manager.register(conn)
+
+        await delivery.dispatch_once(app)  # push + floor 初観測
+        assert conn.unacked_floor == 1
+
+        # ack 相当（outbox から削除）で未 ack floor が消える。
+        c = db.get_connection(settings.db_path)
+        try:
+            c.execute(
+                "DELETE FROM outbox WHERE target_type='subscription' AND subscription_id=?",
+                (record.subscription_id,),
+            )
+            c.commit()
+        finally:
+            c.close()
+
+        await delivery.dispatch_once(app)  # floor None → timer リセット、切断しない
+        assert conn.closed.is_set() is False
+        assert conn.unacked_floor is None
 
 
 class TestSubscriptionRegistrySweep:

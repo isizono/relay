@@ -448,13 +448,32 @@ TTL（既定 90 日）を過ぎた行は `purge_expired_server_log` で間引く
 毎回スキャンすると I/O コストが無視できなくなるため、`_maybe_gc` で最短実行間隔
 （既定 1 時間に 1 回）を設けている。
 
-### 既知のギャップ / 後続タスクへの申し送り
+### ack 未着タイムアウト（push 済みだが ack が進まない接続の強制切断）
 
-1. **ack 未着タイムアウト（60 秒で SSE 接続を強制 close）は未実装**。cc-memory 側の
-   関連 decision には存在するが、本タスクの依頼文が明示する 9 項目には含まれておらず、
-   実装コストとのバランスから見送った。「push はできているが subscriber 側の受信ループが
-   スタックしている」ケースの検知に相当し、slow consumer 強制切断（本実装済み、queue
-   backpressure ベース）とは異なる障害モードをカバーする。
+`_enforce_ack_timeouts`（`relay/delivery.py`）を `dispatch_once` の polling cycle に追加した。
+「push は成功している（SSE queue に積めている = SSE 送信は進んでいる）が、subscriber 側の
+受信 / ack ループがスタックして ack が返ってこない」接続を検知して強制切断する
+（既定 60 秒、`Settings.ack_timeout_seconds` / `RELAY_ACK_TIMEOUT_SECONDS`）。
+
+- **既存の slow consumer 切断（`_push_with_retry`）との違い**: slow consumer 切断は
+  `asyncio.Queue` の backpressure（`put_nowait` が `QueueFull` を返す）をシグナルにする。
+  これは「SSE queue に積めない」ケースを見る。一方 ack 未着タイムアウトは「queue には積めて
+  いる（SSE 送信は進む）が subscriber が ack を返さない」ケースを見る。両者は別の障害モードで
+  あり、独立して発火する。
+- **検知方法**: 接続ごとに「push 済み（`publish_id <= cursor`）だが未 ack のまま outbox に
+  残る最古 publish_id（floor）」を毎 cycle 観測する（ack は outbox からエントリを削除するため、
+  push 済みなのに outbox に残る = 未 ack）。floor が `ack_timeout_seconds` の間 1 度も進まない
+  （= その間 1 件も ack されていない）接続を stuck とみなして切断する。cumulative ack で floor が
+  少しでも上がる / 全部 ack されて floor が消える限り、進捗ありとして timer を張り直すため、
+  遅いが進捗のある subscriber は切断しない。
+- **切断後の回復**: 強制切断してもエントリは outbox に残るため、subscriber は再接続時に
+  resume（wire-api.md §6.5、未 ack エントリの再 push）で回収する。at-least-once は ack に置く
+  という既存 invariant を壊さない。
+- **観測**: 強制切断は warning 構造化ログ（`sse_ack_timeout_disconnect`、`recent_warnings` /
+  サーバーログに載る）で観測する。Prometheus metric は増設していない（wire-api.md §7.2 が列挙する
+  固定 9 種に ack 未着タイムアウト用の counter は無く、仕様の metric 集合を拡張しないため）。
+
+### 既知のギャップ / 後続タスクへの申し送り
 2. **stream レーンの permanent error 検出（DLQ sweep）は未実装**。上記 DLQ sweep の節
    参照。
 3. **TCP keepalive（`TCP_KEEPIDLE` / `TCP_KEEPINTVL` / `TCP_KEEPCNT`）は未設定**。
