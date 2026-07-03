@@ -7,11 +7,17 @@ __pycache__/
 # uv
 .uv/
 
-# SQLite (powwow データストア)
+# SQLite (relay データストア)
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
+
+# relay サーバーログ（append-only sink、disk 上は SQLite と物理分離）
+*.jsonl
+
+# pytest
+.pytest_cache/
 
 # OS
 .DS_Store

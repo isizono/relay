@@ -3,10 +3,19 @@ name = "relay"
 version = "0.1.0"
 description = "Claude Code間のメッセージング中継システム（履歴を持つ軽量サービス・窓口モデル）"
 requires-python = ">=3.11"
-# server.py 本体は標準ライブラリ（http.server + sqlite3）のみで依存ゼロを維持する（D#2282）。
+# relay v2 (relay/ パッケージ) は authlib + Starlette + sse-starlette + rfc8785(JCS) を用いる。
+# 旧 server.py（SSH forced command 認証ベース）は標準ライブラリのみで依存ゼロだったが、
+# v2 移行に伴いこの制約は relay v2 には適用しない。
 # mcp_server.py（PR-c）が使う MCP Python SDK は PR-c/fix で追加した。
 dependencies = [
+    "authlib>=1.7.2",
+    "joserfc>=1.7.2",
     "mcp>=1.27.2",
+    "rfc8785>=0.1.4",
+    "sse-starlette>=3.4.4",
+    "starlette>=1.2.1",
+    "uvicorn>=0.48.0",
+    "yoyo-migrations>=9.0.0",
 ]
 
 [dependency-groups]

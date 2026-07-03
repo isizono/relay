@@ -2,6 +2,13 @@
 
 別々の人間が使う Claude Code 同士に「認識合わせ」を代行させるための、履歴を持つ軽量メッセージング中継サービス。Claude は自動返信せず、人間が承認してから送る**窓口モデル**を採る。
 
+> **relay v2 実装が進行中**: A2A(Agent2Agent) 準拠のメッセージバスへの再アーキテクチャを
+> `relay/` パッケージ配下で実装している。仕様は `docs/design/` 配下（`relay-concept.md` /
+> `relay-glossary.md` / `relay-v2-wire-api.md` / `relay-v2-identity-authz.md` /
+> `relay-v2-sdk.md` / `relay-sequences.md`）、実装のモジュール構成・設計判断は
+> `docs/ARCHITECTURE.md` を参照。以下の説明（SSH forced command 認証ベース）は移行完了までの
+> 旧実装（`server.py` 他）についてのもの。
+
 ## アーキテクチャ（概要）
 
 2層ハイブリッド構成。
