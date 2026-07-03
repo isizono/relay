@@ -15,6 +15,7 @@ relay/
 ├── errors.py           # error envelope（{code, message, details}）+ relay 固有 error_code 定数
 ├── idempotency.py       # idempotency_key の 15 分 dedup（stream / subscription レーン共通）
 ├── identity.py        # AgentCard 構築 / Bearer token authN / JCS(MUST) / JWS(MAY)
+├── agent_cards.py       # 外部 agent の AgentCard 取得 + agent_cards table キャッシュ（実装済み）
 ├── streams.py         # stream (場) API + membership + structural authZ（実装済み）
 ├── subscriptions.py   # subscription API（実装済み: subscribe / lease / unsubscribe / ack / publish）
 ├── delivery.py         # outbox polling dispatcher / SSE / retry / DLQ（実装済み）
@@ -176,8 +177,9 @@ detached 形式）という妥当と考えられる形式を暫定採用した�
   構造化ログ + サーバーログ sink は Delivery タスクで実装済み（詳細は後続の節を参照）。
   `streams.py` は Resources タスク（stream CRUD + membership + structural authZ）で
   実装済み。
-- `agent_cards` テーブル（外部 agent の AgentCard キャッシュ）の読み書きロジックは
-  未実装。schema のみ用意した。
+- （解消済み）`agent_cards` テーブル（外部 agent の AgentCard キャッシュ）の読み書き
+  ロジックを `relay/agent_cards.py` に実装した。詳細は後続の「`relay/agent_cards.py` 実装」
+  節を参照。
 - （解消済み）`PUT /streams/{stream_id}/members` で write member が 0 人になる操作への
   ガードを追加した。詳細は後続の「write member 0 人ガード」節を参照。
 - `GET /status` / `GET /metrics`（wire-api.md §7.1, §7.2）、構造化ログの `level` 統一、
@@ -249,6 +251,46 @@ read 権限を持つ member でない」を同一の `404 Not Found` と明記�
    見直しが必要か検討すべきである。
 5. **（解消済み）同一 stream の write member が 0 人になる operation へのガードを追加した**。
    詳細は下記「write member 0 人ガード（`PUT /streams/{stream_id}/members`）」節を参照。
+
+## `relay/agent_cards.py` 実装（外部 agent の AgentCard 取得 + キャッシュ）
+
+`agent_cards` table（`migrations/0001-initial-schema.sql`）の読み書きロジックと、外部 agent の
+公開 AgentCard（`<base_url>/.well-known/agent-card.json`）の取得・JWS 署名検証を実装した
+（identity-authz.md §1.2.3, §1.3, §4.2）。
+
+### なぜ SQLite table なのか（他 registry と非対称）
+
+subscription registry / stream membership / SSE 接続は R1 原則で in-memory（relay 再起動で消える）
+だが、`agent_cards` は SQLite table（`db.py` の 4 disk table の 1 つ）である。これは
+identity-authz.md §4.2「identity 自体（AgentCard / 公開鍵）は relay の in-memory state とは独立に
+disk 永続化され、relay 再起動を跨いで保持される」に対応する。identity は liveness（生死）ではなく
+credential（真正性の根拠）であり、揮発させる対象ではない。
+
+### 関数構成
+
+- `fetch_agent_card(base_url, http_get=, timeout=)` / `fetch_jwks(jku, ...)`: HTTP GET。実 HTTP を
+  スタブできるよう `http_get: (url, timeout) -> (status, bytes)` を注入点にしてある。既定は stdlib
+  `urllib`（production 依存を増やさないため。httpx は dev 依存のまま）。
+- `store_agent_card` / `get_cached_agent_card` / `get_cached_jwks`: `agent_cards`（`identity` が
+  PRIMARY KEY）への upsert と読み出し。`expires_at`（`fetched_at + ttl_seconds`、既定 TTL は
+  `Settings.agent_card_cache_ttl_seconds` = 1h）超過は cache miss として扱う。`ttl_seconds=None` は
+  無期限キャッシュ（`expires_at` NULL）。
+- `verify_card_signature(card, public_key_pem= | jwks=)`: identity-authz.md §1.2.3 の検証手順。
+  署名対象は `signatures` を除外した AgentCard の JCS 正規化（`relay.identity.canonicalize_agent_card`
+  と同一）。PEM 直接指定と、`jku` から取得した JWKS（`kid` で KeySet から鍵解決）の両方をサポート。
+  検証鍵が無い / 署名不一致はすべて `False`（fail-closed）。
+- `get_or_fetch_agent_card(...)`: cache hit ならキャッシュを返し、miss / TTL 超過なら fetch → 任意で
+  署名検証（`verify_public_key_pem` / `verify_jwks` を渡したとき。失敗なら `AgentCardFetchError` で
+  キャッシュせず fail-closed）→ store する。検証鍵を渡さない場合は署名検証をスキップする（最小
+  セット AgentCard は署名なしで公開される。§1.2.4）。
+
+### スコープ
+
+本タスクは「読み書きロジック + 取得・キャッシュ」までを実装対象とした。この cache を利用する
+具体的な endpoint / 呼び出し経路（例: incoming request の JWS 署名検証への配線、federation）は
+wire-api.md / identity-authz.md に endpoint として定義がなく、relay 内部の利用側実装が具体化した
+時点で配線する。JWKS 鍵ローテーション運用手順（identity-authz.md §7 未決事項）も同様に本タスクの
+スコープ外。
 
 ## write member 0 人ガード（`PUT /streams/{stream_id}/members`）
 
