@@ -14,6 +14,8 @@ integration test 側で real relay に対して検証する）。
 - ``simulate_subscription_loss(subscription_id)`` — 当該 subscription を失効させ、以後の
   操作を ``404`` にし SSE を drop する（PermanentError → resubscribe 経路の検証）
 - ``drop_connections()`` — アクティブな SSE 接続を全て切る（再接続 + 未 ack 再 push の検証）
+- ``simulate_silence(enabled)`` — SSE 接続を張ったまま event も keepalive も一切書き込まない
+  （半死 TCP 接続を模す。read timeout による無音検知の検証用）
 """
 from __future__ import annotations
 
@@ -58,6 +60,7 @@ class FakeRelay:
         self._sub_counter = 0
         self._lost: set[str] = set()
         self._outage = False
+        self._silence = False
         self._drop_generation = 0
         self._stop = False
 
@@ -124,6 +127,15 @@ class FakeRelay:
         with self._lock:
             self._drop_generation += 1
 
+    def simulate_silence(self, enabled: bool = True) -> None:
+        """SSE 接続を張ったまま event も keepalive も一切書き込まない状態にする。
+
+        接続は明示的に close しない（TCP 上は生存したまま無音が続く半死接続を模す）。
+        blocker2（SSE 無音検知 / read timeout）のテスト用。
+        """
+        with self._lock:
+            self._silence = enabled
+
     # -- test convenience -------------------------------------------------
 
     def publish(
@@ -177,11 +189,23 @@ class FakeRelay:
                 pass
 
             # -- helpers --
-            def _read_json(self) -> dict:
+            def _drain_body(self) -> bytes:
+                """request body を読み切ってバッファする。
+
+                HTTP/1.1 keep-alive 接続では、body を読まずに次のレスポンスを
+                書いてしまうと、未読の body バイトが後続 request の先頭に混入し
+                パース位置がずれる（`BaseHTTPRequestHandler` が次の request line を
+                誤読し `501 Unsupported method` 等の破損応答を返す）。outage 等の
+                早期 return 分岐でも必ず body を drain してから応答するため、
+                routing の最初で一度だけ読んでバッファに保持する。
+                """
                 length = int(self.headers.get("Content-Length", 0) or 0)
-                if length == 0:
+                return self.rfile.read(length) if length else b""
+
+            def _read_json(self) -> dict:
+                raw = getattr(self, "_body_bytes", b"")
+                if not raw:
                     return {}
-                raw = self.rfile.read(length)
                 try:
                     return json.loads(raw.decode("utf-8"))
                 except Exception:
@@ -209,6 +233,7 @@ class FakeRelay:
             # -- routing --
             def do_POST(self):
                 path = urlparse(self.path).path
+                self._body_bytes = self._drain_body()
                 if self._outage_active():
                     self._send_json(503, {"code": "OutboxUnavailableError", "message": "outage"})
                     return
@@ -223,6 +248,7 @@ class FakeRelay:
 
             def do_PUT(self):
                 path = urlparse(self.path).path
+                self._body_bytes = self._drain_body()
                 if self._outage_active():
                     self._send_json(503, {"code": "OutboxUnavailableError", "message": "outage"})
                     return
@@ -233,6 +259,7 @@ class FakeRelay:
 
             def do_DELETE(self):
                 path = urlparse(self.path).path
+                self._drain_body()  # DELETE は通常 body 無しだが、念のため drain する。
                 if path.startswith("/subscriptions/"):
                     self._handle_unsubscribe(path.split("/")[2])
                 else:
@@ -346,12 +373,19 @@ class FakeRelay:
                             for sub_id in ids:
                                 if sub_id in fake._lost or sub_id not in fake._subs:
                                     return
+                            silent = fake._silence
                             pending: list[dict] = []
-                            for sub_id in ids:
-                                for entry in fake._outbox.get(sub_id, []):
-                                    if entry["publish_id"] > cursors[sub_id]:
-                                        pending.append(entry)
-                            pending.sort(key=lambda e: e["publish_id"])
+                            if not silent:
+                                for sub_id in ids:
+                                    for entry in fake._outbox.get(sub_id, []):
+                                        if entry["publish_id"] > cursors[sub_id]:
+                                            pending.append(entry)
+                                pending.sort(key=lambda e: e["publish_id"])
+                        if silent:
+                            # 半死接続を模す: event も keepalive も一切書き込まない
+                            # （接続自体は close しない）。
+                            time.sleep(0.02)
+                            continue
                         for entry in pending:
                             self._write_sse_event(entry)
                             sid = entry["delivery_target"].split(":", 1)[1]

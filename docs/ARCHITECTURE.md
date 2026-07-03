@@ -698,7 +698,145 @@ relay_sdk/
    - SSE 30 秒 keepalive で長期接続が落ちないこと: keepalive comment frame の parse と
      それを契機とした lease renew は実装済み（`sse.py` / `Subscription._maybe_renew_lease`）
      だが、30 秒級の長時間統合テストはスイート実行時間を圧迫するため自動化していない。
-4. **lease renew の発火は keepalive comment frame を契機にする**。relay は 30 秒ごとに
-   `: keepalive` を送る（wire §5.5）ため、`lease_ttl` が数百秒なら十分な分解能で
-   「残り <= lease_ttl/3」を検出できる。ただし keepalive より短い `lease_ttl`（< ~90 秒）を
-   使う場合、renew 判定が keepalive 間隔（30 秒）に律速される点は運用上の制約として残る。
+4. **（第三者レビュー指摘により訂正済み、後述「第三者レビュー対応」参照）** 当初
+   lease renew の発火契機を keepalive comment frame に限定していたが、これは
+   event が keepalive 間隔より高頻度に届く状況で renew が一切発火しない欠陥
+   だった。event / keepalive いずれの frame でも発火するよう修正済み。
+
+## 第三者レビュー対応（ブロッカー2件・medium4件の修正）
+
+初版実装に対する第三者（Fable）レビューで、致命的な欠陥 2 件（ブロッカー）と修正推奨
+4 件（medium）が指摘された。すべて `relay_sdk/` 側の修正で、`relay/` パッケージ（サーバー
+実装）には触れていない。
+
+### ブロッカー1: lease renew が高頻度 event 下で一生発火しない
+
+`Subscription._stream_once`（`relay_sdk/client/subscription.py`）は当初、`_maybe_renew_lease()`
+の呼び出しを SSE の comment（keepalive）frame 受信時のみに限定していた。しかし relay 本体
+（`relay/delivery.py`）は「push が無い間だけ」keepalive を送るため、event が keepalive
+間隔（既定 30 秒）より高頻度に届く状況では keepalive 自体が一切来ない。結果として lease
+（既定 300 秒）が更新されないまま失効し、失効後は relay 側の `SubscriptionRegistry.matching()`
+（`relay/subscriptions.py`）が当該 subscription を fan-out 対象から除外するため、失効中に
+publish された event は二度と配達されなくなる欠陥だった。
+
+修正: `_maybe_renew_lease()` を独立の `_run_periodic_maintenance()` に統合し、event frame /
+comment frame いずれの処理時にも呼ぶようにした（`_stream_once` 内、frame の種別判定より前）。
+回帰テストは `tests/test_sdk_client.py::TestLeaseRenewOnEventFrames` に 2 本追加した。
+1 本目は `_lease_expires_at` を直接過去日時に書き換えて renew 閾値を即座に満たす決定的な
+テスト（`put_lease` の呼び出し回数をスパイして検証）、2 本目は実際に高頻度 publish を
+続けて `lease_expires_at` が実地で更新されることを確認するタイミングベースのテスト。
+
+### ブロッカー2: SSE 無音検知（read timeout）が未実装 + read timeout が全リクエストで無効化されていた
+
+`relay_sdk.http.auth.make_client` は当初 `httpx.Timeout(timeout, read=None)` で client
+全体の read timeout を無効化していた。コメントには「keepalive で明示検出する」とあったが
+その検出ロジック自体がどこにも実装されておらず、`Subscription._keepalive_seconds` は
+保持されるだけの未使用フィールドだった。この結果、半死 TCP 接続（ソケットは生存したまま
+一切データが来ない状態）で `receive()` が永久ブロックしうるだけでなく、read timeout が
+client 全体で無効化されていたことにより **`POST /publish` 等の通常リクエストまで**
+無応答時に永久ブロックしうる状態だった（dispatcher の配達ループが停止しうる）。
+
+修正は 2 段階:
+1. `make_client` は `timeout` を connect/read/write/pool の全軸に適用する単純な形に戻し、
+   通常リクエストの read timeout を有効化した。
+2. `relay_sdk.http.request.open_sse` に `read_timeout` 引数を追加し、SSE request にだけ
+   個別に長い read timeout（`Subscription._stream_once` が `keepalive_seconds * 2`、既定
+   60 秒を渡す）を上書きできるようにした。`_stream_once` は `open_sse` を囲む try/except で
+   `httpx.TimeoutException` / `httpx.TransportError` を捕捉し `TransientError` に翻訳する
+   （`receive()` の再接続ループに乗せるため）。
+
+read timeout の閾値を「keepalive 間隔そのもの」ではなく「2 周期分」にしたのは、keepalive
+送出の揺らぎ（dispatcher の polling 間隔・GIL 競合等）で誤検知しないための安全マージンで
+あり、確定した数値根拠があるわけではない（判断の性質としては推測に基づく安全側の選択）。
+
+回帰テストは 2 レイヤーで担保した。
+- protocol 層（`tests/test_sdk_http.py::TestReadTimeoutScoping`）: `make_client` が通常
+  request に read timeout を適用すること、`open_sse(read_timeout=...)` が対象 request
+  だけ read timeout を上書きし connect/write/pool は client 既定のまま保つことを、
+  `httpx.Client.stream` を monkeypatch して直接検証。
+- 振る舞いレベル（`tests/test_sdk_client.py::TestSilentConnectionDetection`）: `FakeRelay`
+  に `simulate_silence()`（SSE 接続を張ったまま event も keepalive も一切書き込まない、
+  半死接続を模す fault 注入）を追加し、`open_sse` の呼び出し回数をスパイして「read timeout
+  検知 → 再接続」が実際に起きたことを直接確認する。**単に「いずれ event が届く」だけの
+  アサーションでは、`FakeRelay` が無音期間中も TCP 接続自体を close しないため、read
+  timeout が無効なままでも同じ接続でいずれデータを受信できてしまい、fix の有無を区別
+  できない**（実際にこの誤りに一度陥り、当初のテストは fix を revert しても pass して
+  しまっていた。`open_sse` 呼び出し回数という直接的なシグナルに変更して修正した）。
+
+### medium3: reconnect_max_attempts 到達後、resubscribe がホットループする
+
+`Subscription._resubscribe` の retry ループは `delay = self._next_reconnect_delay(); if delay:
+time.sleep(delay)` という形で、`_next_reconnect_delay()` が `reconnect_max_attempts` 到達後に
+返す `None` を「sleep 無し」と解釈していた。`_resubscribe` 自身は「新規 subscribe に切り替えた
+後の retry ループ」であり、そこで `_next_reconnect_delay()` が `None` を返すのは「もう
+sleep しなくてよい」という意味ではなく「上限に達した」という意味でしかない。結果、
+`_resubscribe` は上限到達後 `POST /subscriptions` を delay ゼロで連打するホットループに
+陥っていた。
+
+修正: `time.sleep(delay if delay is not None else self._backoff_cap)` とし、`None` の場合は
+`backoff_cap`（既定 30 秒）で待つようにした。回帰テストは
+`tests/test_sdk_client.py::TestResubscribeBackoffAfterAttemptsExhausted` に追加した。
+`time.sleep` を monkeypatch して呼び出し引数を記録し、`reconnect_max_attempts=2` 到達後の
+全 sleep が `backoff_cap` になっていること（ゼロ delay の連打が起きていないこと）を検証する。
+
+### medium4: auto_ack の flush retry が「次の event」を待つしかなく、event が来ないと永久に未 ack のまま残る
+
+`_buffer_and_flush_ack` は resume 直後に一度だけ ack flush を試み、`TransientError` で
+失敗した場合は warning を出すのみで、次に flush が retry される契機は「次の event が
+yield されたとき」に限定されていた。event が来ない期間が続くと、この未 flush の ack が
+無期限に放置される欠陥だった（ブロッカー1と同じ frame 処理箇所の問題であるため、
+まとめて `_run_periodic_maintenance()` に統合して解消した）。
+
+修正: `_run_periodic_maintenance()` が lease renew に加えて、`self._ack_buffer is not None`
+なら `_flush_ack()` を retry するようにした。event frame だけでなく comment（keepalive）
+frame でも呼ばれるため、event が来ない間も keepalive 契機で retry される。回帰テストは
+`tests/test_sdk_client.py::TestAckFlushRetry` に追加した。`post_ack` を monkeypatch して
+最初の 1 回だけ `TransientError` を注入し、新しい event を publish しないまま
+（別スレッドで `receive()` をブロックさせた状態で）keepalive 契機のみで outbox が drain
+されることを確認する。
+
+### medium5: httpx が dev group のみで runtime dependency として宣言されていなかった
+
+`relay_sdk` は import 時に `httpx` を必須とするが、`pyproject.toml` では `httpx` が
+`[dependency-groups].dev` にのみ含まれていた（旧来 `relay/delivery.py` の統合テスト
+専用だったため）。`relay_sdk` を dev 依存なしで install したアプリでは `ImportError` に
+なる状態だった。
+
+修正: `httpx` を `[project.dependencies]` に移動した（`dev` グループからは削除。`uv lock`
+で再解決済み）。回帰テストは `tests/test_sdk_packaging.py` に追加し、`pyproject.toml` を
+`tomllib` でパースして `httpx` が `[project.dependencies]` に含まれることを検証する。
+
+### medium6: outbox の labels 列破損が dispatcher 全体をクラッシュさせる
+
+`dispatcher._deliver_row`（`relay_sdk/outbox/dispatcher.py`）は `json.loads(row["labels"])`
+を try/except の**外**で呼んでいた。一方 daemon ループ（`run_dispatcher`）は
+`except sqlite3.Error` しか捕捉しないため、outbox の `labels` 列に不正な JSON が入った行が
+1 つでもあると `json.JSONDecodeError` が daemon ループ全体を突き抜けて daemon スレッドを
+落とし、同一 cycle 内の後続行（正常行も含む）は一切処理されず、以後 daemon が再起動
+されない限り全配達が止まるクラッシュループになっていた。
+
+修正: labels のデコードを `_deliver_row` 内の try/except に含め、`json.JSONDecodeError` /
+`TypeError` を捕捉した場合は該当行を（retry せず）即 dead 化するようにした（`_RowResult.DEAD`。
+壊れたデータはリトライしても直らないため）。回帰テストは
+`tests/test_sdk_dispatcher.py::TestMalformedRow` に 2 本追加した。1 本目は `_dispatch_once`
+単体で、labels 破損行の**前**に正常行を、**後**に破損行を置いた場合に正常行が配達され
+続けること・破損行が dead 化されることを確認する（破損行を先に置いて `ORDER BY id` で
+先に処理させ、クラッシュがそこで起きた場合に後続の正常行に到達できないことを検出できる
+配置にした）。2 本目は `run_dispatcher` の daemon スレッドレベルで、破損行の後に daemon が
+生存し続け、新たに enqueue した正常行を配達し続けることを確認する。
+
+### レビュー対応中に見つけた副次的な欠陥（`relay_sdk.testing.FakeRelay`）
+
+medium3 の回帰テスト作成中に、`FakeRelay`（テスト用 stub、`relay_sdk/testing.py`）自体の
+バグを発見した。`do_POST` / `do_PUT` が outage（`simulate_outage(True)`）応答を返す際、
+受信した request body を読み切らずに応答を返していた。HTTP/1.1 keep-alive 接続では、
+未読の body バイトが残ったまま次の応答を書くと、その未読バイトが後続 request の
+先頭に混入してパース位置がずれ、`http.server.BaseHTTPRequestHandler` が次の request line
+を誤読して `501 Unsupported method` 等の破損応答を返す（実際に、outage 中に同一接続で
+複数回 POST を送るテストで 1 回おきに 501 が返る形で顕在化した）。
+
+修正: `do_POST` / `do_PUT` / `do_DELETE` の routing 冒頭で必ず body を drain
+（`_drain_body()`）してからバッファに保持し、`_read_json()` はそのバッファから読むように
+変更した（`self.rfile` からの再読み込みをやめた）。これは `relay_sdk` 本体のバグではなく
+test double 側の実装欠陥だが、修正しない限り「同一 keep-alive 接続上で outage 中に
+複数回 request する」パターンのテストが不安定になるため、あわせて修正した。

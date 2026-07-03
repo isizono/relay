@@ -69,8 +69,13 @@ def make_client(
 ) -> httpx.Client:
     """auth ヘッダを既定装備した `httpx.Client` を組み立てる。
 
-    SSE stream 用に read timeout は無効化し（keepalive 30 秒より長く待てるように）、
-    connect timeout のみ `timeout` を適用する。
+    `timeout` は connect/read/write/pool の全軸に適用する。通常の HTTP request
+    （`POST /publish` 等）が無応答のまま永久ブロックしないようにするためで、read
+    timeout をここで無効化しない。SSE stream だけは通常より長い無音期間が正常
+    （keepalive 間隔ぶん）なので、read timeout はこの client 全体ではなく
+    `open_sse()` 呼び出し単位（`read_timeout` 引数）で個別に上書きする
+    （read timeout を client 全体で無効化すると、通常 request まで応答が返らない
+    ケースで永久ブロックしうる）。
     """
     agent_card = load_agent_card(agent_card_path)
     token = resolve_bearer_token(
@@ -80,10 +85,7 @@ def make_client(
         subscriber_identity=subscriber_identity,
     )
     headers = build_auth_headers(token)
-    # read=None: SSE stream は keepalive 間隔（既定 30 秒）より長く読めない状態が正常。
-    # read timeout は subscriber 側 SSE ループが keepalive で明示検出する（sse.py）。
-    timeout_cfg = httpx.Timeout(timeout, read=None)
-    return httpx.Client(base_url=base_url, headers=headers, timeout=timeout_cfg)
+    return httpx.Client(base_url=base_url, headers=headers, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------

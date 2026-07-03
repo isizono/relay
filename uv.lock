@@ -599,6 +599,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "authlib" },
+    { name = "httpx" },
     { name = "joserfc" },
     { name = "mcp" },
     { name = "rfc8785" },
@@ -610,13 +611,13 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "pytest" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "authlib", specifier = ">=1.7.2" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "joserfc", specifier = ">=1.7.2" },
     { name = "mcp", specifier = ">=1.27.2" },
     { name = "rfc8785", specifier = ">=0.1.4" },
@@ -627,10 +628,7 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-dev = [
-    { name = "httpx", specifier = ">=0.28.1" },
-    { name = "pytest", specifier = ">=8.0" },
-]
+dev = [{ name = "pytest", specifier = ">=8.0" }]
 
 [[package]]
 name = "rfc8785"

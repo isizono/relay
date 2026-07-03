@@ -92,8 +92,16 @@ def _deliver_row(client: httpx.Client, row: sqlite3.Row) -> tuple[str, str | Non
     Returns:
         `(result, error_message, retry_after)`。result は `_RowResult` のいずれか。
     """
-    ref = {"type": row["ref_type"], "id": row["ref_id"]}
-    labels = json.loads(row["labels"]) if row["labels"] else []
+    try:
+        ref = {"type": row["ref_type"], "id": row["ref_id"]}
+        labels = json.loads(row["labels"]) if row["labels"] else []
+    except (json.JSONDecodeError, TypeError) as exc:
+        # labels 列が壊れている行はリトライしても直らない。dead 化してスキップし、
+        # daemon ループ全体をクラッシュさせない（この decode を try 外に置くと、
+        # daemon ループは sqlite3.Error しか捕捉しないため 1 行の不正データで
+        # 全配達が止まるクラッシュループになる）。
+        return _RowResult.DEAD, f"labels のデコードに失敗しました: {exc}", None
+
     try:
         post_publish(
             client,

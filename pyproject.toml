@@ -7,8 +7,11 @@ requires-python = ">=3.11"
 # 旧 server.py（SSH forced command 認証ベース）は標準ライブラリのみで依存ゼロだったが、
 # v2 移行に伴いこの制約は relay v2 には適用しない。
 # mcp_server.py（PR-c）が使う MCP Python SDK は PR-c/fix で追加した。
+# httpx は relay_sdk（クライアント側 SDK）が import 時に必須とする runtime dependency
+# （publisher/subscriber の HTTP・SSE 通信の実体）であり、dev-only ではない。
 dependencies = [
     "authlib>=1.7.2",
+    "httpx>=0.28.1",
     "joserfc>=1.7.2",
     "mcp>=1.27.2",
     "rfc8785>=0.1.4",
@@ -20,10 +23,7 @@ dependencies = [
 
 [dependency-groups]
 # MCPサーバー（PR-c）が使う MCP Python SDK は当該PRで追加する。
-# httpx は relay/delivery.py の統合テスト（実 socket 越しの SSE streaming 検証、
-# tests/test_delivery.py の LiveServer）で直接使う。starlette.testclient / mcp 経由の
-# 推移的依存として既に解決されていたが、直接 import するため明示的に宣言する。
-dev = ["pytest>=8.0", "httpx>=0.28.1"]
+dev = ["pytest>=8.0"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

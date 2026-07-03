@@ -157,16 +157,32 @@ def post_ack(
     raise_for_relay_status(response, subscription_scoped=True)
 
 
-def open_sse(client: httpx.Client, *, subscription_ids: Sequence[str]):
+def open_sse(
+    client: httpx.Client, *, subscription_ids: Sequence[str], read_timeout: float | None = None
+):
     """`GET /events?subscription_ids=...` を SSE stream として開く。
 
     `httpx.Client.stream(...)` の context manager を返す（呼び出し側が `with` で使う）。
     status 検証は stream に入ってから `raise_for_sse_status` で行う（stream 前に
     body を読めないため）。
+
+    Args:
+        read_timeout: この request だけに適用する read timeout（秒）。省略時は
+            `client` の既定 timeout をそのまま使う。SSE stream は通常の HTTP request
+            より無音期間が長くなりうる（keepalive 間隔ぶん、§4.2）ため、呼び出し側
+            （`Subscription`）が keepalive 間隔の倍数を明示的に渡す。read timeout を
+            `client` 全体で無効化すると通常の HTTP request（`POST /publish` 等）まで
+            無応答時に永久ブロックしうるため、上書きは SSE request 単位に限定する。
     """
     params = {"subscription_ids": ",".join(subscription_ids)}
+    kwargs: dict[str, Any] = {}
+    if read_timeout is not None:
+        base = client.timeout
+        kwargs["timeout"] = httpx.Timeout(
+            connect=base.connect, read=read_timeout, write=base.write, pool=base.pool
+        )
     return client.stream(
-        "GET", "/events", params=params, headers={"Accept": "text/event-stream"}
+        "GET", "/events", params=params, headers={"Accept": "text/event-stream"}, **kwargs
     )
 
 

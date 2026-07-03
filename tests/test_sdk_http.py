@@ -165,3 +165,85 @@ class TestRaiseForRelayStatus:
     def test_scoped_404_permanent(self):
         with pytest.raises(PermanentError):
             raise_for_relay_status(httpx.Response(404), subscription_scoped=True)
+
+
+# ---------------------------------------------------------------------------
+# ブロッカー2: read timeout の適用範囲（通常 request は有効、SSE は個別上書き）
+# ---------------------------------------------------------------------------
+
+
+class TestReadTimeoutScoping:
+    def test_make_client_applies_read_timeout_to_normal_requests(self, monkeypatch):
+        """通常 request の read timeout を client 全体で無効化すると、応答が返らない
+        ケースで永久ブロックしうる。connect/read/write/pool 全軸に timeout が
+        適用されていること（read=None のまま残っていないこと）を確認する。"""
+        from relay_sdk.http.auth import make_client
+
+        monkeypatch.delenv("RELAY_BEARER_TOKEN", raising=False)
+        client = make_client("http://relay.test", timeout=5.0)
+        try:
+            assert client.timeout.read == 5.0
+            assert client.timeout.connect == 5.0
+        finally:
+            client.close()
+
+    def test_open_sse_overrides_read_timeout_only_for_the_stream_request(self, monkeypatch):
+        """`open_sse(read_timeout=...)` は対象 request の read timeout だけを
+        上書きし、connect/write/pool は client 既定のまま保つこと。"""
+        import contextlib
+
+        from relay_sdk.http.auth import make_client
+        from relay_sdk.http.request import open_sse
+
+        monkeypatch.delenv("RELAY_BEARER_TOKEN", raising=False)
+        client = make_client("http://relay.test", timeout=5.0)
+        captured = {}
+
+        def fake_stream(method, url, **kwargs):
+            captured.update(kwargs)
+
+            @contextlib.contextmanager
+            def _cm():
+                yield httpx.Response(200)
+
+            return _cm()
+
+        monkeypatch.setattr(client, "stream", fake_stream)
+        try:
+            with open_sse(client, subscription_ids=["s1"], read_timeout=60.0):
+                pass
+        finally:
+            client.close()
+
+        timeout_arg = captured["timeout"]
+        assert timeout_arg.read == 60.0
+        assert timeout_arg.connect == 5.0
+        assert timeout_arg.write == 5.0
+        assert timeout_arg.pool == 5.0
+
+    def test_open_sse_without_read_timeout_uses_client_default(self, monkeypatch):
+        from relay_sdk.http.auth import make_client
+        from relay_sdk.http.request import open_sse
+
+        monkeypatch.delenv("RELAY_BEARER_TOKEN", raising=False)
+        client = make_client("http://relay.test", timeout=5.0)
+        captured = {}
+
+        def fake_stream(method, url, **kwargs):
+            captured.update(kwargs)
+            import contextlib
+
+            @contextlib.contextmanager
+            def _cm():
+                yield httpx.Response(200)
+
+            return _cm()
+
+        monkeypatch.setattr(client, "stream", fake_stream)
+        try:
+            with open_sse(client, subscription_ids=["s1"]):
+                pass
+        finally:
+            client.close()
+
+        assert "timeout" not in captured

@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator, Sequence
 
+import httpx
+
 from relay_sdk import config as sdk_config
 from relay_sdk.client.sse import parse_sse_lines
 from relay_sdk.errors import PermanentError, RelayProtocolError, TransientError
@@ -188,8 +190,14 @@ class Subscription:
     def _maybe_renew_lease(self) -> None:
         """lease 切れ間近（残り <= lease_ttl / 3）なら PUT lease で renew する（§3.2）。
 
+        呼び出し契機は `_run_periodic_maintenance()`（event / keepalive いずれの
+        frame でも呼ばれる。keepalive frame だけを契機にすると、event が keepalive
+        間隔より高頻度に届く状況（relay は push が無い間だけ keepalive を送るため、
+        event が絶えず届く限り keepalive 自体が来ない）で一切 renew されないまま
+        lease が失効するバグがあった）。
+
         PermanentError（404/410）は receive() ループへ伝播 → resubscribe。TransientError は
-        次回 keepalive で再試行する。
+        次回の呼び出し契機で再試行する。
         """
         remaining = (_parse_iso(self._lease_expires_at) - _now()).total_seconds()
         if remaining > self._lease_ttl / 3:
@@ -205,6 +213,27 @@ class Subscription:
             _events_logger.warning(
                 "lease renew transient failure (subscription=%s)", self._subscription_id
             )
+
+    def _run_periodic_maintenance(self) -> None:
+        """event / keepalive いずれの frame でも呼ぶ保守処理。
+
+        - lease 切れ間近なら PUT lease で renew する（`_maybe_renew_lease`）。
+        - auto_ack の未 flush ack が残っていれば再送を試みる。直前の resume 時の
+          flush が TransientError で失敗した場合、`_buffer_and_flush_ack` は次に
+          新しい event が yield されるまで再試行の契機を持たない。以後 event が
+          来なければ未 ack のまま放置されるため、event が来ない間も keepalive
+          frame を契機に retry できるようにする。
+        """
+        self._maybe_renew_lease()
+        if self._auto_ack and self._ack_buffer is not None:
+            try:
+                self._flush_ack()
+            except TransientError:
+                _events_logger.warning(
+                    "ack flush retry transient failure (subscription=%s, up_to=%s)",
+                    self._subscription_id,
+                    self._ack_buffer,
+                )
 
     # -- resubscribe ------------------------------------------------------
 
@@ -229,8 +258,11 @@ class Subscription:
                 return
             except TransientError:
                 delay = self._next_reconnect_delay()
-                if delay:
-                    time.sleep(delay)
+                # reconnect_max_attempts 到達後（delay is None）も resubscribe 自体は
+                # 諦めない。ここでの None を「sleep 無し」と読むと、_next_reconnect_delay
+                # が None を返し続ける間 backoff_cap を無視して POST /subscriptions を
+                # 連打するホットループになる（medium3）。その場合は backoff_cap で待つ。
+                time.sleep(delay if delay is not None else self._backoff_cap)
 
     # -- reconnect backoff ------------------------------------------------
 
@@ -286,29 +318,50 @@ class Subscription:
                 time.sleep(delay)
 
     def _stream_once(self) -> Iterator[Event]:
-        """1 本の SSE 接続を張り、切断まで event を yield する。"""
-        with open_sse(self._client, subscription_ids=[self._subscription_id]) as resp:
-            raise_for_sse_status(resp)  # 404/410 → PermanentError, 5xx → TransientError
-            self._response = resp
-            try:
-                for frame in parse_sse_lines(resp.iter_lines()):
-                    if self._closed:
-                        return
-                    self._attempt = 0  # bytes 受信 = 接続健全。backoff をリセット。
-                    if frame.kind == "comment":
-                        self._maybe_renew_lease()  # keepalive 契機の保守
-                        continue
-                    if frame.event != "notification" or not frame.data:
-                        continue
-                    event = self._handle_notification(frame.data)
-                    if event is None:
-                        continue
-                    yield event
-                    # caller が resume（= 処理完了とみなせる時点、§3.3）。
-                    if self._auto_ack:
-                        self._buffer_and_flush_ack(event.publish_id)
-            finally:
-                self._response = None
+        """1 本の SSE 接続を張り、切断まで event を yield する。
+
+        SSE 無音検知（§4.2）: `open_sse` に keepalive 間隔の 2 倍（既定 60 秒）の
+        read timeout を渡す。relay は push が無い間だけ keepalive を送るため
+        （push が高頻度なら keepalive 自体が来ない）、read timeout は「keepalive
+        間隔そのもの」ではなく「直近 2 周期分の無音」を基準にする（keepalive 送出の
+        揺らぎで誤検知しないための余裕）。timeout は `TransientError` に翻訳し、
+        `receive()` の再接続ループに乗せる（無応答のまま永久ブロックしない）。
+        """
+        read_timeout = self._keepalive_seconds * 2
+        try:
+            with open_sse(
+                self._client,
+                subscription_ids=[self._subscription_id],
+                read_timeout=read_timeout,
+            ) as resp:
+                raise_for_sse_status(resp)  # 404/410 → PermanentError, 5xx → TransientError
+                self._response = resp
+                try:
+                    for frame in parse_sse_lines(resp.iter_lines()):
+                        if self._closed:
+                            return
+                        self._attempt = 0  # bytes 受信 = 接続健全。backoff をリセット。
+                        # event / keepalive いずれの frame でも保守処理を回す
+                        # （event 専用の分岐にすると、event が keepalive 間隔より
+                        # 高頻度に届く状況で lease renew も ack retry も発火しなくなる）。
+                        self._run_periodic_maintenance()
+                        if frame.kind == "comment":
+                            continue
+                        if frame.event != "notification" or not frame.data:
+                            continue
+                        event = self._handle_notification(frame.data)
+                        if event is None:
+                            continue
+                        yield event
+                        # caller が resume（= 処理完了とみなせる時点、§3.3）。
+                        if self._auto_ack:
+                            self._buffer_and_flush_ack(event.publish_id)
+                finally:
+                    self._response = None
+        except httpx.TimeoutException as exc:
+            raise TransientError(f"SSE 無音タイムアウト: {exc}") from exc
+        except httpx.TransportError as exc:
+            raise TransientError(f"SSE 接続エラー: {exc}") from exc
 
     def _handle_notification(self, data_str: str) -> Event | None:
         data = json.loads(data_str)

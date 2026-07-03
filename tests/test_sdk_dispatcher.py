@@ -235,3 +235,99 @@ class TestDaemonAgainstFakeRelay:
             stop.set()
             t.join(timeout=3)
             assert delivered
+
+
+# ---------------------------------------------------------------------------
+# medium6: labels 列が壊れた行が dispatcher 全体をクラッシュさせないこと
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedRow:
+    def test_bad_labels_json_deadletters_without_crashing_cycle(self, conn):
+        """labels のデコードは _deliver_row の try 内で行う。daemon ループは
+        sqlite3.Error しか捕捉しないため、これを try 外に置くと不正な 1 行が
+        json.JSONDecodeError を送出してループ全体をクラッシュさせ、同一 cycle 内の
+        後続行（正常行も含む）が一切処理されなくなる。"""
+        # bad を先に enqueue する（ORDER BY id で先に処理される）。旧実装ではここで
+        # 例外が飛び、後続の good 行に到達する前に _dispatch_once 全体が失敗していた。
+        bad_id = publish(conn, ref_type="log", ref_id="bad", labels=["a"])
+        good_id = _enqueue(conn, ref_id="good")
+        conn.commit()
+        conn.execute("UPDATE relay_outbox SET labels = 'not-json{{' WHERE id = ?", (bad_id,))
+        conn.commit()
+
+        def handler(request):
+            return httpx.Response(202, json={"publish_id": 1, "matched_subscriptions": 0})
+
+        with _mock_client(handler) as client:
+            delivered = _dispatch_once(
+                conn, client, max_retry=5, initial_backoff_seconds=0.01,
+                backoff_factor=2.0, backoff_until={},
+            )
+
+        assert delivered == 1  # good 行はクラッシュせず配達された
+        bad_row = conn.execute("SELECT * FROM relay_outbox WHERE id = ?", (bad_id,)).fetchone()
+        assert bad_row["dead_at"] is not None
+        assert bad_row["processed_at"] is None
+        good_row = conn.execute("SELECT * FROM relay_outbox WHERE id = ?", (good_id,)).fetchone()
+        assert good_row["processed_at"] is not None
+
+    def test_dispatcher_daemon_survives_malformed_row(self, tmp_path):
+        """run_dispatcher の daemon loop レベルで、壊れた行のせいで daemon スレッド
+        自体が死んで全配達が止まらないことを確認する。"""
+        with FakeRelay() as fake:
+            db = str(tmp_path / "app.db")
+            c = sqlite3.connect(db)
+            create_outbox_table(c)
+            bad_id = publish(c, ref_type="log", ref_id="bad", labels=["a"])
+            c.commit()
+            c.execute("UPDATE relay_outbox SET labels = 'not-json{{' WHERE id = ?", (bad_id,))
+            c.commit()
+            c.close()
+
+            stop = threading.Event()
+            t = threading.Thread(
+                target=run_dispatcher,
+                kwargs=dict(
+                    db_path=db,
+                    relay_base_url=fake.base_url,
+                    agent_card_path=fake.fake_agent_card_path(),
+                    poll_interval_seconds=0.03,
+                    stop_event=stop,
+                ),
+                daemon=True,
+            )
+            t.start()
+            time.sleep(0.3)
+            assert t.is_alive(), "dispatcher daemon が壊れた行でクラッシュして終了している"
+
+            # 壊れた行の後に enqueue した正常行が、その後も配達され続けることを確認する。
+            c2 = sqlite3.connect(db)
+            good_id = publish(c2, ref_type="log", ref_id="good-after", labels=["b"])
+            c2.commit()
+            c2.close()
+
+            deadline = time.time() + 5
+            delivered = False
+            while time.time() < deadline:
+                check = sqlite3.connect(db)
+                v = check.execute(
+                    "SELECT processed_at FROM relay_outbox WHERE id = ?", (good_id,)
+                ).fetchone()[0]
+                check.close()
+                if v is not None:
+                    delivered = True
+                    break
+                time.sleep(0.05)
+            stop.set()
+            t.join(timeout=3)
+            assert delivered, (
+                "壊れた行の後、正常行が配達され続けなかった（daemon がクラッシュした可能性）"
+            )
+            bad_row_check = sqlite3.connect(db)
+            bad_dead_at = bad_row_check.execute(
+                "SELECT dead_at FROM relay_outbox WHERE id = ?", (bad_id,)
+            ).fetchone()[0]
+            bad_row_check.close()
+            assert bad_dead_at is not None
+            assert delivered
