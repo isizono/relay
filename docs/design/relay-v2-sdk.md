@@ -8,12 +8,12 @@
 >
 > | 前提 | 出典 | 本 SDK での具現化 |
 > |---|---|---|
-> | publish 保証 = transactional outbox + at-least-once + retain 24h default | 機能要件 v3 FR-4 | `relay_outbox.publish()` で同一 SQLite tx に INSERT、dispatcher が relay へ POST |
-> | subscription_id は relay が採番、subscriber 持参復旧経路なし（履歴中立） | 機能要件 v3 FR-3.0 / FR-3.2 | `Subscription` は再接続のたびに新規 subscribe を行う |
-> | SSE resume = relay が未 ack outbox を黙って再 push（`Last-Event-ID` 不使用） | 機能要件 v3 FR-4.8 / FR-3.9 | SDK は `Last-Event-ID` ヘッダを送らず、再接続後の cumulative ack カーソルを真実源とする |
-> | ack = subscriber 発の app-level cumulative ack（`POST /subscriptions/{id}/ack { up_to_publish_id }`） | 機能要件 v3 FR-3.10 | `Subscription.ack(up_to_publish_id)` をラップ |
-> | seq 体系 = `publish_id` 1 系統（relay 全体 global 単調） | 機能要件 v3 §4.4 | event payload の `publish_id` がそのまま ack カーソル |
-> | identity = A2A authN（AgentCard + Bearer / JWS）、subscriber 種別中立 | 機能要件 v3 FR-5 | SDK は AgentCard を読み込んで securityScheme を選択、JWS は `pyjwt` 等で署名 |
+> | publish 保証 = transactional outbox + at-least-once + retain 24h default | 機能要件 v2 FR-4 | `relay_outbox.publish()` で同一 SQLite tx に INSERT、dispatcher が relay へ POST |
+> | subscription_id は relay が採番、subscriber 持参復旧経路なし（履歴中立） | 機能要件 v2 FR-3.0 / FR-3.2 | `Subscription` は再接続のたびに新規 subscribe を行う |
+> | SSE resume = relay が未 ack outbox を黙って再 push（`Last-Event-ID` 不使用） | 機能要件 v2 FR-4.8 / FR-3.9 | SDK は `Last-Event-ID` ヘッダを送らず、再接続後の cumulative ack カーソルを真実源とする |
+> | ack = subscriber 発の app-level cumulative ack（`POST /subscriptions/{id}/ack { up_to_publish_id }`） | 機能要件 v2 FR-3.10 | `Subscription.ack(up_to_publish_id)` をラップ |
+> | seq 体系 = `publish_id` 1 系統（relay 全体 global 単調） | 機能要件 v2 §4.4 | event payload の `publish_id` がそのまま ack カーソル |
+> | identity = A2A authN（AgentCard + Bearer / JWS）、subscriber 種別中立 | 機能要件 v2 FR-5 | SDK は AgentCard を読み込んで securityScheme を選択、JWS は `pyjwt` 等で署名 |
 
 ---
 
@@ -27,9 +27,9 @@
 | **dispatcher** | publisher プロセス（または別プロセス）で常駐する relay 配達 daemon。outbox を polling して relay の `POST /publish` を呼ぶ |
 | **subscription_id** | relay が `POST /subscriptions` で採番する UUID。subscriber が `Subscription` を保持している間だけ有効。subscriber プロセス再起動 / lease 切れで失効し、再 subscribe で新 ID を発行する |
 | **publish_id** | relay 全体で global 単調な整数 ID。subscription 内順序・ack カーソル・SSE `id:` 行の三役を兼ねる |
-| **stream** | 機能要件 v3 で言う「場」の SDK 内呼称。membership ベースで配達先が決まる publish 源 |
+| **stream** | 機能要件 v2 で言う「場」の SDK 内呼称。membership ベースで配達先が決まる publish 源 |
 
-> 機能要件 v3 のユビキタス言語は議論中。本書では「stream」を原則使い、「場」とは併記しない。
+> 機能要件 v2 のユビキタス言語は議論中。本書では「stream」を原則使い、「場」とは併記しない。
 
 ---
 
@@ -109,7 +109,7 @@ def publish(
 
     Args:
         conn: 業務 write が乗っている SQLite Connection。SDK は commit / rollback を呼ばない。
-        ref_type: relay 機能要件 v3 FR-3.6 の ref.type（"decision" / "log" / "material" / ...）。
+        ref_type: relay 機能要件 v2 FR-3.6 の ref.type（"decision" / "log" / "material" / ...）。
         ref_id: 業務 entity の PK。
         labels: AND set として扱われる opaque string のリスト。空配列は ValueError。
         title: 200 UTF-8 chars 以内。超過時は publisher 責任で truncate（SDK は truncate しない）。
@@ -282,7 +282,7 @@ def subscribe(
     Args:
         subscriber_identity: 認証済みハンドル文字列。AgentCard と整合する必要がある。
         labels: AND set として扱われる。空配列は relay 側で 400 になるので呼び出し前に ValueError。
-        lease_ttl_seconds: 機能要件 v3 FR-3.2 で min 30, max 86400。
+        lease_ttl_seconds: 機能要件 v2 FR-3.2 で min 30, max 86400。
         retain_seconds: SSE 切断中の outbox 保持秒数。省略時は relay 既定（24h）。
                         lease_ttl とは独立した軸で、大小制約はない（retain > lease は正当）。
         auto_ack: True なら receive() のイテレーションが次に進んだ時点（= 直前に yield した
@@ -469,14 +469,14 @@ reconciliation の本筋ロジック（labels → 内部 tool 呼び出しの翻
 ### 4.2 SSE 接続管理
 
 - `httpx` の `client.stream("GET", url, headers=...)` を使う。
-- 30 秒以内に何も読まれなければ TCP close と扱う（relay 側 keepalive 間隔は 30 秒、機能要件 v3 FR-4.6）。
+- 30 秒以内に何も読まれなければ TCP close と扱う（relay 側 keepalive 間隔は 30 秒、機能要件 v2 FR-4.6）。
 - event 単位の dedup は `(subscription_id, publish_id)` で行う。SDK 内に LRU set（直近 10000 件）を持つ。
 - 再接続の指数バックオフは §3.4 参照。
 
 ### 4.3 JWS 署名生成 / 検証
 
 - AgentCard の `securitySchemes` を読み込み、Bearer 用 token を `RELAY_BEARER_TOKEN` 環境変数または `jws_key_path` 経由の私鍵で生成する。
-- relay 側 AgentCard を起動時に取得し、JWS で署名されていれば `/.well-known/jwks.json` の公開鍵で検証する（MAY 要件、機能要件 v3 FR-5.3）。検証失敗時は接続を拒否する。
+- relay 側 AgentCard を起動時に取得し、JWS で署名されていれば `/.well-known/jwks.json` の公開鍵で検証する（MAY 要件、機能要件 v2 FR-5.3）。検証失敗時は接続を拒否する。
 - 署名 / 検証は `pyjwt`（ES256）と `rfc8785`（JCS）を使う。SDK 自体は wrapper として `relay_sdk.http.auth` に閉じ込める。
 
 ### 4.4 エラーハンドリング
@@ -663,7 +663,7 @@ def test_subscriber_receives_published_event() -> None:
 
 - `POST /subscriptions` / `DELETE /subscriptions/{id}` / `PUT /subscriptions/{id}/lease` / `POST /publish` / `POST /subscriptions/{id}/ack` / `GET /events` の最小実装
 - in-memory な outbox（subscription_id -> [Event]）
-- subset マッチング（機能要件 v3 FR-3.3 と同じ）
+- subset マッチング（機能要件 v2 FR-3.3 と同じ）
 - cumulative ack（FR-3.10 と同じ）
 - ack 前切断 → 再接続で再 push（FR-4.8）
 - `fake.simulate_outage()` / `fake.simulate_subscription_loss(subscription_id)`（subscription 操作への 404 / 410 応答の注入）等のフォールト注入 API
@@ -692,7 +692,7 @@ FakeRelay を使う unit test では、§3.2.1 の型分離を回帰から守る
 
 ### 7.3 contract test
 
-SDK が relay へ送る HTTP request / SSE consume の形は relay 機能要件の仕様と整合している必要がある。`tests/contract/` 配下に relay 機能要件 v3 と本書の対応表に基づく契約テストを置き、ワイヤ API ドキュメントを更新したときに SDK 側も追随漏れなく検知できるようにする。
+SDK が relay へ送る HTTP request / SSE consume の形は relay 機能要件の仕様と整合している必要がある。`tests/contract/` 配下に relay 機能要件 v2 と本書の対応表に基づく契約テストを置き、ワイヤ API ドキュメントを更新したときに SDK 側も追随漏れなく検知できるようにする。
 
 ---
 
@@ -709,7 +709,7 @@ SDK が relay へ送る HTTP request / SSE consume の形は relay 機能要件�
 
 ## 9. 関連
 
-- relay 機能要件 v3（凍結）— relay が満たす振る舞いの一次ソース
+- relay 機能要件 v2（凍結）— relay が満たす振る舞いの一次ソース
 - ワイヤ / API 仕様（`relay-v2-wire-api.md`）— 本書が依存する HTTP / SSE プロトコル
 - cc-memory ↔ relay 協調プロトコル v1（cc-memory 側で凍結）— `relay_outbox.publish()` の利用側ガイド
 - identity / authZ 仕様（`relay-v2-identity-authz.md`、別書）— AgentCard / JWS / Bearer の詳細

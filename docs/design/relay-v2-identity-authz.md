@@ -19,7 +19,7 @@
 > - ワイヤプロトコルの endpoint / payload / status code 全集
 >   → `relay-v2-wire-api.md`
 > - cc-memory 連携プロトコル → cc-memory 側にのみ存在（協調プロトコル v1）
-> - 用語の最終確定: relay v2 のユビキタス言語は議論中。本書は暫定的に機能要件文書 v3 の用語に揃え、
+> - 用語の最終確定: relay v2 のユビキタス言語は議論中。本書は暫定的に機能要件文書 v2（物理改稿版）の用語に揃え、
 >   「場」と「stream」が併存する場合は原則「stream」を使う。A2A spec 由来の用語（AgentCard / JWS /
 >   JCS / DID / SecurityScheme）はそのまま英語で書く
 
