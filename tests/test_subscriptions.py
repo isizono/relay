@@ -118,6 +118,33 @@ class TestSubscriptionRegistry:
         record.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
         assert registry.matching(frozenset({"X"})) == []
 
+    def test_evict_expired_removes_only_past_grace_period(self):
+        """猶予期間を過ぎた lease 切れのみ除去し、猶予内・生存中は残す。"""
+        from datetime import datetime, timedelta, timezone
+
+        registry = SubscriptionRegistry()
+        now = datetime.now(timezone.utc)
+
+        long_expired = registry.create("agent-a", frozenset({"x"}), 300, 86400)
+        long_expired.lease_expires_at = now - timedelta(seconds=7200)  # 2h 前に失効
+
+        recently_expired = registry.create("agent-b", frozenset({"x"}), 300, 86400)
+        recently_expired.lease_expires_at = now - timedelta(seconds=10)  # 10s 前に失効
+
+        alive = registry.create("agent-c", frozenset({"x"}), 300, 86400)
+
+        evicted = registry.evict_expired(older_than_seconds=3600)
+
+        assert evicted == [long_expired.subscription_id]
+        assert registry.get(long_expired.subscription_id) is None
+        assert registry.get(recently_expired.subscription_id) is not None
+        assert registry.get(alive.subscription_id) is not None
+
+    def test_evict_expired_noop_when_nothing_past_grace_period(self):
+        registry = SubscriptionRegistry()
+        registry.create("agent-a", frozenset({"x"}), 300, 86400)
+        assert registry.evict_expired(older_than_seconds=3600) == []
+
 
 # ---------------------------------------------------------------------------
 # HTTP 統合テスト
@@ -282,6 +309,23 @@ class TestRenewLease:
         )
         assert r.status_code == 400
 
+    def test_owner_lease_expired_returns_410(self, client):
+        """所有者本人でも lease 切れ済み subscription への renew は 410（wire-api.md §5.3）。
+
+        renew の目的自体が「切れかけの lease を延命する」ことだが、いったん期限を過ぎた
+        subscription は re-subscribe が必要というのが仕様の意図であり、410 は
+        registry に残存している間だけ返る best-effort のヒント（§5.7）。
+        """
+        from datetime import datetime, timedelta, timezone
+
+        sid = self._subscribe(client)
+        record = client.app.state.subscription_registry.get(sid)
+        record.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+        r = client.put(f"/subscriptions/{sid}/lease", json={}, headers=_auth("tok-a"))
+        assert r.status_code == 410
+        assert r.json()["code"] == "SubscriptionGoneError"
+
 
 class TestUnsubscribe:
     def test_owner_can_unsubscribe(self, client):
@@ -412,6 +456,22 @@ class TestAckSubscription:
             headers=_auth("tok-b"),
         )
         assert r.status_code == 400
+
+    def test_owner_lease_expired_returns_410(self, client):
+        """所有者本人でも lease 切れ済み subscription への ack は 410（wire-api.md §5.6）。"""
+        from datetime import datetime, timedelta, timezone
+
+        sid, publish_id = self._subscribe_and_publish(client)
+        record = client.app.state.subscription_registry.get(sid)
+        record.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+        r = client.post(
+            f"/subscriptions/{sid}/ack",
+            json={"up_to_publish_id": publish_id},
+            headers=_auth("tok-b"),
+        )
+        assert r.status_code == 410
+        assert r.json()["code"] == "SubscriptionGoneError"
 
 
 class TestPublish:

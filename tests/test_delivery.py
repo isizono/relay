@@ -523,6 +523,29 @@ class TestDlqSweep:
         assert remaining == {"recent-sub"}
 
 
+class TestSubscriptionRegistrySweep:
+    """dispatch_once が subscription registry の掃除まで一貫して行うことを検証する。"""
+
+    def test_dispatch_once_evicts_long_expired_subscription(self, settings):
+        asyncio.run(self._run(settings))
+
+    async def _run(self, settings):
+        db.init_db(settings.db_path)
+        app = create_app(settings)
+        sub_registry = subscriptions.get_registry_from_state(app.state)
+
+        long_expired = sub_registry.create("agent-a", frozenset({"x"}), 300, 86400)
+        long_expired.lease_expires_at = datetime.now(timezone.utc) - timedelta(
+            seconds=settings.subscription_registry_retention_seconds + 1
+        )
+        alive = sub_registry.create("agent-b", frozenset({"y"}), 300, 86400)
+
+        await delivery.dispatch_once(app)
+
+        assert sub_registry.get(long_expired.subscription_id) is None
+        assert sub_registry.get(alive.subscription_id) is not None
+
+
 # ---------------------------------------------------------------------------
 # dispatcher 単一プロセス enforcement（file lock）
 # ---------------------------------------------------------------------------

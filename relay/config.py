@@ -31,6 +31,14 @@ DEFAULT_SSE_SEND_TIMEOUT_SECONDS = 5.0
 DEFAULT_DLQ_RETENTION_DAYS = 7
 DEFAULT_PUBLISH_RATE_LIMIT_PER_SECOND = 100
 
+# lease 切れ済み subscription を in-memory registry に残しておく猶予秒数
+# （relay-v2-wire-api.md §5.7 の 410 ヒントを再接続の遅い subscriber にも
+# 一定時間だけ提供するため）。この猶予を過ぎたら registry から物理的に除去する
+# （unsubscribe されないまま放置された subscription による無制限のメモリ増加を防ぐ）。
+# 404 / 410 いずれも subscriber は同一に「re-subscribe せよ」と扱うため（§5.7）、
+# 猶予の長さは機能上の互換性には影響しない。
+DEFAULT_SUBSCRIPTION_REGISTRY_RETENTION_SECONDS = 3600  # 1h
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -61,6 +69,9 @@ class Settings:
     sse_send_timeout_seconds: float = DEFAULT_SSE_SEND_TIMEOUT_SECONDS
     dlq_retention_days: int = DEFAULT_DLQ_RETENTION_DAYS
     publish_rate_limit_per_second: int = DEFAULT_PUBLISH_RATE_LIMIT_PER_SECOND
+    subscription_registry_retention_seconds: float = (
+        DEFAULT_SUBSCRIPTION_REGISTRY_RETENTION_SECONDS
+    )
 
 
 def _load_auth_tokens_from_env() -> dict[str, str]:
@@ -116,6 +127,12 @@ def load_settings_from_env() -> Settings:
             os.environ.get(
                 "RELAY_PUBLISH_RATE_LIMIT_PER_SECOND",
                 DEFAULT_PUBLISH_RATE_LIMIT_PER_SECOND,
+            )
+        ),
+        subscription_registry_retention_seconds=float(
+            os.environ.get(
+                "RELAY_SUBSCRIPTION_REGISTRY_RETENTION_SECONDS",
+                DEFAULT_SUBSCRIPTION_REGISTRY_RETENTION_SECONDS,
             )
         ),
     )

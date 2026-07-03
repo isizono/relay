@@ -444,3 +444,20 @@ TTL（既定 90 日）を過ぎた行は `purge_expired_server_log` で間引く
    現状の実装は `SubscriptionRegistry.matching()` で全 subscription を線形走査する素朴な
    実装であり、性能 SLO 検証・最適化（inverted index 等）は T7（observability /
    性能）相当のタスクに委ねる。
+
+## Subscriptions タスク: `SubscriptionRegistry` の無制限メモリ増加を解消
+
+Delivery タスクの実装レビュー中に見つけた点。`SubscriptionRegistry` は unsubscribe
+（`DELETE /subscriptions/{id}`）でのみレコードを除去しており、lease が切れて renew
+されないまま放置された subscription（subscriber がクラッシュして re-subscribe も
+unsubscribe もしないケース）は `_subs` dict に無期限に残り続ける実装になっていた。
+wire-api.md §5.7 は「所有者本人の lease 切れ subscription への操作は registry 残存時に
+限り `410`」と規定しており、この 410 ヒントを提供する目的で registry 残存自体は必要だが、
+無期限に残す必然性はない（`404` / `410` はどちらも subscriber 側で「re-subscribe せよ」
+の同一シグナルとして扱われるため、いつまで `410` を返せるかは機能的な互換性に影響しない）。
+
+対応として `SubscriptionRegistry.evict_expired(older_than_seconds)` を追加し、
+`relay/delivery.py` の `dispatch_once`（既存の DLQ sweep サイクル）から毎 polling cycle
+呼び出すようにした。lease 切れから `Settings.subscription_registry_retention_seconds`
+（既定 1 時間、`RELAY_SUBSCRIPTION_REGISTRY_RETENTION_SECONDS` で override 可）を過ぎた
+subscription を registry から物理的に除去する。除去後は非所有者と同じ `404` になる。

@@ -141,6 +141,27 @@ class SubscriptionRegistry:
         with self._lock:
             self._subs.pop(subscription_id, None)
 
+    def evict_expired(self, older_than_seconds: float) -> list[str]:
+        """lease が `older_than_seconds` 秒より前に切れた subscription を registry から除去する。
+
+        unsubscribe されないまま放置された subscription（クラッシュした subscriber 等）が
+        registry に無期限に残り続けるのを防ぐ（`_subs` の無制限成長を回避）。除去対象は
+        「所有者本人への 410 ヒント」（wire-api.md §5.7）を提供する目的の猶予期間を過ぎた
+        ものに限る。除去されると以後は非所有者と同じ `404 Not Found` になるが、subscriber は
+        `404` / `410` のどちらも re-subscribe のシグナルとして同一に扱うため機能上の影響はない
+        （§5.7）。除去した `subscription_id` の一覧を返す（呼び出し側のログ用）。
+        """
+        cutoff = _now() - timedelta(seconds=older_than_seconds)
+        with self._lock:
+            expired_ids = [
+                subscription_id
+                for subscription_id, record in self._subs.items()
+                if record.lease_expires_at <= cutoff
+            ]
+            for subscription_id in expired_ids:
+                del self._subs[subscription_id]
+            return expired_ids
+
     def matching(self, publish_labels: frozenset[str]) -> list[SubscriptionRecord]:
         """`publish_labels` の superset となる labels を持つ、lease 生存中の subscription 一覧。
 

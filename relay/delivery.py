@@ -25,6 +25,8 @@ retry → DLQ 化ループ）、DLQ sweep（`dead_at` から 7 日後の物理 D
        permanent error（subscription_id が registry に存在しない / lease 切れ）の
        outbox エントリを `dlq` table に移す。
     4. DLQ 物理削除: `dead_at` から 7 日経過した `dlq` 行を DELETE する。
+    5. subscription registry 掃除: lease 切れから猶予期間（既定 1 時間）を過ぎた
+       subscription を in-memory registry から除去する（無制限メモリ増加の防止）。
 
 - keepalive（30 秒ごとの `: keepalive` コメント行）は SSE 送信側の generator が
   `asyncio.wait_for(queue.get(), timeout=...)` のタイムアウトとして自前で生成する
@@ -448,6 +450,22 @@ def _sweep_dlq_physical_delete(db_conn: sqlite3.Connection, settings: Settings) 
     db_conn.execute("DELETE FROM dlq WHERE dead_at < ?", (cutoff,))
 
 
+def _sweep_expired_subscription_registry(
+    sub_registry, settings: Settings, app_state=None
+) -> None:
+    """lease 切れから猶予期間を過ぎた subscription を registry から除去する。
+
+    unsubscribe されないまま放置された subscription による registry の無制限成長を防ぐ
+    （`relay.subscriptions.SubscriptionRegistry.evict_expired` docstring 参照）。
+    """
+    evicted = sub_registry.evict_expired(settings.subscription_registry_retention_seconds)
+    if evicted and app_state is not None:
+        for subscription_id in evicted:
+            observability.record_event(
+                app_state, "subscription_registry_evicted", subscription_id=subscription_id
+            )
+
+
 # ---------------------------------------------------------------------------
 # dispatcher 本体（polling loop）
 # ---------------------------------------------------------------------------
@@ -465,6 +483,7 @@ async def dispatch_once(app) -> None:
         _sweep_permanent_errors(db_conn, sub_registry, app_state=app.state)
         _sweep_dlq_physical_delete(db_conn, settings)
         db_conn.commit()
+        _sweep_expired_subscription_registry(sub_registry, settings, app_state=app.state)
     finally:
         db_conn.close()
 
