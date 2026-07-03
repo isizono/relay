@@ -549,3 +549,22 @@ label には `subscription_id` / `delivery_target` を使わない（wire-api.md
    本タスクのスコープ外として明示的に見送られている）。
 4. **`recent_warnings` の保持件数（50 件）とバッファのスコープ（app インスタンス単位、
    relay 再起動で消える）は本タスクでの判断**。wire-api.md は件数・保持期間を規定していない。
+
+## Verify タスク: outbox 障害時に `503` を返す共通 exception handler を追加
+
+T6 退化モード検証（material id 550 T6 Acceptance「outbox 障害 (disk full / DB corrupt 擬似)
+で `POST /publish` が `503`」）を実機で検証したところ、DB ファイルの権限を落として
+SQLite の read/write を失敗させると、各 endpoint 実装（`streams.py` / `subscriptions.py`）
+は `sqlite3.Error` を未処理のまま送出し、Starlette デフォルトの `500 Internal Server Error`
+（非構造化・error envelope 無し）になっていた。wire-api.md §8 が明示的に `503` と規定して
+いるため、これは受け入れ基準を満たさない実装欠陥と判断し、その場で修正した。
+
+個々の endpoint 実装が SQLite 操作のたびに try/except するのではなく、`relay/app.py`
+の `create_app` で Starlette の `exception_handlers={sqlite3.Error: handle_outbox_unavailable}`
+を登録し、一箇所に集約した（`relay/errors.py` に `OUTBOX_UNAVAILABLE =
+"OutboxUnavailableError"` を追加）。`sqlite3.Error` は `sqlite3.OperationalError` /
+`sqlite3.DatabaseError` 等の基底クラスであり、DB ファイルの権限エラー・disk full・
+corruption のいずれもこの経路で捕捉される。`tests/test_app.py` の
+`TestOutboxUnavailable` で `db.get_connection` を monkeypatch して `sqlite3.OperationalError`
+を送出させ、`503` + `{"code": "OutboxUnavailableError"}` を返すことを検証した。実機
+（DB ファイルを `chmod 000` して SQLite の open を失敗させる方法）でも `503` を確認した。

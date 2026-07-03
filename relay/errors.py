@@ -29,6 +29,7 @@ INVALID_REQUEST = "InvalidRequestError"
 PAYLOAD_TOO_LARGE = "PayloadTooLargeError"
 RATE_LIMIT_EXCEEDED = "RateLimitExceededError"
 SUBSCRIBER_MISMATCH = "SubscriberMismatchError"
+OUTBOX_UNAVAILABLE = "OutboxUnavailableError"
 
 
 def error_response(

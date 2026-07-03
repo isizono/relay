@@ -76,3 +76,31 @@ class TestNotFound:
     def test_unregistered_route_returns_404(self, client):
         r = client.get("/nonexistent")
         assert r.status_code == 404
+
+
+class TestOutboxUnavailable:
+    """outbox（SQLite）書き込み失敗時の共通 exception handler（relay-v2-wire-api.md §8）。
+
+    disk full / DB corrupt 等で `sqlite3.Error` が送出された場合、未処理のまま Starlette
+    デフォルトの 500 に落ちず `503` を返すことを検証する（T6 退化モード検証の一部）。
+    """
+
+    def test_sqlite_error_returns_503(self, client, monkeypatch):
+        headers = {"Authorization": "Bearer tok-abc"}
+        r = client.post("/streams", json={"stream_id": "s1"}, headers=headers)
+        assert r.status_code == 201
+
+        import sqlite3
+
+        import relay.db as db_module
+
+        def _boom(path):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(db_module, "get_connection", _boom)
+
+        r = client.post(
+            "/streams/s1/messages", json={"body": "hello"}, headers=headers
+        )
+        assert r.status_code == 503
+        assert r.json()["code"] == "OutboxUnavailableError"

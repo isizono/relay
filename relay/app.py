@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -20,7 +21,24 @@ from starlette.routing import Route
 
 from relay import db, delivery, observability, streams, subscriptions
 from relay.config import Settings, get_settings
+from relay.errors import OUTBOX_UNAVAILABLE, error_response
 from relay.identity import MEDIA_TYPE_AGENT_CARD, build_public_agent_card
+
+
+async def handle_outbox_unavailable(request: Request, exc: Exception) -> Response:
+    """outbox（SQLite）への読み書きが失敗した場合の共通ハンドラ。
+
+    disk full / DB corrupt 等で `sqlite3.Error` が送出された場合、relay-v2-wire-api.md
+    §8 の規約どおり `503 Service Unavailable` を返す（未処理のまま Starlette デフォルトの
+    `500 Internal Server Error` に落ちるのを防ぐ）。個々の endpoint 実装が SQLite 操作の
+    たびに try/except するのではなく、Starlette の `exception_handlers` で一箇所に集約する。
+    """
+    observability.record_event(
+        request.app.state, "outbox_error", level="warning", reason=str(exc)
+    )
+    return error_response(
+        503, OUTBOX_UNAVAILABLE, "outbox が一時的に利用できません（disk full / DB corrupt 等）"
+    )
 
 
 async def health(request: Request) -> Response:
@@ -77,7 +95,11 @@ def create_app(settings: Settings | None = None) -> Starlette:
         *observability.routes,
     ]
 
-    app = Starlette(routes=routes, lifespan=lifespan)
+    app = Starlette(
+        routes=routes,
+        lifespan=lifespan,
+        exception_handlers={sqlite3.Error: handle_outbox_unavailable},
+    )
     app.state.settings = resolved_settings
     # `GET /status` の `uptime_seconds` 用（wire-api.md §7.1）。壁時計のずれに影響されない
     # `time.monotonic()` を使う。
