@@ -568,3 +568,137 @@ corruption のいずれもこの経路で捕捉される。`tests/test_app.py` �
 `TestOutboxUnavailable` で `db.get_connection` を monkeypatch して `sqlite3.OperationalError`
 を送出させ、`503` + `{"code": "OutboxUnavailableError"}` を返すことを検証した。実機
 （DB ファイルを `chmod 000` して SQLite の open を失敗させる方法）でも `503` を確認した。
+
+## `relay_sdk`（Python SDK、クライアント側）実装
+
+`docs/design/relay-v2-sdk.md` の仕様に従い、クライアント側 Python SDK を新規パッケージ
+`relay_sdk/` として実装した。relay 本体（`relay/` パッケージ）には一切変更を加えていない。
+
+### パッケージ構成（実装済み）
+
+```
+relay_sdk/
+├── __init__.py           # errors の re-export
+├── errors.py             # RelayProtocolError / TransientError / PermanentError（§4.4）
+├── config.py             # 環境変数解決（§6）
+├── testing.py            # FakeRelay（§7.1、in-process HTTP server stub）
+├── outbox/               # publisher 側（§2）
+│   ├── __init__.py       # publish / poll / mark_delivered / run_dispatcher の re-export
+│   ├── schema.py         # relay_outbox DDL + create_outbox_table
+│   ├── publisher.py      # publish(conn, ...) 本体 + debug 用 poll / mark_delivered
+│   ├── dispatcher.py     # run_dispatcher 常駐ループ + file lock singleton
+│   └── __main__.py       # python -m relay_sdk.outbox（CLI entrypoint、§2.3.2）
+├── client/               # subscriber 側（§3）
+│   ├── __init__.py       # subscribe / Subscription / Event / EventDisplay / reconcile
+│   ├── subscription.py   # Subscription / Event / EventDisplay / subscribe()
+│   ├── sse.py            # SSE frame パーサ
+│   └── reconcile.py      # retain 切れ fallback ヘルパ（§3.5）
+└── http/                 # protocol 層（§4）
+    ├── __init__.py
+    ├── request.py        # post_publish / post_subscription / put_lease / delete_subscription / post_ack / open_sse + status→例外翻訳
+    └── auth.py           # Bearer / JWS 署名・検証 + make_client
+```
+
+### 実装カバレッジ（依頼の優先順位に対応）
+
+| 優先度 | 項目 | 状態 |
+|---|---|---|
+| 1 | publisher `publish()` + `run_dispatcher()`、subscriber `subscribe()` → `receive()` → `ack()` / `close()`、§5.1/§5.2 の典型コード例 | 実装済み・テスト済み |
+| 2 | `relay_sdk.http`（6 request 関数）+ `relay_sdk.errors`（3 例外分類） | 実装済み・テスト済み |
+| 3 | `FakeRelay` + §7.1 の title 型分離「固定すべき 4 項目」の回帰テスト | 実装済み・テスト済み |
+| 4 | 実 `relay/app.py` に対する integration test（往復 1 本 + dispatcher 再起動） | 実装済み・テスト済み |
+| 5 | JWS 署名/検証（`http.auth`）、`reconcile()`（§3.5）、CLI entrypoint（`python -m relay_sdk.outbox`） | 実装済み・テスト済み |
+
+新規テスト（`tests/test_sdk_*.py` + `tests/integration/test_sdk_roundtrip.py`）を追加した。
+全体で 407 passed（既存 354 + SDK 分 53）。relay 本体テストへの破壊はない。
+
+### 判断した点（一次情報源に曖昧さがあり、独自解釈で進めた箇所）
+
+1. **SSE 接続は最初の `receive()` で張る（`subscribe()` では張らない）**。§3.1 の文面は
+   「`subscribe()` が…`GET /events` で SSE 接続を張る」だが、SSE stream は generator の
+   lifecycle であり、`subscribe()` で開いて `receive()` まで保持するのは httpx streaming の
+   扱いが煩雑になる。`subscribe()`→`receive()` 間の publish は relay が未 ack outbox として
+   保持し接続時に再 push する（§6.5）ため、遅延して張っても取りこぼさない。配達確証への
+   影響はないと判断し、SSE は `receive()` 初回で張る実装にした。
+
+2. **`auto_ack` の flush タイミングは「caller が event を resume した直後に即 flush」**。
+   §3.2 は「次の relay 通信（lease renew / 次の ack flush / close）で送る」と batch を示唆
+   するが、v1 は正確性優先で、resume 直後に cumulative ack を 1 回 POST する実装にした。
+   これは §3.3 の「handle が成功した直後の event だけが ack される」を厳密に満たし、
+   「resume 直後の flush」自体が spec の言う「次の relay 通信」に該当する。event ごとに
+   1 POST になるが cumulative なのでコストは O(1)（wire §5.6）。batch 効率化が要る場合は
+   caller が `auto_ack=False` + `ack()` を使う（§5.3）。この判断は推測に基づく実装選択で
+   あり、性能要求が出た段階で deferred flush へ差し替えられる。
+
+3. **dispatcher の per-row retry backoff は in-memory 管理**。§2.1 の `relay_outbox` schema
+   には「次回リトライ時刻」列が無い。§2.3.1 手順4 の「同一ループ内で待つのではなく次回
+   polling まで待つ」指数バックオフを、schema を拡張せず dispatcher プロセスの in-memory
+   dict（`_backoff_until`）で刻む実装にした。dispatcher は単一プロセス（file lock で enforce）
+   のため in-memory で十分で、プロセス再起動時は backoff state を失って即リトライになる
+   （at-least-once を壊さない。過剰再送は relay 側 idempotency 15 分 dedup が吸収する）。
+
+4. **`FakeRelay` は httpx.MockTransport ではなく実 in-process HTTP server（`http.server`）**。
+   §7.1 は「Python オブジェクトで模した stub」とするが、SDK が使う httpx streaming / SSE
+   frame parse / 再接続の実経路をそのまま通すには MockTransport では不足（streaming の
+   incremental read を模しにくい）と判断し、stdlib の `ThreadingHTTPServer` で実 socket を
+   張る stub にした。「real relay なしに駆動」という §7.1 の要件は満たす（`relay/app.py` に
+   依存しない）。SSE body は `Connection: close`（body-until-close）で httpx に incremental
+   に読ませる。fault 注入（`simulate_outage` / `simulate_subscription_loss` /
+   `drop_connections`）を実装した。**auth は FakeRelay 側で強制しない**（`Authorization`
+   ヘッダを無視する）。認証経路の検証は integration test（実 relay）側で行う。
+
+5. **Bearer token 解決は `RELAY_BEARER_TOKEN` 環境変数を主経路にした**。現行 relay の authN
+   （`relay/identity.py`）は `Authorization: Bearer <token>` の静的照合（`RELAY_AUTH_TOKENS`
+   の token→identity 表）であり、relay は **JWS Bearer を consume しない**。したがって
+   §4.3 の JWS 署名（`sign_jws`、pyjwt[crypto] + ES256）は A2A 準拠を見据えた MAY 機能と
+   して実装したが、現行 relay に対する実認証は plain Bearer token で行う。integration test は
+   relay の `Settings.auth_tokens` と `RELAY_BEARER_TOKEN` を揃える（publisher / subscriber を
+   同一 identity で回す。publish は authN のみ、subscribe は subscriber==認証 identity を要求
+   するが、同一 identity なら両立する）。`subscribe()` の signature は spec 通り（`bearer_token`
+   引数を足していない）。`run_dispatcher()` には利便のため任意の `bearer_token` 引数を追加した
+   （spec signature の superset。省略時は env にフォールバック）。
+
+6. **subscriber は場（stream）レーンの event を skip する**。§3.2 の `Event` 型は
+   `ref_type` / `ref_id` / `labels` を持つ subscription レーン形状で、場レーンの `body` のみの
+   event は表現できない。`subscribe()` は subscription を張るだけで場 membership を張らない
+   ため、`GET /events` に場 event が混ざる状況は通常発生しない。防御的に
+   `delivery_target` が `sub:` で始まらない frame は skip する実装にした。
+
+7. **`reconnect_max_attempts` 枯渇時は例外ではなく resubscribe**。§3.4 は「max_attempts に
+   達するか 404/410 を受け取ったら新規 subscribe に切り替える」と規定するため、再接続上限に
+   達しても caller へ例外を投げず、新規 `POST /subscriptions` で自己修復する（self-healing）。
+   `RELAY_SSE_RECONNECT_MAX_ATTEMPTS=0` は無限（§6）として扱う。
+
+8. **`title` の 200 文字上限は文字数（`len()`）で判定**。§2.2 / wire §5.4 の「200 UTF-8 chars」
+   を byte 数ではなく文字数と解釈した（曖昧さあり）。超過時は truncate せず `ValueError`
+   （SDK は truncate しない、§2.2）。
+
+9. **`pyproject.toml` は変更していない**。SDK が使う `httpx`（dev 依存）と `pyjwt[crypto]`
+   （`mcp` の推移的依存として uv.lock に pin 済み）はいずれも既存の依存解決で利用可能なため、
+   依存追加は不要と判断した（並行して `relay/` を触る別担当との衝突回避も兼ねる）。`joserfc`
+   / `rfc8785` も relay 本体が既に依存として持つ（AgentCard 検証の相互運用で流用）。
+
+### 未実装 / 後続タスクへの申し送り
+
+1. **AsyncClient / asyncio 版 API は未実装**（§8 で v1 スコープ外と明記。同期版のみ）。
+2. **`tests/contract/`（§7.3 の独立 contract test）は未作成**。wire フォーマットの整合は
+   integration test（実 relay に対する往復）で間接的に検証している。ワイヤ API ドキュメント
+   更新時に SDK 側追随漏れを機械検知する専用スイートは後続で追加すべきである。
+3. **§7.2 の integration 観点のうち未自動化のもの**:
+   - subscriber プロセス再起動 → 新規 subscribe → 古い outbox の 7 日後 GC（time-shift
+     fixture）: dispatcher 側の DLQ 7 日 GC は `_gc_dlq` の単体テストで検証済みだが、
+     daemon loop を time-shift で 7 日進める統合検証は未実施。
+   - `429` の `Retry-After` 尊重: dispatcher cycle の単体テスト（`test_429_respects_retry_after`）
+     で検証済み。実 relay の rate limit（既定 100 req/sec）を実際に超過させる統合検証は、
+     テスト時間とのバランスから見送った。
+   - JWS 署名・検証（鍵不一致で接続拒否）: `sign_jws` / `verify_relay_agent_card` の単体
+     テストで検証済み。ただし**現行 relay は JWS Bearer を consume しない**（静的 Bearer 照合、
+     判断5）ため、「鍵不一致で実 relay が接続拒否する」統合検証は現行 relay では意味を持た
+     ない。relay 側が JWS 検証を実装した段階で追加すべきである。
+   - SSE 30 秒 keepalive で長期接続が落ちないこと: keepalive comment frame の parse と
+     それを契機とした lease renew は実装済み（`sse.py` / `Subscription._maybe_renew_lease`）
+     だが、30 秒級の長時間統合テストはスイート実行時間を圧迫するため自動化していない。
+4. **lease renew の発火は keepalive comment frame を契機にする**。relay は 30 秒ごとに
+   `: keepalive` を送る（wire §5.5）ため、`lease_ttl` が数百秒なら十分な分解能で
+   「残り <= lease_ttl/3」を検出できる。ただし keepalive より短い `lease_ttl`（< ~90 秒）を
+   使う場合、renew 判定が keepalive 間隔（30 秒）に律速される点は運用上の制約として残る。
