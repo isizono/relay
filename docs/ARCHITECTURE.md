@@ -13,22 +13,27 @@ relay/
 ├── config.py         # 実行時設定（環境変数 → Settings dataclass）
 ├── db.py             # SQLite 接続 + migration 適用（yoyo-migrations）
 ├── errors.py           # error envelope（{code, message, details}）+ relay 固有 error_code 定数
+├── idempotency.py       # idempotency_key の 15 分 dedup（stream / subscription レーン共通）
 ├── identity.py        # AgentCard 構築 / Bearer token authN / JCS(MUST) / JWS(MAY)
 ├── streams.py         # stream (場) API + membership + structural authZ（実装済み）
-├── subscriptions.py   # subscription API（後続タスク実装）
-├── delivery.py         # outbox polling dispatcher / SSE（後続タスク実装）
-├── observability.py    # /status /metrics /サーバーログ（後続タスク実装）
-└── app.py              # Starlette アプリ組み立て（各モジュールの routes を集約）
+├── subscriptions.py   # subscription API（実装済み: subscribe / lease / unsubscribe / ack / publish）
+├── delivery.py         # outbox polling dispatcher / SSE / retry / DLQ（実装済み）
+├── observability.py    # 構造化ログ + サーバーログ sink（実装済み）。/status /metrics は未実装
+└── app.py              # Starlette アプリ組み立て（各モジュールの routes を集約 + dispatcher 起動）
 
 migrations/
-└── 0001-initial-schema.sql   # yoyo-migrations 形式。以後の schema 変更は追加 migration で行う
+├── 0001-initial-schema.sql        # yoyo-migrations 形式。以後の schema 変更は追加 migration で行う
+└── 0002-outbox-expires-at.sql     # outbox.expires_at 列追加（DLQ sweep の retain 判定用）
 
 tests/
 ├── test_db.py
 ├── test_identity.py
 ├── test_app.py
 ├── test_config.py
-└── test_streams.py
+├── test_streams.py
+├── test_subscriptions.py
+├── test_delivery.py
+└── test_observability.py
 ```
 
 各機能モジュール（`streams.py` / `subscriptions.py` / `delivery.py` /
@@ -166,16 +171,18 @@ detached 形式）という妥当と考えられる形式を暫定採用した�
 
 ## 未実装 / 後続タスクへの申し送り
 
-- `subscriptions.py` / `delivery.py` / `observability.py` は
-  `routes: list[Route] = []` のみの空モジュール。各担当が endpoint を実装する。
-  `streams.py` は本タスク（stream CRUD + membership + structural authZ）で実装済み
-  （詳細は次節）。
+- `subscriptions.py`（subscribe / lease renew / unsubscribe / ack / publish）、
+  `delivery.py`（outbox dispatcher / SSE / retry / DLQ）、`observability.py` の
+  構造化ログ + サーバーログ sink は Delivery タスクで実装済み（詳細は後続の節を参照）。
+  `streams.py` は Resources タスク（stream CRUD + membership + structural authZ）で
+  実装済み。
 - `agent_cards` テーブル（外部 agent の AgentCard キャッシュ）の読み書きロジックは
   未実装。schema のみ用意した。
-- `server_log`（`Settings.server_log_path`、既定 `relay-server.jsonl`）の
-  append-only 書き込みロジックは未実装（`observability.py` 担当）。
-- polling dispatcher（outbox polling → SSE push → retry → DLQ 化）は未実装
-  （`delivery.py` 担当）。
+- `GET /status` / `GET /metrics`（observability.md §7.1, §7.2）は未実装
+  （後続タスクの担当分）。`observability.py` は構造化ログ + サーバーログ sink のみ
+  実装済み。
+- `PUT /streams/{stream_id}/members` で write member が 0 人になる操作へのガードは無い
+  （Resources タスクからの申し送り、未解消のまま）。
 
 ## `streams.py` 実装（stream CRUD + membership + structural authZ）
 
@@ -223,15 +230,15 @@ read 権限を持つ member でない」を同一の `404 Not Found` と明記�
    定義されていない。一覧 endpoint を新設するかどうかは仕様上未確定のため、本タスクでは
    `GET /streams/{stream_id}` のみを実装し、一覧 endpoint は実装していない。必要であれば
    別途仕様を確定してから追加すべきである。
-2. **`idempotency_key` の 15 分 dedup は未実装**（wire-api.md §6.3）。dedup 用の永続
-   store が `migrations/0001-initial-schema.sql` に存在しないため見送った。stream レーン /
-   subscription レーン共通の関心事なので、`subscriptions.py` 側の `POST /publish` 実装と
-   あわせて共通化を検討すべきである。
-3. **`ttl`（メッセージ単位の retain 上書き）・`default_ttl`（stream 単位の retain
-   default）は値バリデーション（min 60 / max 86400、wire-api.md §6.4）のみ行い、実際の
-   retain / DLQ 判定には未反映**。outbox table に enqueue 時点の期限を持たせる列が無い
-   ため、DLQ sweep ロジックを実装する `delivery.py` 側でスキーマ拡張が必要になる
-   可能性がある。
+2. **（解消済み、Delivery タスクで対応）** `idempotency_key` の 15 分 dedup
+   （wire-api.md §6.3）は `relay/idempotency.py` の共通ヘルパーで実装した。
+   stream レーン（本モジュール）と subscription レーンの `POST /publish` の両方が
+   `app.state.idempotency_store` を共有する。詳細は後続の Delivery 実装セクションを
+   参照。
+3. **（解消済み、Delivery タスクで対応）** `ttl` / `default_ttl` は
+   `migrations/0002-outbox-expires-at.sql` で追加した `outbox.expires_at` 列に
+   enqueue 時点で計算した期限を書き込み、`relay/delivery.py` の DLQ sweep
+   （`_sweep_retain_exceeded`）がこれを見て retain 超過を検出するようになった。
 4. **error_code の一部は cc-memory 側の既存 decision（`error_code = A2A 8 種 + relay
    固有最小集合`）の列挙にない**。`StreamAlreadyExistsError`（`POST /streams` の
    stream_id 重複、409）と `InvalidRequestError`（汎用 400 バリデーション）を追加した。
@@ -243,3 +250,197 @@ read 権限を持つ member でない」を同一の `404 Not Found` と明記�
 5. **同一 stream の write member が 0 人になる操作（自分自身の write 権限を削除する
    membership 変更等）へのガードは無い**。wire-api.md / identity-authz.md にこの
    edge case の規定がないため、意図的に制約を追加していない。
+
+## `relay/delivery.py` + `relay/subscriptions.py` 実装（outbox dispatcher / SSE / retry / DLQ / cumulative ack / server log）
+
+`GET /events`（SSE 多重化購読）、outbox polling dispatcher、push retry、DLQ sweep、
+`POST /subscriptions/{id}/ack`、および subscription レーンの残り endpoint
+（`POST /subscriptions` / `PUT /subscriptions/{id}/lease` / `DELETE /subscriptions/{id}` /
+`POST /publish`）を実装した。
+
+### スコープ判断: subscription レーンの CRUD も含めて実装した
+
+Foundation が書いた `subscriptions.py` の元 docstring は「subscribe / lease renew /
+unsubscribe / ack / publish はすべて後続タスクの担当分」としていたが、本タスクの依頼文が
+明示的に要求する項目（`POST /subscriptions/{id}/ack`、`GET /events` の ownership /
+lease 検証、dispatcher の DLQ permanent error 判定）はいずれも `SubscriptionRegistry`
+（subscriber identity・lease・labels を保持する in-memory registry）の存在を前提とする。
+この registry を作らずに ack や `GET /events` だけを実装することはできない。加えて
+`POST /subscriptions`（subscribe）が無いと registry に何も登録できず、統合テストで
+実際の HTTP 経路を検証できない。そのため本タスクでは `subscriptions.py` を
+`StreamRegistry`（Resources 実装）と対称な設計で全面的に実装した
+（`SubscriptionRegistry` + 5 endpoint 全部）。`POST /publish` の subset マッチング fan-out
+も同様の理由で実装している。
+
+### `SubscriptionRegistry`
+
+`relay/subscriptions.py` の `SubscriptionRegistry` は `dict[str, SubscriptionRecord]` +
+`threading.Lock` で保持する（`StreamRegistry` と同じパターン）。`app.state.subscription_registry`
+に app インスタンスごとに遅延生成され、`relay/delivery.py`（`GET /events` の ownership 検証、
+dispatcher の DLQ permanent error 判定）からも `get_registry_from_state(app_state)` で
+同じインスタンスを参照する。`is_lease_expired()` は「不存在」を `False` として返す
+（「不存在」と「lease 切れ」の区別は呼び出し側が `is_owner()` / `get()` と組み合わせて
+行う設計。wire-api.md §5.7 の 404 / 410 使い分けに対応）。
+
+### outbox schema 拡張: `outbox.expires_at`（`migrations/0002-outbox-expires-at.sql`）
+
+Resources 実装時点の outbox schema（`migrations/0001-initial-schema.sql`）には、
+enqueue 時点で retain 期限を保持する列が無かった。DLQ sweep が retain 超過
+（wire-api.md §6.6）を判定するにはこの情報が必須なため、`outbox.expires_at`（TEXT、
+ISO8601）を追加した。stream レーン（`streams.py` の `post_stream_message`）・
+subscription レーン（`subscriptions.py` の `publish`）双方の INSERT 時に
+`enqueued_at + retain_seconds` を計算して書き込む。`dlq` table 側には追加していない
+（dead 化した時点で「なぜ dead になったか」は `error_code` に記録され、`expires_at` の
+情報は不要になるため）。
+
+### push retry: relay 自身の SSE push とは別に、SDK 側 dispatcher の Full Jitter backoff が存在する点に注意
+
+cc-memory の decision 記録には retry backoff に関する 2 系統の決定が存在し、混同しやすい。
+
+- **relay 自身の push retry**（本実装の対象）: `GET /events` で push した SSE イベントが
+  接続先の `asyncio.Queue`（`Connection.queue`、slow consumer 検出用のバッファ）に
+  入らない場合、初回 100ms・係数 2・最大 5 回・累積約 3.1 秒の指数バックオフで retry する
+  （wire-api.md §6.4、`relay-glossary.md`「polling dispatcher」）。Full Jitter ではない
+  単純な指数バックオフ。5 回すべて失敗したら接続を強制切断する（wire-api.md §6.4 / SSE
+  slow consumer 強制切断の決定）。`relay/delivery.py` の `PUSH_RETRY_DELAYS_SECONDS` /
+  `_push_with_retry` がこれに対応する。
+- **SDK 側（cc-memory 等）のローカル outbox → relay への POST dispatcher backoff**
+  （本実装のスコープ外）: Full Jitter、base=1 秒、cap=300 秒。これは cc-memory 側の
+  ローカル outbox から relay へ `POST /publish` する際の retry であり、relay 本体
+  （このリポジトリ）には実装しない。`relay-v2-sdk.md` 側の実装対象。
+
+「dispatcher」という語が両方の文脈で使われるため、本実装のコード内コメントでは
+「push retry」（relay 内、本実装）と表記し、SDK 側の同名の仕組みとは明示的に区別した。
+
+### SSE keepalive の実装: sse-starlette 組み込み `ping` は使わず自前生成
+
+`sse_starlette.sse.EventSourceResponse` の `ping` パラメータは「0 で無効化」と docstring に
+書かれているが、実際の実装は `while self.active: await anyio.sleep(self._ping_interval)` の
+ループを `ping_interval=0` のまま無条件で起動するため、`anyio.sleep(0)` によるビジーループ
+になる（sse-starlette 側の既知の挙動、`ping=0` 起因で CPU 100% 近くまで張り付く事象を
+実装中に実機で確認した）。本実装では `ping` に実用上到達しない大きな値
+（`_DISABLE_BUILTIN_PING_INTERVAL_SECONDS = 10_000_000`）を渡して組み込み ping を事実上
+無効化し、代わりに `event_stream()` ジェネレータ自身が
+`asyncio.wait_for(queue.get(), timeout=settings.sse_keepalive_seconds)` のタイムアウトで
+`: keepalive` コメント行（30 秒間隔、wire-api.md §5.5）を生成する。`send_timeout` は
+transport 層の write 詰まり（TCP レベルの zombie 接続）を検出する保険として残している。
+
+### slow consumer 検出の実装: `asyncio.Queue` の backpressure をシグナルとして使う
+
+relay と subscriber の間の実際の TCP write 詰まりを ASGI 層で直接検出するのは
+（sse-starlette / Starlette の抽象化越しでは）現実的ではないため、本実装は
+「dispatcher → SSE 送信 generator」間に有界 `asyncio.Queue`
+（`CONNECTION_QUEUE_MAXSIZE = 256`）を挟み、dispatcher がここへの `put_nowait()` に
+失敗する（= generator 側が十分な速さで消費できていない）ことを slow consumer の
+シグナルとして扱う。retry を使い切ってもキューに空きが出ない場合、接続を強制切断する
+（`_force_disconnect`）。`send_timeout`（既定 5 秒）は、真に TCP write がハングする
+ケースへの保険として併用している。
+
+### `GET /events` の実装: HTTP 層とジェネレータ / 検証ロジックを分離
+
+`get_events`（HTTP handler）は薄く保ち、以下を独立した関数に切り出した。
+
+- `validate_subscription_ids(sub_registry, identity_id, subscription_ids)`:
+  ownership（404）→ lease 状態（410）の検証順序（wire-api.md §5.7）。
+- `event_stream(conn, manager, settings, app_state)`: `conn.queue` を読んで SSE event に
+  変換する非同期ジェネレータ。
+
+この分離は主にテスト容易性のためである。**実機で確認した事実として、この環境の
+Starlette `TestClient`（httpx ラップ）も `httpx.ASGITransport` も、内部で
+`await app(scope, receive, send)` の完了を待ってからレスポンスを返す実装になっており、
+終端しない SSE stream を「ストリーミングで読む」ことができず、そのままではテストが
+無限に hang する**（`TestClient.stream()` を使っても同様。両者のソースを直接確認して
+特定した）。そのため:
+
+- ロジックの大半（ownership/lease 検証、keepalive のタイムアウト生成、force-disconnect
+  センチネルでの停止）は `validate_subscription_ids` / `event_stream` を直接呼ぶ形の単体
+  テストで検証する（`tests/test_delivery.py`）。
+- dispatcher が実際に `Connection.queue` へ push しカーソルを進める挙動は
+  `dispatch_once(app)` を `asyncio.run()` でラップした非同期テストから直接呼び出して検証する
+  （`asyncio.Queue` / `asyncio.Event` はループに紐づくため、同一イベントループ内で完結
+  させる必要がある。pytest-asyncio は導入せず、各テストを同期関数から `asyncio.run(...)`
+  する方式にした）。
+- `GET /events` の実際の wire（SSE ヘッダ・event framing・実際のプッシュ〜受信）だけは、
+  uvicorn を実 TCP port で起動した上で `httpx.Client`（非 ASGI transport、実ソケット）
+  から読む統合テストで検証する（`tests/test_delivery.py` の `LiveServer` fixture）。
+
+### dispatcher 単一プロセス enforcement（file lock）
+
+`relay/app.py` の lifespan で `delivery.try_acquire_dispatcher_lock(settings.dispatcher_lock_path)`
+を呼び、non-blocking `fcntl.flock` で排他制御する（wire-api.md §6.2）。lock を取得できた
+プロセスだけが `run_dispatcher_loop` を起動する。取得できなければ（他プロセスが既に
+dispatcher を担っている）そのプロセスは HTTP handler だけ動かし、dispatcher は起動しない。
+テストでは `Settings.dispatcher_lock_path` を `tmp_path` 配下に向けることで、テスト間の
+lock 競合を避けている（デフォルト値のまま複数 app を並行起動すると同一 lock file を取り合う
+点に注意。既存モジュールの `db_path` と同じ注意が必要）。
+
+### DLQ sweep の実装
+
+`_sweep_retain_exceeded`（`outbox.expires_at` 経過）と `_sweep_permanent_errors`
+（subscription lane で `subscription_id` が registry に存在しない、または lease 切れ）の
+2 経路で `outbox` → `dlq` へ行を移す（`_move_to_dlq`、INSERT + DELETE を同一 transaction
+内で実行）。dead 化のたびに `observability.record_event(..., "outbox_dead", ...)` で
+構造化ログを 1 件出す（`publish_id` で trace 可能、wire-api.md §7.3 の要求）。
+`_sweep_dlq_physical_delete` が `dead_at` から `Settings.dlq_retention_days`（既定 7 日）
+経過した行を物理 DELETE する。stream レーンの permanent error（member 削除等）は
+明示的には検出していない（wire-api.md / identity-authz.md にこの edge case の規定が
+無いため、意図的に対象外とした。stream は close されても消滅しないため「target の消滅」
+に相当する事象が subscription レーンほど明確でない）。
+
+### idempotency dedup（`relay/idempotency.py`）
+
+stream レーン・subscription レーン共通の in-memory dedup store
+（`app.state.idempotency_store`）。`idempotency_key` 指定時は
+`(lane, publisher_identity, idempotency_key)` で 15 分 window の dedup、省略時は
+wire-api.md §6.3 の擬似キー補完式（`publisher_identity` / scope（stream_id か ref の
+正規化 JSON）/ labels 正規化 / body・title の hash / 受信秒精度 ts）で擬似キーを計算する。
+
+### rate limiting（`POST /publish`、`RateLimiter`）
+
+`subscriptions.py` に token bucket 方式の `RateLimiter`（`app.state.publish_rate_limiter`、
+publisher identity ごと）を実装し、`POST /publish` に適用した（wire-api.md §5.4、既定
+100 req/sec、超過時 `429` + `Retry-After` ヘッダ）。`POST /streams/{id}/messages`
+（場投函）への適用は wire-api.md §10 が「残置（実装段階で詰める）」と明記しているため、
+本タスクでは見送った（Resources 実装のまま）。
+
+### structured log / server log（`relay/observability.py`）
+
+Foundation の元 docstring は「構造化ログ」（`publish_id` で trace する短期ログ）と
+「サーバーログ」（payload 込み・TTL 90 日の長期デバッグ sink）を 2 つの独立した sink として
+想定していたが、本実装ではこれを単一の JSON Lines append-only sink
+（`Settings.server_log_path`、既定 `relay-server.jsonl`）に統合した（`event` フィールドで
+種別を判別できるため、実用上 2 sink に分離する必然性が薄いと判断した）。
+`record_event(app_state, event_type, **fields)` を publish 受領（stream / subscription
+両レーン）・ack 受領（両レーン）・subscribe・unsubscribe・SSE 接続 / 切断・DLQ 移動・
+dispatcher 内部エラーで呼んでいる。**購読者向け読み取り endpoint は一切持たない**
+（wire-api.md §7.3 が明示的に禁止する「`since=N` 型 pull の裏口化」を避けるため）。
+TTL（既定 90 日）を過ぎた行は `purge_expired_server_log` で間引く。書き込みのたびに
+毎回スキャンすると I/O コストが無視できなくなるため、`_maybe_gc` で最短実行間隔
+（既定 1 時間に 1 回）を設けている。
+
+### 既知のギャップ / 後続タスクへの申し送り
+
+1. **ack 未着タイムアウト（60 秒で SSE 接続を強制 close）は未実装**。cc-memory 側の
+   関連 decision には存在するが、本タスクの依頼文が明示する 9 項目には含まれておらず、
+   実装コストとのバランスから見送った。「push はできているが subscriber 側の受信ループが
+   スタックしている」ケースの検知に相当し、slow consumer 強制切断（本実装済み、queue
+   backpressure ベース）とは異なる障害モードをカバーする。
+2. **stream レーンの permanent error 検出（DLQ sweep）は未実装**。上記 DLQ sweep の節
+   参照。
+3. **TCP keepalive（`TCP_KEEPIDLE` / `TCP_KEEPINTVL` / `TCP_KEEPCNT`）は未設定**。
+   cc-memory 側の関連 decision は具体値（60 秒 / 10 秒 / 3 回）を確定しているが、これは
+   ASGI アプリケーションコードの層ではなく uvicorn の起動オプション
+   （`--limit-max-requests` 等とは別の socket オプション）で設定するものであり、
+   本実装（`relay/` パッケージ内のコード）のスコープ外と判断した。本番運用時の uvicorn
+   起動コマンド側で設定する必要がある。
+4. **`GET /status` / `GET /metrics` は未実装**（後続タスクの担当分、observability.md
+   §7.1, §7.2）。`relay/observability.py` は構造化ログ + サーバーログ sink のみ実装した。
+5. **1 SSE 接続で複数 target を多重化する際の ack バッチ境界・部分 ack の最適化は
+   未着手**。現状の実装は正しく動作する（各 target は個別の delivery target として
+   cumulative ack される）が、性能最適化（大量 target 保持時の dispatcher 1 cycle の
+   処理時間）は検証していない。
+6. **subscription レーンの `POST /publish` に対する subset マッチング性能
+   （wire-api.md §10「10,000 subscriptions × 100 labels で p99 200ms」）は未検証**。
+   現状の実装は `SubscriptionRegistry.matching()` で全 subscription を線形走査する素朴な
+   実装であり、性能 SLO 検証・最適化（inverted index 等）は T7（observability /
+   性能）相当のタスクに委ねる。

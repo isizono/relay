@@ -2,10 +2,13 @@
 
 各モジュール（streams / subscriptions / delivery / observability）が公開する
 `routes: list[Route]` をここでまとめて登録する。個別 endpoint の実装は各モジュール側の
-責務で、本ファイルは配線とアプリ起動ライフサイクル（DB migration 適用）のみを持つ。
+責務で、本ファイルは配線とアプリ起動ライフサイクル（DB migration 適用 + dispatcher の
+起動/停止）のみを持つ。
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -45,7 +48,24 @@ def create_app(settings: Settings | None = None) -> Starlette:
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         db.init_db(resolved_settings.db_path)
-        yield
+
+        # dispatcher はプロセス内シングルトン（file lock で enforce、
+        # relay-v2-wire-api.md §6.2）。lock を取れなかった場合はこのプロセスでは
+        # dispatcher を起動しない（他プロセスが既に担っている）。
+        lock_fd = delivery.try_acquire_dispatcher_lock(resolved_settings.dispatcher_lock_path)
+        dispatcher_task: asyncio.Task | None = None
+        if lock_fd is not None:
+            dispatcher_task = asyncio.create_task(delivery.run_dispatcher_loop(app))
+
+        try:
+            yield
+        finally:
+            if dispatcher_task is not None:
+                dispatcher_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await dispatcher_task
+            if lock_fd is not None:
+                delivery.release_dispatcher_lock(lock_fd)
 
     routes: list[Route] = [
         Route("/", health, methods=["GET"]),

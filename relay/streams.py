@@ -20,31 +20,27 @@ identity-authz.md §2.2）もここで行う。
 `relay.db` 経由で直接 SQLite に書く（transactional outbox）。publish_id の採番は
 `publish_log` への INSERT 1 件で行う。
 
-未実装（後続タスクへの申し送り、モジュール docstring 末尾を参照）:
-- `idempotency_key` による 15 分 dedup（wire-api.md §6.3）: dedup 用の永続 store が
-  migration に存在しないため見送った。stream レーン / subscription レーン共通の関心
-  事なので、subscriptions.py 側の `POST /publish` 実装とあわせて共通化を検討すべき。
-- `ttl`（メッセージ単位の retain 上書き）・`default_ttl`（stream 単位の retain default）の
-  実際の retain / DLQ 判定への反映: outbox table に enqueue 時点の期限を持たせる列が無い
-  （`migrations/0001-initial-schema.sql` 参照）。DLQ sweep ロジックを実装する delivery.py
-  側でスキーマ拡張が必要になる可能性がある。本モジュールは `default_ttl` / `ttl` の
-  値バリデーション（min 60 / max 86400、wire-api.md §6.4）のみ行い、`StreamRecord` に
-  保持する。
+`idempotency_key` の 15 分 dedup（wire-api.md §6.3）は `relay.idempotency` の共通
+ヘルパーを使う（subscription レーンの `POST /publish` と同じ dedup store を app 単位で
+共有する）。`ttl`（メッセージ単位の retain 上書き）・`default_ttl`（stream 単位の retain
+default）は `migrations/0002-outbox-expires-at.sql` で追加した `outbox.expires_at` 列に
+enqueue 時点で計算した期限を書き込み、DLQ sweep（`relay.delivery`）がこれを見て retain
+超過を検出する。
 """
 from __future__ import annotations
 
 import sqlite3
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from relay import db
-from relay.config import MAX_RETAIN_SECONDS, MIN_RETAIN_SECONDS, Settings
+from relay import db, idempotency, observability
+from relay.config import DEFAULT_RETAIN_SECONDS, MAX_RETAIN_SECONDS, MIN_RETAIN_SECONDS, Settings
 from relay.errors import (
     INVALID_REQUEST,
     MEMBERSHIP_REQUIRED,
@@ -160,18 +156,42 @@ class StreamRegistry:
                 return []
             return [i for i, a in record.members.items() if a in ("read", "read_write")]
 
+    def read_streams_for_identity(self, identity: str) -> list[str]:
+        """`identity` が read 権限を持つ stream_id の一覧を返す。
 
-def _get_registry(request: Request) -> StreamRegistry:
+        `relay.delivery` の dispatcher が「接続した identity が read 権限を持つ member
+        である stream のメッセージも同じ SSE 接続に流す」（wire-api.md §5.5）を実装する
+        際に使う。
+        """
+        with self._lock:
+            return [
+                stream_id
+                for stream_id, record in self._streams.items()
+                if record.members.get(identity) in ("read", "read_write")
+            ]
+
+
+def get_registry_from_state(app_state) -> StreamRegistry:
     """`request.app.state.stream_registry` を遅延初期化して返す。
 
     app インスタンス（テストでは `create_app(settings)` 呼び出しごと）にスコープされ、
-    テスト間の状態リークを防ぐ。
+    テスト間の状態リークを防ぐ。`request` を持たない呼び出し元（dispatcher 等）からも
+    `app.state` を直接渡して呼べる。
     """
-    registry = getattr(request.app.state, "stream_registry", None)
+    registry = getattr(app_state, "stream_registry", None)
     if registry is None:
         registry = StreamRegistry()
-        request.app.state.stream_registry = registry
+        app_state.stream_registry = registry
     return registry
+
+
+def get_registry(request: Request) -> StreamRegistry:
+    """`request` 経由で呼ぶ場合の `get_registry_from_state` の薄いラッパー。"""
+    return get_registry_from_state(request.app.state)
+
+
+def _get_registry(request: Request) -> StreamRegistry:
+    return get_registry_from_state(request.app.state)
 
 
 def _get_connection(request: Request) -> sqlite3.Connection:
@@ -321,7 +341,25 @@ async def post_stream_message(request: Request) -> Response:
     idempotency_key = body.get("idempotency_key")
     if idempotency_key is not None and not isinstance(idempotency_key, str):
         return error_response(400, INVALID_REQUEST, "idempotency_key は文字列で指定してください")
-    # idempotency_key の 15 分 dedup は未実装（モジュール docstring 参照）。
+
+    dedup_key = idempotency.build_key(
+        lane="stream",
+        publisher_identity=identity.id,
+        explicit_key=idempotency_key,
+        scope=stream_id,
+        body=message_body,
+    )
+    store = idempotency.get_store(request.app.state)
+    existing_publish_id = store.check(dedup_key)
+    if existing_publish_id is not None:
+        return JSONResponse(
+            {"publish_id": existing_publish_id, "matched_members": 0}, status_code=202
+        )
+
+    retain_seconds = _ttl if _ttl is not None else (record.default_ttl or DEFAULT_RETAIN_SECONDS)
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=retain_seconds)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
 
     read_members = registry.read_members(stream_id)
     payload = message_body.encode("utf-8")
@@ -338,14 +376,25 @@ async def post_stream_message(request: Request) -> Response:
         for member_identity in read_members:
             conn.execute(
                 "INSERT INTO outbox"
-                " (target_type, stream_id, member_identity, publish_id, payload, enqueued_at)"
-                " VALUES ('stream', ?, ?, ?, ?, ?)",
-                (stream_id, member_identity, publish_id, payload, now),
+                " (target_type, stream_id, member_identity, publish_id, payload, enqueued_at,"
+                " expires_at)"
+                " VALUES ('stream', ?, ?, ?, ?, ?, ?)",
+                (stream_id, member_identity, publish_id, payload, now, expires_at),
             )
         conn.commit()
     finally:
         conn.close()
+    store.register(dedup_key, publish_id)
 
+    observability.record_event(
+        request.app.state,
+        "publish_received",
+        lane="stream",
+        publish_id=publish_id,
+        publisher_identity=identity.id,
+        stream_id=stream_id,
+        matched_members=len(read_members),
+    )
     return JSONResponse(
         {"publish_id": publish_id, "matched_members": len(read_members)}, status_code=202
     )
@@ -460,6 +509,14 @@ async def ack_stream(request: Request) -> Response:
     finally:
         conn.close()
 
+    observability.record_event(
+        request.app.state,
+        "ack_received",
+        lane="stream",
+        stream_id=stream_id,
+        member_identity=identity.id,
+        up_to_publish_id=up_to_publish_id,
+    )
     return JSONResponse({}, status_code=200)
 
 

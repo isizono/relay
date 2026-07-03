@@ -16,6 +16,9 @@ __pycache__/
 # relay サーバーログ（append-only sink、disk 上は SQLite と物理分離）
 *.jsonl
 
+# relay dispatcher の単一プロセス enforcement 用 file lock
+*.lock
+
 # pytest
 .pytest_cache/
 

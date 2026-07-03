@@ -1,0 +1,727 @@
+"""relay.delivery テストスイート。
+
+- `ConnectionManager` / `Connection` の単体テスト
+- `validate_subscription_ids`（ownership → lease 検証順序）の単体テスト
+- dispatcher（`dispatch_once`）の push / retry / DLQ sweep を asyncio 直接呼び出しで検証
+  （`asyncio.Queue` / `asyncio.Event` はループに紐づくため、`asyncio.run()` でラップした
+  非同期テスト関数内で完結させる。pytest-asyncio は使わず、各テストを同期関数から
+  `asyncio.run(...)` する）
+- `GET /events` の実際の SSE wire を検証する統合テストは、実ソケット越しの HTTP が必要
+  （Starlette TestClient / httpx.ASGITransport はいずれも ASGI app 呼び出し全体の完了を
+  待ってから応答を返すため、終端しない SSE stream を『ストリーミングで読む』ことが
+  できない。詳細は `LiveServer` fixture の docstring）。そのため uvicorn を実ポートで
+  起動する `live_server` fixture を使う。
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import socket
+import sqlite3
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+
+import httpx
+import pytest
+import uvicorn
+from starlette.testclient import TestClient
+
+from relay import db, delivery, subscriptions
+from relay.app import create_app
+from relay.config import Settings
+from relay.streams import StreamRegistry
+from relay.subscriptions import SubscriptionRegistry
+
+
+def _auth(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture()
+def settings(tmp_path):
+    return Settings(
+        db_path=str(tmp_path / "test_relay.db"),
+        server_log_path=str(tmp_path / "test_relay.jsonl"),
+        dispatcher_lock_path=str(tmp_path / "test_relay.lock"),
+        auth_tokens={"tok-a": "agent-a", "tok-b": "agent-b", "tok-c": "agent-c"},
+        dispatcher_poll_interval_seconds=0.02,
+    )
+
+
+# ---------------------------------------------------------------------------
+# ConnectionManager 単体テスト
+# ---------------------------------------------------------------------------
+
+
+class TestConnectionManager:
+    def _connection(self, identity="agent-a", subscription_ids=frozenset()):
+        return delivery.Connection(
+            identity=identity, subscription_ids=subscription_ids, queue=asyncio.Queue()
+        )
+
+    def test_register_and_snapshot(self):
+        manager = delivery.ConnectionManager()
+        conn = self._connection()
+        manager.register(conn)
+        snapshot = manager.snapshot()
+        assert snapshot == {"agent-a": [conn]}
+
+    def test_unregister_removes_connection(self):
+        manager = delivery.ConnectionManager()
+        conn = self._connection()
+        manager.register(conn)
+        manager.unregister(conn)
+        assert manager.snapshot() == {}
+
+    def test_multiple_connections_same_identity(self):
+        manager = delivery.ConnectionManager()
+        conn1 = self._connection()
+        conn2 = self._connection()
+        manager.register(conn1)
+        manager.register(conn2)
+        assert len(manager.snapshot()["agent-a"]) == 2
+
+    def test_unregister_unknown_connection_is_noop(self):
+        manager = delivery.ConnectionManager()
+        conn = self._connection()
+        manager.unregister(conn)  # 例外を出さない
+
+
+# ---------------------------------------------------------------------------
+# validate_subscription_ids（ownership → lease 検証順序）
+# ---------------------------------------------------------------------------
+
+
+class TestValidateSubscriptionIds:
+    def test_no_ids_is_valid(self):
+        registry = SubscriptionRegistry()
+        assert delivery.validate_subscription_ids(registry, "agent-a", []) is None
+
+    def test_owned_and_alive_is_valid(self):
+        registry = SubscriptionRegistry()
+        record = registry.create("agent-a", frozenset({"x"}), 300, 86400)
+        err = delivery.validate_subscription_ids(registry, "agent-a", [record.subscription_id])
+        assert err is None
+
+    def test_unknown_id_returns_404(self):
+        registry = SubscriptionRegistry()
+        err = delivery.validate_subscription_ids(registry, "agent-a", ["nope"])
+        assert err.status_code == 404
+
+    def test_non_owned_id_returns_404(self):
+        registry = SubscriptionRegistry()
+        record = registry.create("agent-a", frozenset({"x"}), 300, 86400)
+        err = delivery.validate_subscription_ids(registry, "agent-b", [record.subscription_id])
+        assert err.status_code == 404
+
+    def test_lease_expired_owned_returns_410(self):
+        registry = SubscriptionRegistry()
+        record = registry.create("agent-a", frozenset({"x"}), 300, 86400)
+        record.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        err = delivery.validate_subscription_ids(registry, "agent-a", [record.subscription_id])
+        assert err.status_code == 410
+
+    def test_ownership_checked_before_lease_across_multiple_ids(self):
+        """複数 id のうち 1 つでも非所有なら、他が lease 切れでも 404 が優先される。"""
+        registry = SubscriptionRegistry()
+        owned = registry.create("agent-a", frozenset({"x"}), 300, 86400)
+        owned.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        other = registry.create("agent-b", frozenset({"y"}), 300, 86400)
+        err = delivery.validate_subscription_ids(
+            registry, "agent-a", [owned.subscription_id, other.subscription_id]
+        )
+        assert err.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# event_stream ジェネレータ単体テスト（実ソケット不要）
+# ---------------------------------------------------------------------------
+
+
+class TestEventStream:
+    def test_yields_pushed_item_then_stops_on_sentinel(self):
+        asyncio.run(self._run())
+
+    async def _run(self):
+        manager = delivery.ConnectionManager()
+        conn = delivery.Connection(
+            identity="agent-a", subscription_ids=frozenset(), queue=asyncio.Queue()
+        )
+        manager.register(conn)
+        settings = Settings(sse_keepalive_seconds=30)
+
+        await conn.queue.put({"publish_id": 5, "data": {"foo": "bar"}})
+        await conn.queue.put(None)  # 強制切断センチネル
+
+        events = []
+        async for event in delivery.event_stream(conn, manager, settings, object()):
+            events.append(event)
+
+        assert len(events) == 1
+        assert events[0].id == "5"
+        assert events[0].event == "notification"
+        assert json.loads(events[0].data) == {"foo": "bar"}
+        # finally 節で unregister されている
+        assert manager.snapshot() == {}
+
+    def test_keepalive_comment_on_timeout(self):
+        asyncio.run(self._run_keepalive())
+
+    async def _run_keepalive(self):
+        manager = delivery.ConnectionManager()
+        conn = delivery.Connection(
+            identity="agent-a", subscription_ids=frozenset(), queue=asyncio.Queue()
+        )
+        manager.register(conn)
+        settings = Settings(sse_keepalive_seconds=0.01)
+
+        gen = delivery.event_stream(conn, manager, settings, object())
+        first = await gen.__anext__()
+        assert first.comment == "keepalive"
+        await gen.aclose()
+
+
+# ---------------------------------------------------------------------------
+# dispatcher: push / retry / cursor advance（asyncio.run 直接呼び出し）
+# ---------------------------------------------------------------------------
+
+
+def _insert_subscription_outbox_row(
+    settings: Settings, subscription_id: str, publish_id: int, *, labels=("x",)
+) -> None:
+    conn = db.get_connection(settings.db_path)
+    try:
+        payload = json.dumps({"ref": {"type": "decision", "id": publish_id}, "title": None}).encode()
+        conn.execute(
+            "INSERT INTO publish_log (lane, stream_id, publisher_identity, enqueued_at)"
+            " VALUES ('subscription', NULL, 'agent-a', ?)",
+            (delivery._now_iso(),),
+        )
+        conn.execute(
+            "INSERT INTO outbox"
+            " (target_type, subscription_id, publish_id, payload, labels, enqueued_at, expires_at)"
+            " VALUES ('subscription', ?, ?, ?, ?, ?, ?)",
+            (
+                subscription_id,
+                publish_id,
+                payload,
+                json.dumps(list(labels)),
+                delivery._now_iso(),
+                delivery._now_iso(),  # 呼び出し側で上書きする場合あり
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestDispatchOnce:
+    def test_push_advances_cursor_and_fills_queue(self, settings):
+        asyncio.run(self._run(settings))
+
+    async def _run(self, settings):
+        db.init_db(settings.db_path)
+        app = create_app(settings)
+
+        sub_registry = subscriptions.get_registry_from_state(app.state)
+        record = sub_registry.create("agent-b", frozenset({"x"}), 300, 86400)
+
+        _insert_subscription_outbox_row(settings, record.subscription_id, 1)
+
+        manager = delivery._get_connection_manager(app.state)
+        conn = delivery.Connection(
+            identity="agent-b",
+            subscription_ids=frozenset({record.subscription_id}),
+            queue=asyncio.Queue(),
+        )
+        manager.register(conn)
+
+        await delivery.dispatch_once(app)
+
+        assert not conn.queue.empty()
+        item = conn.queue.get_nowait()
+        assert item["publish_id"] == 1
+        target_key = delivery._subscription_target_key(record.subscription_id)
+        assert conn.cursor[target_key] == 1
+
+        # 2 回目の cycle では同じエントリを再送しない（cursor が進んでいるため）。
+        await delivery.dispatch_once(app)
+        assert conn.queue.empty()
+
+    def test_stream_lane_push_via_membership(self, settings):
+        asyncio.run(self._run_stream(settings))
+
+    async def _run_stream(self, settings):
+        db.init_db(settings.db_path)
+        app = create_app(settings)
+
+        stream_registry = StreamRegistry()
+        app.state.stream_registry = stream_registry
+        stream_registry.create("s1", "agent-a", None)
+        stream_registry.put_member("s1", "agent-b", "read")
+
+        db_conn = db.get_connection(settings.db_path)
+        try:
+            db_conn.execute(
+                "INSERT INTO publish_log (lane, stream_id, publisher_identity, enqueued_at)"
+                " VALUES ('stream', 's1', 'agent-a', ?)",
+                (delivery._now_iso(),),
+            )
+            db_conn.execute(
+                "INSERT INTO outbox"
+                " (target_type, stream_id, member_identity, publish_id, payload, enqueued_at,"
+                " expires_at)"
+                " VALUES ('stream', 's1', 'agent-b', 1, ?, ?, ?)",
+                (b"hello", delivery._now_iso(), delivery._now_iso()),
+            )
+            db_conn.commit()
+        finally:
+            db_conn.close()
+
+        manager = delivery._get_connection_manager(app.state)
+        conn = delivery.Connection(
+            identity="agent-b", subscription_ids=frozenset(), queue=asyncio.Queue()
+        )
+        manager.register(conn)
+
+        await delivery.dispatch_once(app)
+
+        item = conn.queue.get_nowait()
+        assert item["publish_id"] == 1
+        assert item["data"]["body"] == "hello"
+        assert item["data"]["delivery_target"] == "stream:s1"
+
+
+class TestPushRetryAndSlowConsumer:
+    def test_push_succeeds_immediately_when_queue_has_room(self):
+        asyncio.run(self._run_success())
+
+    async def _run_success(self):
+        conn = delivery.Connection(
+            identity="agent-a", subscription_ids=frozenset(), queue=asyncio.Queue(maxsize=1)
+        )
+        ok = await delivery._push_with_retry(conn, {"publish_id": 1, "data": {}})
+        assert ok is True
+        assert conn.closed.is_set() is False
+
+    def test_exhausted_retries_force_disconnects(self):
+        asyncio.run(self._run_exhausted())
+
+    async def _run_exhausted(self):
+        # maxsize=1 の queue を満杯にしておき、以降の push が queue full で
+        # retry を使い切って強制切断されることを検証する。backoff の実時間待機
+        # （累積約 3.1 秒）は PUSH_RETRY_DELAYS_SECONDS を monkeypatch して短縮する。
+        original = delivery.PUSH_RETRY_DELAYS_SECONDS
+        delivery.PUSH_RETRY_DELAYS_SECONDS = (0.001,) * 5
+        try:
+            conn = delivery.Connection(
+                identity="agent-a", subscription_ids=frozenset(), queue=asyncio.Queue(maxsize=1)
+            )
+            conn.queue.put_nowait({"publish_id": 0, "data": {}})  # queue を満杯にする
+
+            ok = await delivery._push_with_retry(conn, {"publish_id": 1, "data": {}})
+
+            assert ok is False
+            assert conn.closed.is_set() is True
+        finally:
+            delivery.PUSH_RETRY_DELAYS_SECONDS = original
+
+    def test_retry_delay_sequence_matches_wire_api_spec(self):
+        """初回 100ms・係数 2・最大 5 回・累積約 3.1 秒（wire-api.md §6.4）。"""
+        assert delivery.PUSH_RETRY_DELAYS_SECONDS == (0.1, 0.2, 0.4, 0.8, 1.6)
+        assert sum(delivery.PUSH_RETRY_DELAYS_SECONDS) == pytest.approx(3.1)
+
+
+# ---------------------------------------------------------------------------
+# DLQ sweep
+# ---------------------------------------------------------------------------
+
+
+class TestDlqSweep:
+    def test_retain_exceeded_moves_to_dlq(self, settings):
+        db.init_db(settings.db_path)
+        conn = db.get_connection(settings.db_path)
+        past = (datetime.now(timezone.utc) - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            conn.execute(
+                "INSERT INTO publish_log (lane, stream_id, publisher_identity, enqueued_at)"
+                " VALUES ('subscription', NULL, 'agent-a', ?)",
+                (delivery._now_iso(),),
+            )
+            conn.execute(
+                "INSERT INTO outbox"
+                " (target_type, subscription_id, publish_id, payload, enqueued_at, expires_at)"
+                " VALUES ('subscription', 'sub-x', 1, ?, ?, ?)",
+                (b"{}", delivery._now_iso(), past),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        conn = db.get_connection(settings.db_path)
+        try:
+            delivery._sweep_retain_exceeded(conn)
+            conn.commit()
+            outbox_rows = conn.execute("SELECT * FROM outbox").fetchall()
+            dlq_rows = [
+                tuple(r)
+                for r in conn.execute(
+                    "SELECT error_code FROM dlq WHERE subscription_id = 'sub-x'"
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+        assert outbox_rows == []
+        assert dlq_rows == [(delivery.DLQ_ERROR_RETAIN_EXCEEDED,)]
+
+    def test_permanent_error_unknown_subscription_moves_to_dlq(self, settings):
+        db.init_db(settings.db_path)
+        conn = db.get_connection(settings.db_path)
+        try:
+            conn.execute(
+                "INSERT INTO publish_log (lane, stream_id, publisher_identity, enqueued_at)"
+                " VALUES ('subscription', NULL, 'agent-a', ?)",
+                (delivery._now_iso(),),
+            )
+            conn.execute(
+                "INSERT INTO outbox"
+                " (target_type, subscription_id, publish_id, payload, enqueued_at, expires_at)"
+                " VALUES ('subscription', 'ghost-sub', 1, ?, ?, ?)",
+                (b"{}", delivery._now_iso(), None),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        sub_registry = SubscriptionRegistry()  # 'ghost-sub' を知らない空の registry
+        conn = db.get_connection(settings.db_path)
+        try:
+            delivery._sweep_permanent_errors(conn, sub_registry)
+            conn.commit()
+            outbox_rows = conn.execute("SELECT * FROM outbox").fetchall()
+            dlq_rows = [
+                tuple(r)
+                for r in conn.execute(
+                    "SELECT error_code FROM dlq WHERE subscription_id = 'ghost-sub'"
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+        assert outbox_rows == []
+        assert dlq_rows == [(delivery.DLQ_ERROR_SUBSCRIPTION_UNAVAILABLE,)]
+
+    def test_lease_expired_subscription_moves_to_dlq(self, settings):
+        db.init_db(settings.db_path)
+        sub_registry = SubscriptionRegistry()
+        record = sub_registry.create("agent-b", frozenset({"x"}), 300, 86400)
+        record.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+        conn = db.get_connection(settings.db_path)
+        try:
+            conn.execute(
+                "INSERT INTO publish_log (lane, stream_id, publisher_identity, enqueued_at)"
+                " VALUES ('subscription', NULL, 'agent-a', ?)",
+                (delivery._now_iso(),),
+            )
+            conn.execute(
+                "INSERT INTO outbox"
+                " (target_type, subscription_id, publish_id, payload, enqueued_at, expires_at)"
+                " VALUES ('subscription', ?, 1, ?, ?, ?)",
+                (record.subscription_id, b"{}", delivery._now_iso(), None),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        conn = db.get_connection(settings.db_path)
+        try:
+            delivery._sweep_permanent_errors(conn, sub_registry)
+            conn.commit()
+            dlq_rows = [
+                tuple(r)
+                for r in conn.execute(
+                    "SELECT error_code FROM dlq WHERE subscription_id = ?",
+                    (record.subscription_id,),
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+        assert dlq_rows == [(delivery.DLQ_ERROR_SUBSCRIPTION_UNAVAILABLE,)]
+
+    def test_live_subscription_not_moved_to_dlq(self, settings):
+        db.init_db(settings.db_path)
+        sub_registry = SubscriptionRegistry()
+        record = sub_registry.create("agent-b", frozenset({"x"}), 300, 86400)
+
+        conn = db.get_connection(settings.db_path)
+        try:
+            conn.execute(
+                "INSERT INTO publish_log (lane, stream_id, publisher_identity, enqueued_at)"
+                " VALUES ('subscription', NULL, 'agent-a', ?)",
+                (delivery._now_iso(),),
+            )
+            conn.execute(
+                "INSERT INTO outbox"
+                " (target_type, subscription_id, publish_id, payload, enqueued_at, expires_at)"
+                " VALUES ('subscription', ?, 1, ?, ?, ?)",
+                (record.subscription_id, b"{}", delivery._now_iso(), None),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        conn = db.get_connection(settings.db_path)
+        try:
+            delivery._sweep_permanent_errors(conn, sub_registry)
+            conn.commit()
+            outbox_rows = [
+                tuple(r)
+                for r in conn.execute(
+                    "SELECT publish_id FROM outbox WHERE subscription_id = ?",
+                    (record.subscription_id,),
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+        assert outbox_rows == [(1,)]
+
+    def test_physical_delete_after_retention_days(self, settings):
+        db.init_db(settings.db_path)
+        old_dead_at = (
+            datetime.now(timezone.utc) - timedelta(days=settings.dlq_retention_days, seconds=1)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        recent_dead_at = delivery._now_iso()
+
+        conn = db.get_connection(settings.db_path)
+        try:
+            conn.execute(
+                "INSERT INTO dlq"
+                " (target_type, subscription_id, publish_id, payload, error_code, dead_at)"
+                " VALUES ('subscription', 'old-sub', 1, ?, 'x', ?)",
+                (b"{}", old_dead_at),
+            )
+            conn.execute(
+                "INSERT INTO dlq"
+                " (target_type, subscription_id, publish_id, payload, error_code, dead_at)"
+                " VALUES ('subscription', 'recent-sub', 1, ?, 'x', ?)",
+                (b"{}", recent_dead_at),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        conn = db.get_connection(settings.db_path)
+        try:
+            delivery._sweep_dlq_physical_delete(conn, settings)
+            conn.commit()
+            remaining = {
+                r[0] for r in conn.execute("SELECT subscription_id FROM dlq").fetchall()
+            }
+        finally:
+            conn.close()
+        assert remaining == {"recent-sub"}
+
+
+# ---------------------------------------------------------------------------
+# dispatcher 単一プロセス enforcement（file lock）
+# ---------------------------------------------------------------------------
+
+
+class TestDispatcherLock:
+    def test_second_acquire_fails_while_first_holds(self, tmp_path):
+        lock_path = str(tmp_path / "d.lock")
+        fd1 = delivery.try_acquire_dispatcher_lock(lock_path)
+        assert fd1 is not None
+        fd2 = delivery.try_acquire_dispatcher_lock(lock_path)
+        assert fd2 is None
+        delivery.release_dispatcher_lock(fd1)
+
+    def test_reacquire_succeeds_after_release(self, tmp_path):
+        lock_path = str(tmp_path / "d.lock")
+        fd1 = delivery.try_acquire_dispatcher_lock(lock_path)
+        delivery.release_dispatcher_lock(fd1)
+        fd2 = delivery.try_acquire_dispatcher_lock(lock_path)
+        assert fd2 is not None
+        delivery.release_dispatcher_lock(fd2)
+
+
+# ---------------------------------------------------------------------------
+# 実ソケット統合テスト（真の SSE ストリーミング）
+# ---------------------------------------------------------------------------
+
+
+def _read_until_data_line(resp: httpx.Response, timeout: float) -> str:
+    """`data:` で始まる行が来るまで読み進める（keepalive コメント行は読み飛ばす）。
+
+    行が来ない場合は httpx.Client 側の read timeout（`live_client` fixture で設定）で
+    例外になる（無限 hang はしない）。
+    """
+    deadline = time.time() + timeout
+    for line in resp.iter_lines():
+        if line.startswith("data:"):
+            return line
+        if time.time() > deadline:
+            break
+    raise AssertionError("data: 行が timeout 内に観測できませんでした")
+
+
+def _read_publish_ids(resp: httpx.Response, count: int, timeout: float) -> list[int]:
+    deadline = time.time() + timeout
+    ids: list[int] = []
+    for line in resp.iter_lines():
+        if line.startswith("data:"):
+            data = json.loads(line[len("data:") :].strip())
+            ids.append(data["publish_id"])
+            if len(ids) >= count:
+                break
+        if time.time() > deadline:
+            break
+    return ids
+
+
+class LiveServer:
+    """uvicorn を実 TCP port で起動する test helper。
+
+    Starlette `TestClient`（httpx ラップ）も `httpx.ASGITransport` も、内部で
+    `await app(scope, receive, send)` の完了を待ってからレスポンスを返す実装になっており
+    （終端しない SSE stream は待ち続けて hang する）、真のインクリメンタル HTTP
+    ストリーミングをサポートしない。そのため `GET /events` を実際にストリームとして
+    読む検証だけは、実ソケット越しの uvicorn + `httpx.Client`（非 ASGI transport）を使う。
+    """
+
+    def __init__(self, app):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        self.port = sock.getsockname()[1]
+        sock.close()
+
+        config = uvicorn.Config(app, host="127.0.0.1", port=self.port, log_level="warning")
+        self.server = uvicorn.Server(config)
+        self.thread = threading.Thread(target=self.server.run, daemon=True)
+
+    def __enter__(self) -> httpx.Client:
+        self.thread.start()
+        deadline = time.time() + 5
+        while not self.server.started and time.time() < deadline:
+            time.sleep(0.02)
+        self.client = httpx.Client(base_url=f"http://127.0.0.1:{self.port}", timeout=10.0)
+        return self.client
+
+    def __exit__(self, *exc_info) -> None:
+        self.client.close()
+        self.server.should_exit = True
+        self.thread.join(timeout=5)
+
+
+@pytest.fixture()
+def live_client(settings):
+    app = create_app(settings)
+    with LiveServer(app) as client:
+        yield client
+
+
+class TestGetEventsLive:
+    def test_subscription_lane_happy_path_and_ack(self, live_client, settings):
+        r = live_client.post(
+            "/subscriptions",
+            json={"subscriber": "agent-b", "labels": ["topic:474"]},
+            headers=_auth("tok-b"),
+        )
+        subscription_id = r.json()["subscription_id"]
+
+        with live_client.stream(
+            "GET", f"/events?subscription_ids={subscription_id}", headers=_auth("tok-b")
+        ) as resp:
+            assert resp.status_code == 200
+            assert resp.headers["content-type"].startswith("text/event-stream")
+
+            r2 = live_client.post(
+                "/publish",
+                json={"ref": {"type": "decision", "id": 1}, "labels": ["topic:474"]},
+                headers=_auth("tok-a"),
+            )
+            publish_id = r2.json()["publish_id"]
+
+            data_line = _read_until_data_line(resp, timeout=5)
+            data = json.loads(data_line[len("data:") :].strip())
+            assert data["publish_id"] == publish_id
+            assert data["delivery_target"] == f"sub:{subscription_id}"
+
+        r3 = live_client.post(
+            f"/subscriptions/{subscription_id}/ack",
+            json={"up_to_publish_id": publish_id},
+            headers=_auth("tok-b"),
+        )
+        assert r3.status_code == 200
+
+        conn = sqlite3.connect(settings.db_path)
+        try:
+            rows = conn.execute("SELECT * FROM outbox").fetchall()
+        finally:
+            conn.close()
+        assert rows == []
+
+    def test_stream_lane_auto_included_without_subscription_ids(self, live_client):
+        live_client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        live_client.put(
+            "/streams/s1/members",
+            json={"identity": "agent-b", "access": "read"},
+            headers=_auth("tok-a"),
+        )
+
+        with live_client.stream("GET", "/events", headers=_auth("tok-b")) as resp:
+            assert resp.status_code == 200
+            r = live_client.post(
+                "/streams/s1/messages", json={"body": "hello"}, headers=_auth("tok-a")
+            )
+            publish_id = r.json()["publish_id"]
+
+            data_line = _read_until_data_line(resp, timeout=5)
+            data = json.loads(data_line[len("data:") :].strip())
+            assert data["publish_id"] == publish_id
+            assert data["body"] == "hello"
+            assert data["delivery_target"] == "stream:s1"
+
+    def test_unknown_subscription_id_returns_404(self, live_client):
+        r = live_client.get("/events?subscription_ids=nope", headers=_auth("tok-a"))
+        assert r.status_code == 404
+
+    def test_non_owned_subscription_id_returns_404(self, live_client):
+        r = live_client.post(
+            "/subscriptions", json={"subscriber": "agent-a", "labels": ["x"]}, headers=_auth("tok-a")
+        )
+        subscription_id = r.json()["subscription_id"]
+        r2 = live_client.get(
+            f"/events?subscription_ids={subscription_id}", headers=_auth("tok-b")
+        )
+        assert r2.status_code == 404
+
+    def test_resume_after_reconnect_replays_unacked_entries(self, live_client, settings):
+        """再接続時、ack されていない outbox エントリが古い順に再 push される
+        （wire-api.md §6.5：暗黙再 push）。"""
+        r = live_client.post(
+            "/subscriptions",
+            json={"subscriber": "agent-b", "labels": ["x"]},
+            headers=_auth("tok-b"),
+        )
+        subscription_id = r.json()["subscription_id"]
+
+        # 誰も接続していない状態で 2 件 publish（outbox に積むだけ）。
+        p1 = live_client.post(
+            "/publish",
+            json={"ref": {"type": "decision", "id": 1}, "labels": ["x"]},
+            headers=_auth("tok-a"),
+        ).json()["publish_id"]
+        p2 = live_client.post(
+            "/publish",
+            json={"ref": {"type": "decision", "id": 2}, "labels": ["x"]},
+            headers=_auth("tok-a"),
+        ).json()["publish_id"]
+
+        with live_client.stream(
+            "GET", f"/events?subscription_ids={subscription_id}", headers=_auth("tok-b")
+        ) as resp:
+            seen_ids = _read_publish_ids(resp, count=2, timeout=5)
+
+        assert seen_ids == [p1, p2]

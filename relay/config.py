@@ -23,6 +23,14 @@ DEFAULT_LEASE_TTL_SECONDS = 300
 MIN_LEASE_TTL_SECONDS = 30
 MAX_LEASE_TTL_SECONDS = 86400
 
+# dispatcher / push retry / SSE の既定値（relay-v2-wire-api.md §6.2, §6.4, §5.5）
+DEFAULT_DISPATCHER_POLL_INTERVAL_SECONDS = 0.2  # 100ms〜1s の範囲内
+DEFAULT_DISPATCHER_LOCK_PATH = "relay-dispatcher.lock"
+DEFAULT_SSE_KEEPALIVE_SECONDS = 30
+DEFAULT_SSE_SEND_TIMEOUT_SECONDS = 5.0
+DEFAULT_DLQ_RETENTION_DAYS = 7
+DEFAULT_PUBLISH_RATE_LIMIT_PER_SECOND = 100
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -45,6 +53,14 @@ class Settings:
     jws_private_key_pem: str | None = None
     jws_kid: str | None = None
     jws_jku: str | None = None
+
+    # 配達基盤（relay-v2-wire-api.md §6）
+    dispatcher_poll_interval_seconds: float = DEFAULT_DISPATCHER_POLL_INTERVAL_SECONDS
+    dispatcher_lock_path: str = DEFAULT_DISPATCHER_LOCK_PATH
+    sse_keepalive_seconds: float = DEFAULT_SSE_KEEPALIVE_SECONDS
+    sse_send_timeout_seconds: float = DEFAULT_SSE_SEND_TIMEOUT_SECONDS
+    dlq_retention_days: int = DEFAULT_DLQ_RETENTION_DAYS
+    publish_rate_limit_per_second: int = DEFAULT_PUBLISH_RATE_LIMIT_PER_SECOND
 
 
 def _load_auth_tokens_from_env() -> dict[str, str]:
@@ -76,6 +92,32 @@ def load_settings_from_env() -> Settings:
         jws_private_key_pem=os.environ.get("RELAY_JWS_PRIVATE_KEY_PEM"),
         jws_kid=os.environ.get("RELAY_JWS_KID"),
         jws_jku=os.environ.get("RELAY_JWS_JKU"),
+        dispatcher_poll_interval_seconds=float(
+            os.environ.get(
+                "RELAY_DISPATCHER_POLL_INTERVAL_SECONDS",
+                DEFAULT_DISPATCHER_POLL_INTERVAL_SECONDS,
+            )
+        ),
+        dispatcher_lock_path=os.environ.get(
+            "RELAY_DISPATCHER_LOCK_PATH", DEFAULT_DISPATCHER_LOCK_PATH
+        ),
+        sse_keepalive_seconds=float(
+            os.environ.get("RELAY_SSE_KEEPALIVE_SECONDS", DEFAULT_SSE_KEEPALIVE_SECONDS)
+        ),
+        sse_send_timeout_seconds=float(
+            os.environ.get(
+                "RELAY_SSE_SEND_TIMEOUT_SECONDS", DEFAULT_SSE_SEND_TIMEOUT_SECONDS
+            )
+        ),
+        dlq_retention_days=int(
+            os.environ.get("RELAY_DLQ_RETENTION_DAYS", DEFAULT_DLQ_RETENTION_DAYS)
+        ),
+        publish_rate_limit_per_second=int(
+            os.environ.get(
+                "RELAY_PUBLISH_RATE_LIMIT_PER_SECOND",
+                DEFAULT_PUBLISH_RATE_LIMIT_PER_SECOND,
+            )
+        ),
     )
 
 
