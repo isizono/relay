@@ -12,8 +12,9 @@ relay/
 ├── __init__.py
 ├── config.py         # 実行時設定（環境変数 → Settings dataclass）
 ├── db.py             # SQLite 接続 + migration 適用（yoyo-migrations）
+├── errors.py           # error envelope（{code, message, details}）+ relay 固有 error_code 定数
 ├── identity.py        # AgentCard 構築 / Bearer token authN / JCS(MUST) / JWS(MAY)
-├── streams.py         # stream (場) API（後続タスク実装）
+├── streams.py         # stream (場) API + membership + structural authZ（実装済み）
 ├── subscriptions.py   # subscription API（後続タスク実装）
 ├── delivery.py         # outbox polling dispatcher / SSE（後続タスク実装）
 ├── observability.py    # /status /metrics /サーバーログ（後続タスク実装）
@@ -26,7 +27,8 @@ tests/
 ├── test_db.py
 ├── test_identity.py
 ├── test_app.py
-└── test_config.py
+├── test_config.py
+└── test_streams.py
 ```
 
 各機能モジュール（`streams.py` / `subscriptions.py` / `delivery.py` /
@@ -164,14 +166,80 @@ detached 形式）という妥当と考えられる形式を暫定採用した�
 
 ## 未実装 / 後続タスクへの申し送り
 
-- `streams.py` / `subscriptions.py` / `delivery.py` / `observability.py` は
+- `subscriptions.py` / `delivery.py` / `observability.py` は
   `routes: list[Route] = []` のみの空モジュール。各担当が endpoint を実装する。
-- structural authZ（membership 照合、ownership 照合）のヘルパー関数は未実装。
-  `relay.identity.Identity` を受け取って判定する関数を各モジュール側に置くか、
-  共通化するかは後続の判断に委ねる。
+  `streams.py` は本タスク（stream CRUD + membership + structural authZ）で実装済み
+  （詳細は次節）。
 - `agent_cards` テーブル（外部 agent の AgentCard キャッシュ）の読み書きロジックは
   未実装。schema のみ用意した。
 - `server_log`（`Settings.server_log_path`、既定 `relay-server.jsonl`）の
   append-only 書き込みロジックは未実装（`observability.py` 担当）。
 - polling dispatcher（outbox polling → SSE push → retry → DLQ 化）は未実装
   （`delivery.py` 担当）。
+
+## `streams.py` 実装（stream CRUD + membership + structural authZ）
+
+`POST /streams` / `GET /streams/{stream_id}` / `DELETE /streams/{stream_id}` /
+`POST /streams/{stream_id}/messages` / `PUT`・`DELETE`・`GET /streams/{stream_id}/members` /
+`POST /streams/{stream_id}/ack` を実装した（`relay-v2-wire-api.md` §3, §5.6,
+`relay-v2-identity-authz.md` §2.2）。
+
+### stream / membership の in-memory registry
+
+`StreamRegistry`（`relay/streams.py`）が `dict[str, StreamRecord]` + `threading.Lock` で
+保持する。app インスタンスごとに `request.app.state.stream_registry` へ遅延生成され、
+同一 app を共有する他モジュール（`delivery.py` の `GET /events` が「認証 identity の
+member 場を自動含む」判定をする際など）からも同じ属性名で参照できる。
+
+### stream レーン publish は `streams.py` 側で outbox に直接 INSERT する
+
+`POST /streams/{stream_id}/messages` の `202 Accepted` は「outbox 永続化完了」が条件
+（wire-api.md §3.2, §6.1 transactional outbox）であるため、read 権限を持つ member 宛の
+outbox エントリ作成は `delivery.py`（polling dispatcher）を待たず `streams.py` が
+`relay.db` 経由で直接行う。`delivery.py` の責務は outbox からの読み出し（polling →
+SSE push → retry → DLQ 化）に限定される。
+
+### 追加した `relay/errors.py`
+
+A2A 1.0 spec Section 3.3.2 相当の共通 error envelope（`{code, message, details}`）と、
+relay 固有 error_code 定数を集約する共通モジュールを新設した。`streams.py` だけでなく
+`subscriptions.py` / `delivery.py` 側の endpoint 実装でも同じ envelope 形式を使うことを
+想定している。
+
+### status code の判断（wire-api.md の記述を優先）
+
+`POST /streams/{stream_id}/messages` の write 権限不足は、wire-api.md §3.2 / §8 が
+明示的に `403 Forbidden` と記載しているためその通りに実装した（`DELETE
+/streams/{stream_id}` や membership 変更の write 権限不足も同様に `403`）。一方
+`POST /streams/{stream_id}/ack` は wire-api.md §5.6 が「場が不在、または呼び出し元が
+read 権限を持つ member でない」を同一の `404 Not Found` と明記しているため、そちらは
+存在と権限不足を区別しない実装にした。
+
+### 既知のギャップ（後続タスクへの申し送り）
+
+1. **`GET /streams`（一覧）は wire-api.md に存在しない**。本タスクの依頼文には
+   「`GET /streams`」という記載があったが、`relay-v2-wire-api.md` §2 / §3 の
+   endpoint 一覧には `GET /streams/{stream_id}`（単一 stream のメタ取得）しか
+   定義されていない。一覧 endpoint を新設するかどうかは仕様上未確定のため、本タスクでは
+   `GET /streams/{stream_id}` のみを実装し、一覧 endpoint は実装していない。必要であれば
+   別途仕様を確定してから追加すべきである。
+2. **`idempotency_key` の 15 分 dedup は未実装**（wire-api.md §6.3）。dedup 用の永続
+   store が `migrations/0001-initial-schema.sql` に存在しないため見送った。stream レーン /
+   subscription レーン共通の関心事なので、`subscriptions.py` 側の `POST /publish` 実装と
+   あわせて共通化を検討すべきである。
+3. **`ttl`（メッセージ単位の retain 上書き）・`default_ttl`（stream 単位の retain
+   default）は値バリデーション（min 60 / max 86400、wire-api.md §6.4）のみ行い、実際の
+   retain / DLQ 判定には未反映**。outbox table に enqueue 時点の期限を持たせる列が無い
+   ため、DLQ sweep ロジックを実装する `delivery.py` 側でスキーマ拡張が必要になる
+   可能性がある。
+4. **error_code の一部は cc-memory 側の既存 decision（`error_code = A2A 8 種 + relay
+   固有最小集合`）の列挙にない**。`StreamAlreadyExistsError`（`POST /streams` の
+   stream_id 重複、409）と `InvalidRequestError`（汎用 400 バリデーション）を追加した。
+   前者は既存 decision の列挙に conflict 用の code が無いための追加、後者は
+   `LabelValidationError` が labels 専用の名前であり stream_id / body / access 等の
+   汎用バリデーションに転用するのは意味的に不適切と判断したための追加である。
+   error_code 一覧を「上限 7 種程度」で運用する方針との整合は、確定 decision 側の
+   見直しが必要か検討すべきである。
+5. **同一 stream の write member が 0 人になる操作（自分自身の write 権限を削除する
+   membership 変更等）へのガードは無い**。wire-api.md / identity-authz.md にこの
+   edge case の規定がないため、意図的に制約を追加していない。
