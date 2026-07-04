@@ -12,6 +12,7 @@ relay-v2-sdk.md §7.1 が「§3.2.1 の title 型分離を回帰から守るた�
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -466,3 +467,95 @@ class TestAckFlushRetry:
             t.join(timeout=3)
 
         assert got and got[0].ref_id == 2
+
+
+# ---------------------------------------------------------------------------
+# 不正フレーム耐性: _handle_notification 単体（壊れた payload を skip）
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedNotificationSkipped:
+    def test_bad_json_returns_none_and_warns(self, fake, caplog):
+        caplog.set_level(logging.WARNING, logger="relay_sdk.client.events")
+        with _subscribe(fake) as sub:
+            assert sub._handle_notification("{broken json") is None
+        assert any("JSON" in r.getMessage() for r in caplog.records)
+
+    def test_non_object_payload_returns_none(self, fake):
+        with _subscribe(fake) as sub:
+            for payload in ("42", '"a string"', "null", "[1, 2, 3]", "true"):
+                assert sub._handle_notification(payload) is None
+
+    def test_missing_publish_id_returns_none(self, fake):
+        with _subscribe(fake) as sub:
+            data = json.dumps({"delivery_target": "sub:x", "ref": {"type": "d", "id": 1}})
+            assert sub._handle_notification(data) is None
+
+    def test_publish_id_wrong_type_returns_none(self, fake):
+        with _subscribe(fake) as sub:
+            # str / float / bool / None / list はいずれも ack カーソルに使えず skip。
+            for pid in ("1", 1.5, True, None, [1]):
+                data = json.dumps({"delivery_target": "sub:x", "publish_id": pid})
+                assert sub._handle_notification(data) is None
+
+    def test_wrong_typed_ref_and_labels_do_not_crash(self, fake):
+        with _subscribe(fake) as sub:
+            data = json.dumps(
+                {
+                    "delivery_target": "sub:x",
+                    "publish_id": 5,
+                    "ref": "not-a-dict",
+                    "labels": "not-a-list",
+                }
+            )
+            event = sub._handle_notification(data)
+            assert event is not None and event.publish_id == 5
+            # 型不整合の ref/labels は空に落とすが例外にはしない。
+            assert event.ref_type == "" and event.ref_id == "" and event.labels == []
+
+    def test_non_sub_delivery_target_returns_none(self, fake):
+        with _subscribe(fake) as sub:
+            data = json.dumps({"delivery_target": 123, "publish_id": 5})
+            assert sub._handle_notification(data) is None
+
+
+# ---------------------------------------------------------------------------
+# 不正フレーム耐性: end-to-end（受信ループが不正フレームで落ちず継続）
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedFrameResilienceEndToEnd:
+    def test_receive_survives_injected_malformed_frames(self, fake, caplog):
+        caplog.set_level(logging.WARNING, logger="relay_sdk.client.events")
+        with _subscribe(fake) as sub:
+            # 正規経路（publish）では作れない不正な wire を SSE stream に直接注入する。
+            fake.inject_raw_sse(b"event: notification\nid: 1\ndata: {broken json\n\n")
+            fake.inject_raw_sse(b"event: notification\ndata: 42\n\n")  # 非 object payload
+            fake.inject_raw_sse(
+                b'event: notification\ndata: {"delivery_target":"sub:x","ref":{}}\n\n'
+            )  # publish_id 欠落
+            fake.inject_raw_sse(b"event: bogus\ndata: whatever\n\n")  # 未知 event 型
+            fake.inject_raw_sse(b"data: no event field\n\n")  # event フィールド欠落
+            fake.inject_raw_sse(b"garbage line without colon\n\n")  # 破損行
+            # 不正フレーム群のあとに正規 event を publish。
+            fake.publish(ref_type="decision", ref_id=99, labels=["entity:decision"], title="ok")
+            got = next(sub.receive())
+
+        # 不正フレームで受信ループが落ちず、後続の正規 event が届く。
+        assert got.ref_id == 99
+        # 壊れた JSON / publish_id 欠落は WARNING で記録される。
+        assert any("JSON" in r.getMessage() for r in caplog.records)
+
+    def test_receive_survives_oversized_frame(self, fake, caplog, monkeypatch):
+        import relay_sdk.config as cfg
+
+        monkeypatch.setattr(cfg, "SSE_MAX_FRAME_BYTES", 512)
+        caplog.set_level(logging.WARNING, logger="relay_sdk.client.events")
+        with _subscribe(fake) as sub:
+            # 上限を超える巨大 data 行を注入 → overflow で破棄され受信は継続する。
+            fake.inject_raw_sse(b"event: notification\ndata: " + b"Z" * 2000 + b"\n\n")
+            fake.publish(ref_type="decision", ref_id=7, labels=["entity:decision"])
+            got = next(sub.receive())
+
+        assert got.ref_id == 7
+        assert any("上限" in r.getMessage() for r in caplog.records)

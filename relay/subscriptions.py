@@ -22,7 +22,6 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -34,6 +33,8 @@ from starlette.routing import Route
 from relay import db, idempotency, observability
 from relay.config import (
     DEFAULT_LEASE_TTL_SECONDS,
+    DEFAULT_MAX_SUBSCRIPTIONS_PER_IDENTITY,
+    DEFAULT_MAX_SUBSCRIPTIONS_TOTAL,
     DEFAULT_RETAIN_SECONDS,
     MAX_LEASE_TTL_SECONDS,
     MAX_RETAIN_SECONDS,
@@ -49,9 +50,12 @@ from relay.errors import (
     SUBSCRIBER_MISMATCH,
     SUBSCRIPTION_GONE,
     SUBSCRIPTION_NOT_FOUND,
+    ResourceLimitExceeded,
     error_response,
+    resource_limit_response,
 )
 from relay.identity import Identity, require_authn
+from relay.ratelimit import get_publish_rate_limiter
 
 
 def _now() -> datetime:
@@ -83,11 +87,25 @@ class SubscriptionRegistry:
     `StreamRegistry`（`relay/streams.py`）と対称の設計。relay-v2-wire-api.md §0 の
     R1 原則により disk 永続化しない（relay 再起動で消える。subscriber は re-subscribe
     で自己修復する）。
+
+    資源上限（`max_total` / `max_per_identity`）は DoS 防御。`create` 時に registry 全体
+    の登録数と subscriber の登録数を検査し、超過すると `ResourceLimitExceeded` を送出する
+    （判定と挿入は同一 lock 下で atomic に行い、並行 create による上限すり抜けを防ぐ）。
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        max_total: int = DEFAULT_MAX_SUBSCRIPTIONS_TOTAL,
+        max_per_identity: int = DEFAULT_MAX_SUBSCRIPTIONS_PER_IDENTITY,
+    ) -> None:
         self._lock = threading.Lock()
         self._subs: dict[str, SubscriptionRecord] = {}
+        self._max_total = max_total
+        self._max_per_identity = max_per_identity
+        # subscriber ごとの現存 subscription 数。上限判定を O(1) にするため
+        # create/delete/evict_expired で増減させる。0 になった subscriber は key を落とす。
+        # 不変条件: sum(_per_subscriber_count.values()) == len(_subs)。
+        self._per_subscriber_count: dict[str, int] = {}
 
     def create(
         self,
@@ -96,7 +114,17 @@ class SubscriptionRegistry:
         lease_ttl: int,
         retain_seconds: int,
     ) -> SubscriptionRecord:
+        """新規 subscription を作成する。
+
+        Raises:
+            ResourceLimitExceeded: registry 総数または subscriber の登録数が上限に
+                達している場合。
+        """
         with self._lock:
+            if len(self._subs) >= self._max_total:
+                raise ResourceLimitExceeded("total")
+            if self._per_subscriber_count.get(subscriber, 0) >= self._max_per_identity:
+                raise ResourceLimitExceeded("per_identity")
             subscription_id = str(uuid.uuid4())
             record = SubscriptionRecord(
                 subscription_id=subscription_id,
@@ -107,7 +135,18 @@ class SubscriptionRegistry:
                 retain_seconds=retain_seconds,
             )
             self._subs[subscription_id] = record
+            self._per_subscriber_count[subscriber] = (
+                self._per_subscriber_count.get(subscriber, 0) + 1
+            )
             return record
+
+    def _decr_subscriber(self, subscriber: str) -> None:
+        """`subscriber` の現存 subscription 数を 1 減らす（lock 保持下で呼ぶこと）。"""
+        remaining = self._per_subscriber_count.get(subscriber, 0) - 1
+        if remaining <= 0:
+            self._per_subscriber_count.pop(subscriber, None)
+        else:
+            self._per_subscriber_count[subscriber] = remaining
 
     def get(self, subscription_id: str) -> SubscriptionRecord | None:
         with self._lock:
@@ -140,7 +179,9 @@ class SubscriptionRegistry:
 
     def delete(self, subscription_id: str) -> None:
         with self._lock:
-            self._subs.pop(subscription_id, None)
+            record = self._subs.pop(subscription_id, None)
+            if record is not None:
+                self._decr_subscriber(record.subscriber)
 
     def evict_expired(self, older_than_seconds: float) -> list[str]:
         """lease が `older_than_seconds` 秒より前に切れた subscription を registry から除去する。
@@ -160,7 +201,8 @@ class SubscriptionRegistry:
                 if record.lease_expires_at <= cutoff
             ]
             for subscription_id in expired_ids:
-                del self._subs[subscription_id]
+                record = self._subs.pop(subscription_id)
+                self._decr_subscriber(record.subscriber)
             return expired_ids
 
     def count(self) -> int:
@@ -190,7 +232,14 @@ def get_registry_from_state(app_state) -> SubscriptionRegistry:
     """
     registry = getattr(app_state, "subscription_registry", None)
     if registry is None:
-        registry = SubscriptionRegistry()
+        settings: Settings | None = getattr(app_state, "settings", None)
+        if settings is not None:
+            registry = SubscriptionRegistry(
+                max_total=settings.max_subscriptions_total,
+                max_per_identity=settings.max_subscriptions_per_identity,
+            )
+        else:
+            registry = SubscriptionRegistry()
         app_state.subscription_registry = registry
     return registry
 
@@ -203,42 +252,6 @@ def get_registry(request: Request) -> SubscriptionRegistry:
 def _get_connection(request: Request) -> sqlite3.Connection:
     settings: Settings = request.app.state.settings
     return db.get_connection(settings.db_path)
-
-
-# ---------------------------------------------------------------------------
-# publish レート制限（relay-v2-wire-api.md §5.4、publisher ごと token bucket）
-# ---------------------------------------------------------------------------
-
-
-class RateLimiter:
-    """publisher identity ごとの token bucket rate limiter。"""
-
-    def __init__(self, rate_per_second: int) -> None:
-        self._rate = max(1, rate_per_second)
-        self._lock = threading.Lock()
-        self._buckets: dict[str, tuple[float, float]] = {}
-
-    def allow(self, identity: str) -> tuple[bool, int]:
-        """許可なら `(True, 0)`、拒否なら `(False, retry_after_seconds)`。"""
-        now = time.monotonic()
-        with self._lock:
-            tokens, last = self._buckets.get(identity, (float(self._rate), now))
-            tokens = min(float(self._rate), tokens + (now - last) * self._rate)
-            if tokens >= 1.0:
-                self._buckets[identity] = (tokens - 1.0, now)
-                return True, 0
-            self._buckets[identity] = (tokens, now)
-            retry_after = max(1, int((1.0 - tokens) / self._rate) + 1)
-            return False, retry_after
-
-
-def _get_rate_limiter(request: Request) -> RateLimiter:
-    limiter = getattr(request.app.state, "publish_rate_limiter", None)
-    if limiter is None:
-        settings: Settings = request.app.state.settings
-        limiter = RateLimiter(settings.publish_rate_limit_per_second)
-        request.app.state.publish_rate_limiter = limiter
-    return limiter
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +293,35 @@ async def _read_capped_body(request: Request) -> tuple[bytes, Response | None]:
             )
         chunks.append(chunk)
     return b"".join(chunks), None
+
+
+def _validate_label_caps(labels: list[str], settings: Settings) -> Response | None:
+    """labels の個数上限と各 label の文字列長上限を検査する（型チェック済み前提）。"""
+    if len(labels) > settings.max_labels_count:
+        return error_response(
+            400,
+            LABEL_VALIDATION,
+            f"labels は最大 {settings.max_labels_count} 個までです",
+        )
+    for label in labels:
+        if len(label) > settings.max_label_length:
+            return error_response(
+                400,
+                LABEL_VALIDATION,
+                f"label は 1 個あたり最大 {settings.max_label_length} 文字までです",
+            )
+    return None
+
+
+def _validate_title_cap(title: str, settings: Settings) -> Response | None:
+    """title の文字列長上限を検査する（型チェック済み前提）。"""
+    if len(title) > settings.max_title_length:
+        return error_response(
+            400,
+            INVALID_REQUEST,
+            f"title は最大 {settings.max_title_length} 文字までです",
+        )
+    return None
 
 
 async def _read_json_body(request: Request) -> tuple[dict, Response | None]:
@@ -349,6 +391,7 @@ def _validate_retain_seconds(value: object) -> tuple[int | None, Response | None
 @require_authn
 async def create_subscription(request: Request) -> Response:
     identity: Identity = request.state.identity
+    settings: Settings = request.app.state.settings
     body, err = await _read_json_body(request)
     if err is not None:
         return err
@@ -368,6 +411,9 @@ async def create_subscription(request: Request) -> Response:
         return error_response(400, LABEL_VALIDATION, "labels は非空配列で指定してください（firehose 防止）")
     if not all(isinstance(label, str) for label in labels):
         return error_response(400, LABEL_VALIDATION, "labels は文字列の配列で指定してください")
+    err = _validate_label_caps(labels, settings)
+    if err is not None:
+        return err
 
     lease_ttl, err = _validate_lease_ttl(body.get("lease_ttl"))
     if err is not None:
@@ -387,7 +433,10 @@ async def create_subscription(request: Request) -> Response:
         retain_seconds = DEFAULT_RETAIN_SECONDS
 
     registry = get_registry(request)
-    record = registry.create(identity.id, frozenset(labels), lease_ttl, retain_seconds)
+    try:
+        record = registry.create(identity.id, frozenset(labels), lease_ttl, retain_seconds)
+    except ResourceLimitExceeded as exc:
+        return resource_limit_response("subscription", exc.scope)
     observability.record_event(
         request.app.state,
         "subscribe",
@@ -531,7 +580,7 @@ async def publish(request: Request) -> Response:
     identity: Identity = request.state.identity
     settings: Settings = request.app.state.settings
 
-    limiter = _get_rate_limiter(request)
+    limiter = get_publish_rate_limiter(request.app.state)
     allowed, retry_after = limiter.allow(identity.id)
     if not allowed:
         observability.inc_metric(
@@ -565,6 +614,12 @@ async def publish(request: Request) -> Response:
             request.app.state, "relay_publish_failed_total", failure_reason="invalid_request"
         )
         return error_response(400, INVALID_REQUEST, "labels は文字列の配列で指定してください")
+    err = _validate_label_caps(labels, settings)
+    if err is not None:
+        observability.inc_metric(
+            request.app.state, "relay_publish_failed_total", failure_reason="invalid_request"
+        )
+        return err
 
     title = body.get("title")
     if title is not None and not isinstance(title, str):
@@ -572,6 +627,13 @@ async def publish(request: Request) -> Response:
             request.app.state, "relay_publish_failed_total", failure_reason="invalid_request"
         )
         return error_response(400, INVALID_REQUEST, "title は文字列で指定してください")
+    if title is not None:
+        err = _validate_title_cap(title, settings)
+        if err is not None:
+            observability.inc_metric(
+                request.app.state, "relay_publish_failed_total", failure_reason="invalid_request"
+            )
+            return err
 
     idempotency_key = body.get("idempotency_key")
     if idempotency_key is not None and not isinstance(idempotency_key, str):
@@ -591,41 +653,47 @@ async def publish(request: Request) -> Response:
         body=title,
     )
     store = idempotency.get_store(request.app.state)
-    existing_publish_id = store.check(dedup_key)
+    existing_publish_id = await idempotency.resolve_or_reserve(store, dedup_key)
     if existing_publish_id is not None:
         return JSONResponse(
             {"publish_id": existing_publish_id, "matched_subscriptions": 0}, status_code=202
         )
 
-    registry = get_registry(request)
-    matches = registry.matching(labels_set)
-
-    payload = json.dumps({"ref": ref, "title": title}, ensure_ascii=False).encode("utf-8")
-    labels_json = json.dumps(sorted(labels_set), ensure_ascii=False)
-    now_dt = _now()
-    now = _iso(now_dt)
-
-    conn = _get_connection(request)
+    # 予約獲得後は finalize / release のどちらかで必ず予約を解消する。CancelledError
+    # でも解放が要るため BaseException で受ける。
     try:
-        cur = conn.execute(
-            "INSERT INTO publish_log (lane, stream_id, publisher_identity, enqueued_at)"
-            " VALUES ('subscription', NULL, ?, ?)",
-            (identity.id, now),
-        )
-        publish_id = cur.lastrowid
-        for record in matches:
-            expires_at = _iso(now_dt + timedelta(seconds=record.retain_seconds))
-            conn.execute(
-                "INSERT INTO outbox"
-                " (target_type, subscription_id, publish_id, payload, labels, enqueued_at,"
-                " expires_at)"
-                " VALUES ('subscription', ?, ?, ?, ?, ?, ?)",
-                (record.subscription_id, publish_id, payload, labels_json, now, expires_at),
+        registry = get_registry(request)
+        matches = registry.matching(labels_set)
+
+        payload = json.dumps({"ref": ref, "title": title}, ensure_ascii=False).encode("utf-8")
+        labels_json = json.dumps(sorted(labels_set), ensure_ascii=False)
+        now_dt = _now()
+        now = _iso(now_dt)
+
+        conn = _get_connection(request)
+        try:
+            cur = conn.execute(
+                "INSERT INTO publish_log (lane, stream_id, publisher_identity, enqueued_at)"
+                " VALUES ('subscription', NULL, ?, ?)",
+                (identity.id, now),
             )
-        conn.commit()
-    finally:
-        conn.close()
-    store.register(dedup_key, publish_id)
+            publish_id = cur.lastrowid
+            for record in matches:
+                expires_at = _iso(now_dt + timedelta(seconds=record.retain_seconds))
+                conn.execute(
+                    "INSERT INTO outbox"
+                    " (target_type, subscription_id, publish_id, payload, labels, enqueued_at,"
+                    " expires_at)"
+                    " VALUES ('subscription', ?, ?, ?, ?, ?, ?)",
+                    (record.subscription_id, publish_id, payload, labels_json, now, expires_at),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except BaseException:
+        store.release(dedup_key)
+        raise
+    store.finalize(dedup_key, publish_id)
 
     observability.record_event(
         request.app.state,
@@ -635,9 +703,7 @@ async def publish(request: Request) -> Response:
         publisher_identity=identity.id,
         matched_subscriptions=len(matches),
     )
-    observability.inc_metric(
-        request.app.state, "relay_publish_received_total", publisher_identity=identity.id
-    )
+    observability.inc_metric(request.app.state, "relay_publish_received_total")
     return JSONResponse(
         {"publish_id": publish_id, "matched_subscriptions": len(matches)}, status_code=202
     )

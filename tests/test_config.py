@@ -14,6 +14,14 @@ class TestSettingsDefaults:
         assert settings.jws_private_key_pem is None
         assert settings.max_payload_bytes == DEFAULT_MAX_PAYLOAD_BYTES
 
+    def test_registry_limit_defaults(self):
+        settings = Settings()
+        assert settings.max_streams_total == 20000
+        assert settings.max_streams_per_identity == 1000
+        assert settings.max_subscriptions_total == 20000
+        assert settings.max_subscriptions_per_identity == 1000
+        assert settings.stream_registry_retention_seconds == 3600
+
 
 class TestLoadSettingsFromEnv:
     def test_reads_db_path(self, monkeypatch):
@@ -52,3 +60,16 @@ class TestLoadSettingsFromEnv:
         monkeypatch.delenv("RELAY_MAX_PAYLOAD_BYTES", raising=False)
         settings = load_settings_from_env()
         assert settings.max_payload_bytes == DEFAULT_MAX_PAYLOAD_BYTES
+
+    def test_reads_registry_limits_from_env(self, monkeypatch):
+        monkeypatch.setenv("RELAY_MAX_STREAMS_TOTAL", "50")
+        monkeypatch.setenv("RELAY_MAX_STREAMS_PER_IDENTITY", "5")
+        monkeypatch.setenv("RELAY_MAX_SUBSCRIPTIONS_TOTAL", "60")
+        monkeypatch.setenv("RELAY_MAX_SUBSCRIPTIONS_PER_IDENTITY", "6")
+        monkeypatch.setenv("RELAY_STREAM_REGISTRY_RETENTION_SECONDS", "120")
+        settings = load_settings_from_env()
+        assert settings.max_streams_total == 50
+        assert settings.max_streams_per_identity == 5
+        assert settings.max_subscriptions_total == 60
+        assert settings.max_subscriptions_per_identity == 6
+        assert settings.stream_registry_retention_seconds == 120

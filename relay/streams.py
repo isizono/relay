@@ -41,24 +41,84 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from relay import db, idempotency, observability
-from relay.config import DEFAULT_RETAIN_SECONDS, MAX_RETAIN_SECONDS, MIN_RETAIN_SECONDS, Settings
+from relay.config import (
+    DEFAULT_MAX_STREAMS_PER_IDENTITY,
+    DEFAULT_MAX_STREAMS_TOTAL,
+    DEFAULT_RETAIN_SECONDS,
+    MAX_RETAIN_SECONDS,
+    MIN_RETAIN_SECONDS,
+    Settings,
+)
 from relay.errors import (
     INVALID_REQUEST,
     MEMBERSHIP_REQUIRED,
     PAYLOAD_TOO_LARGE,
+    RATE_LIMIT_EXCEEDED,
     STREAM_ALREADY_EXISTS,
     STREAM_GONE,
     STREAM_NOT_FOUND,
+    ResourceLimitExceeded,
     error_response,
+    resource_limit_response,
 )
 from relay.identity import Identity, require_authn
+from relay.ratelimit import get_publish_rate_limiter
 
 Access = Literal["read", "write", "read_write"]
 _VALID_ACCESS: frozenset[str] = frozenset({"read", "write", "read_write"})
 
+# canonical stream_id は "{creator_identity}{SEP}{name}" 形式で、creator identity を構造的に
+# 前置する。これにより stream_id 名前空間が identity 単位で分割され、ある identity が別 identity
+# の名前空間で stream を作成することが構造的に不可能になる（同名の name を別 identity が使っても
+# canonical が別物になり衝突しない）。
+#
+# 区切り文字 ":" の選定理由:
+# - URL パスの単一セグメント（`[^/]+`）に収まるため、"/" と違い `/streams/{id}/members` 等の
+#   サブリソース経路とルーティング上衝突しない。
+# - name から ":" と "/" を除外する（`_validate_stream_name`）ことで canonical 文字列の区切り
+#   構造が一意に保たれ、delivery target key `stream:{stream_id}:{member_identity}` の
+#   （":" 区切りに依存する）injectivity も維持される。
+# creator identity 自体が ":" / "/" を含まないことは authN 側（管理者管理の識別子）の前提。
+STREAM_ID_SEPARATOR = ":"
+_FORBIDDEN_NAME_CHARS = (STREAM_ID_SEPARATOR, "/")
+
+
+def canonical_stream_id(creator_identity: str, name: str) -> str:
+    """creator identity でスコープ化した canonical stream_id を構築する。"""
+    return f"{creator_identity}{STREAM_ID_SEPARATOR}{name}"
+
+
+def _validate_stream_name(
+    value: object, settings: Settings
+) -> tuple[str | None, Response | None]:
+    """`POST /streams` の `name`（作成者名前空間内の stream 名）を検証する。
+
+    Returns:
+        (検証済み name または None, エラー Response または None) のタプル。
+    """
+    if not isinstance(value, str) or not value:
+        return None, error_response(400, INVALID_REQUEST, "name は必須の非空文字列です")
+    if any(ch in value for ch in _FORBIDDEN_NAME_CHARS):
+        return None, error_response(
+            400,
+            INVALID_REQUEST,
+            "name に ':' および '/' は使用できません",
+        )
+    if len(value) > settings.max_stream_name_length:
+        return None, error_response(
+            400,
+            INVALID_REQUEST,
+            f"name は最大 {settings.max_stream_name_length} 文字までです",
+        )
+    return value, None
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return _now().strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +131,11 @@ class StreamRecord:
     stream_id: str
     created_at: str
     default_ttl: int | None
+    creator_identity: str
     state: Literal["open", "closed"] = "open"
+    # open→closed へ遷移した時刻（ISO8601 UTC、秒精度）。open のうちは None。
+    # idle-GC の猶予計算に使う。冪等な再 close では更新しない（最初の close 時刻を保つ）。
+    closed_at: str | None = None
     members: dict[str, Access] = field(default_factory=dict)
 
 
@@ -80,11 +144,25 @@ class StreamRegistry:
 
     `threading.Lock` で単純に排他する。relay-v2-wire-api.md §0 の R1 原則により disk
     永続化しない（relay 再起動で消える。docs/ARCHITECTURE.md 参照）。
+
+    資源上限（`max_total` / `max_per_identity`）は DoS 防御。`create` 時に registry 全体
+    の登録数と作成者 identity の登録数を検査し、超過すると `ResourceLimitExceeded` を送出
+    する（判定と挿入は同一 lock 下で atomic に行い、並行 create による上限すり抜けを防ぐ）。
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        max_total: int = DEFAULT_MAX_STREAMS_TOTAL,
+        max_per_identity: int = DEFAULT_MAX_STREAMS_PER_IDENTITY,
+    ) -> None:
         self._lock = threading.Lock()
         self._streams: dict[str, StreamRecord] = {}
+        self._max_total = max_total
+        self._max_per_identity = max_per_identity
+        # creator_identity ごとの現存 stream 数。上限判定を O(1) にするため create/evict で
+        # 増減させる。0 になった identity は key を落とす（identity 空間での無制限成長を防ぐ）。
+        # 不変条件: sum(_per_creator_count.values()) == len(_streams)。
+        self._per_creator_count: dict[str, int] = {}
 
     def create(
         self, stream_id: str, creator_identity: str, default_ttl: int | None
@@ -93,16 +171,39 @@ class StreamRegistry:
 
         作成者は bootstrap として write 権限を持つ member として自動登録される
         （wire-api.md §3.1）。
+
+        Raises:
+            ResourceLimitExceeded: registry 総数または作成者 identity の登録数が上限に
+                達している場合（既存 stream_id の再作成は新規スロットを消費しないため
+                この検査より前に None を返す）。
         """
         with self._lock:
             if stream_id in self._streams:
                 return None
+            if len(self._streams) >= self._max_total:
+                raise ResourceLimitExceeded("total")
+            if self._per_creator_count.get(creator_identity, 0) >= self._max_per_identity:
+                raise ResourceLimitExceeded("per_identity")
             record = StreamRecord(
-                stream_id=stream_id, created_at=_now_iso(), default_ttl=default_ttl
+                stream_id=stream_id,
+                created_at=_now_iso(),
+                default_ttl=default_ttl,
+                creator_identity=creator_identity,
             )
             record.members[creator_identity] = "write"
             self._streams[stream_id] = record
+            self._per_creator_count[creator_identity] = (
+                self._per_creator_count.get(creator_identity, 0) + 1
+            )
             return record
+
+    def _decr_creator(self, creator_identity: str) -> None:
+        """`creator_identity` の現存 stream 数を 1 減らす（lock 保持下で呼ぶこと）。"""
+        remaining = self._per_creator_count.get(creator_identity, 0) - 1
+        if remaining <= 0:
+            self._per_creator_count.pop(creator_identity, None)
+        else:
+            self._per_creator_count[creator_identity] = remaining
 
     def get(self, stream_id: str) -> StreamRecord | None:
         with self._lock:
@@ -112,11 +213,48 @@ class StreamRegistry:
         """新規投函を止める（close）。存在しない stream_id は no-op（呼び出し側で 404 判定済み前提）。
 
         close は冪等: 既に closed な stream への再 close は状態を変えず成功扱いにする。
+        `closed_at` は open→closed への遷移時のみ記録し、再 close では上書きしない
+        （idle-GC の猶予起点を最初の close 時刻に固定する）。
         """
         with self._lock:
             record = self._streams.get(stream_id)
-            if record is not None:
+            if record is not None and record.state != "closed":
                 record.state = "closed"
+                record.closed_at = _now_iso()
+
+    def idle_closed_ids(self, older_than_seconds: float) -> list[str]:
+        """close から `older_than_seconds` 秒以上経過した close 済み stream_id の一覧。
+
+        idle-GC の除去候補選定。ここでは「close 済み かつ 猶予経過」だけを判定し、実際の
+        除去は未配達 outbox エントリが drain し切ったことを確認してから `evict` で行う
+        （`relay.delivery._sweep_idle_streams`）。`closed_at` は秒精度の固定幅 ISO8601 UTC
+        文字列なので辞書順比較が時刻順比較に一致する。
+        """
+        cutoff = (_now() - timedelta(seconds=older_than_seconds)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        with self._lock:
+            return [
+                stream_id
+                for stream_id, record in self._streams.items()
+                if record.state == "closed"
+                and record.closed_at is not None
+                and record.closed_at <= cutoff
+            ]
+
+    def evict(self, stream_id: str) -> bool:
+        """close 済み stream を registry から除去する。除去できたら True。
+
+        open な stream（配達継続中で live）や不在 stream は除去せず False を返す。
+        `idle_closed_ids` で候補選定 → outbox drain 確認 → 本メソッドで除去、の順で使う。
+        """
+        with self._lock:
+            record = self._streams.get(stream_id)
+            if record is None or record.state != "closed":
+                return False
+            del self._streams[stream_id]
+            self._decr_creator(record.creator_identity)
+            return True
 
     def put_member(self, stream_id: str, identity: str, access: Access) -> None:
         with self._lock:
@@ -176,6 +314,19 @@ class StreamRegistry:
                 return False
             return record.members.get(identity) in ("read", "read_write")
 
+    def is_member(self, stream_id: str, identity: str) -> bool:
+        """`identity` が当該 stream の member かを access 種別を問わず返す。
+
+        参照系（メタ取得 / member 一覧）の structural authZ に使う。write 単独権限の member
+        （作成者 bootstrap は `access: "write"` で登録される）も member として扱い、自身が
+        属する stream を参照できる。不在 stream は非メンバーと同じく False。
+        """
+        with self._lock:
+            record = self._streams.get(stream_id)
+            if record is None:
+                return False
+            return identity in record.members
+
     def read_members(self, stream_id: str) -> list[str]:
         with self._lock:
             record = self._streams.get(stream_id)
@@ -212,7 +363,14 @@ def get_registry_from_state(app_state) -> StreamRegistry:
     """
     registry = getattr(app_state, "stream_registry", None)
     if registry is None:
-        registry = StreamRegistry()
+        settings: Settings | None = getattr(app_state, "settings", None)
+        if settings is not None:
+            registry = StreamRegistry(
+                max_total=settings.max_streams_total,
+                max_per_identity=settings.max_streams_per_identity,
+            )
+        else:
+            registry = StreamRegistry()
         app_state.stream_registry = registry
     return registry
 
@@ -318,16 +476,20 @@ async def create_stream(request: Request) -> Response:
     if err is not None:
         return err
 
-    stream_id = body.get("stream_id")
-    if not isinstance(stream_id, str) or not stream_id:
-        return error_response(400, INVALID_REQUEST, "stream_id は必須の非空文字列です")
+    name, err = _validate_stream_name(body.get("name"), request.app.state.settings)
+    if err is not None:
+        return err
 
     default_ttl, err = _validate_retain_seconds(body.get("default_ttl"), field_name="default_ttl")
     if err is not None:
         return err
 
+    stream_id = canonical_stream_id(identity.id, name)
     registry = _get_registry(request)
-    record = registry.create(stream_id, identity.id, default_ttl)
+    try:
+        record = registry.create(stream_id, identity.id, default_ttl)
+    except ResourceLimitExceeded as exc:
+        return resource_limit_response("stream", exc.scope)
     if record is None:
         return error_response(
             409, STREAM_ALREADY_EXISTS, f"stream '{stream_id}' は既に存在します"
@@ -344,12 +506,14 @@ async def create_stream(request: Request) -> Response:
 
 @require_authn
 async def get_stream(request: Request) -> Response:
+    identity: Identity = request.state.identity
     stream_id = request.path_params["stream_id"]
     registry = _get_registry(request)
     record = registry.get(stream_id)
-    if record is None:
+    # 非メンバーには存在しない stream_id と同一の 404 を返し、stream の存在を悟らせない
+    # （identity-authz.md §2.1, A2A 1.0 §7.5）。403 での拒否は resource 存在の露呈になる。
+    if record is None or not registry.is_member(stream_id, identity.id):
         return error_response(404, STREAM_NOT_FOUND, f"stream '{stream_id}' が見つかりません")
-    # read は全許可（identity-authz.md §2.1）。membership 照合はしない。
     return JSONResponse(
         {"stream_id": record.stream_id, "state": record.state, "created_at": record.created_at}
     )
@@ -366,7 +530,10 @@ async def close_stream(request: Request) -> Response:
     stream_id = request.path_params["stream_id"]
     registry = _get_registry(request)
     record = registry.get(stream_id)
-    if record is None:
+    # 完全非メンバーには不在の stream_id と同一の 404 を返し、stream の存在を悟らせない
+    # （identity-authz.md §2.2）。403 を返してよいのは、stream の存在を正当に知っている
+    # 権限不足の member のみ。
+    if record is None or not registry.is_member(stream_id, identity.id):
         return error_response(404, STREAM_NOT_FOUND, f"stream '{stream_id}' が見つかりません")
     if not registry.has_write_access(stream_id, identity.id):
         return error_response(
@@ -387,13 +554,33 @@ async def post_stream_message(request: Request) -> Response:
     stream_id = request.path_params["stream_id"]
     registry = _get_registry(request)
 
+    limiter = get_publish_rate_limiter(request.app.state)
+    allowed, retry_after = limiter.allow(identity.id)
+    if not allowed:
+        observability.inc_metric(
+            request.app.state, "relay_publish_failed_total", failure_reason="rate_limited"
+        )
+        response = error_response(
+            429, RATE_LIMIT_EXCEEDED, "投函のレート制限を超過しました"
+        )
+        response.headers["Retry-After"] = str(retry_after)
+        return response
+
     record = registry.get(stream_id)
     if record is None:
         observability.inc_metric(
             request.app.state, "relay_publish_failed_total", failure_reason="stream_not_found"
         )
         return error_response(404, STREAM_NOT_FOUND, f"stream '{stream_id}' が見つかりません")
+    if not registry.is_member(stream_id, identity.id):
+        # 完全非メンバーには不在の stream_id と同一の 404 を返し、stream の存在を悟らせない
+        # （identity-authz.md §2.2）。metric は内部観測用のため真の理由を残す。
+        observability.inc_metric(
+            request.app.state, "relay_publish_failed_total", failure_reason="membership_required"
+        )
+        return error_response(404, STREAM_NOT_FOUND, f"stream '{stream_id}' が見つかりません")
     if not registry.has_write_access(stream_id, identity.id):
+        # 権限不足の member は stream の存在を正当に知っているため 403 で区別してよい。
         observability.inc_metric(
             request.app.state, "relay_publish_failed_total", failure_reason="membership_required"
         )
@@ -444,41 +631,49 @@ async def post_stream_message(request: Request) -> Response:
         body=message_body,
     )
     store = idempotency.get_store(request.app.state)
-    existing_publish_id = store.check(dedup_key)
+    existing_publish_id = await idempotency.resolve_or_reserve(store, dedup_key)
     if existing_publish_id is not None:
         return JSONResponse(
             {"publish_id": existing_publish_id, "matched_members": 0}, status_code=202
         )
 
-    retain_seconds = _ttl if _ttl is not None else (record.default_ttl or DEFAULT_RETAIN_SECONDS)
-    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=retain_seconds)).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
-
-    read_members = registry.read_members(stream_id)
-    payload = message_body.encode("utf-8")
-    now = _now_iso()
-
-    conn = _get_connection(request)
+    # 予約獲得後は finalize / release のどちらかで必ず予約を解消する。CancelledError
+    # でも解放が要るため BaseException で受ける。
     try:
-        cur = conn.execute(
-            "INSERT INTO publish_log (lane, stream_id, publisher_identity, enqueued_at)"
-            " VALUES ('stream', ?, ?, ?)",
-            (stream_id, identity.id, now),
+        retain_seconds = (
+            _ttl if _ttl is not None else (record.default_ttl or DEFAULT_RETAIN_SECONDS)
         )
-        publish_id = cur.lastrowid
-        for member_identity in read_members:
-            conn.execute(
-                "INSERT INTO outbox"
-                " (target_type, stream_id, member_identity, publish_id, payload, enqueued_at,"
-                " expires_at)"
-                " VALUES ('stream', ?, ?, ?, ?, ?, ?)",
-                (stream_id, member_identity, publish_id, payload, now, expires_at),
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=retain_seconds)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+        read_members = registry.read_members(stream_id)
+        payload = message_body.encode("utf-8")
+        now = _now_iso()
+
+        conn = _get_connection(request)
+        try:
+            cur = conn.execute(
+                "INSERT INTO publish_log (lane, stream_id, publisher_identity, enqueued_at)"
+                " VALUES ('stream', ?, ?, ?)",
+                (stream_id, identity.id, now),
             )
-        conn.commit()
-    finally:
-        conn.close()
-    store.register(dedup_key, publish_id)
+            publish_id = cur.lastrowid
+            for member_identity in read_members:
+                conn.execute(
+                    "INSERT INTO outbox"
+                    " (target_type, stream_id, member_identity, publish_id, payload, enqueued_at,"
+                    " expires_at)"
+                    " VALUES ('stream', ?, ?, ?, ?, ?, ?)",
+                    (stream_id, member_identity, publish_id, payload, now, expires_at),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except BaseException:
+        store.release(dedup_key)
+        raise
+    store.finalize(dedup_key, publish_id)
 
     observability.record_event(
         request.app.state,
@@ -489,9 +684,7 @@ async def post_stream_message(request: Request) -> Response:
         stream_id=stream_id,
         matched_members=len(read_members),
     )
-    observability.inc_metric(
-        request.app.state, "relay_publish_received_total", publisher_identity=identity.id
-    )
+    observability.inc_metric(request.app.state, "relay_publish_received_total")
     return JSONResponse(
         {"publish_id": publish_id, "matched_members": len(read_members)}, status_code=202
     )
@@ -509,7 +702,9 @@ async def put_member(request: Request) -> Response:
     registry = _get_registry(request)
 
     record = registry.get(stream_id)
-    if record is None:
+    # 完全非メンバーには不在の stream_id と同一の 404 を返し、stream の存在を悟らせない
+    # （identity-authz.md §2.2）。403 は存在を正当に知っている権限不足 member 専用。
+    if record is None or not registry.is_member(stream_id, identity.id):
         return error_response(404, STREAM_NOT_FOUND, f"stream '{stream_id}' が見つかりません")
     if not registry.has_write_access(stream_id, identity.id):
         return error_response(
@@ -548,7 +743,10 @@ async def delete_member(request: Request) -> Response:
     registry = _get_registry(request)
 
     record = registry.get(stream_id)
-    if record is None:
+    # 完全非メンバーには不在の stream_id と同一の 404 を返し、stream の存在を悟らせない
+    # （identity-authz.md §2.2）。自己離脱パスより先に判定するため、非メンバーの自己離脱
+    # 試行も 404 になる（204 を返すと存在の露呈になる）。
+    if record is None or not registry.is_member(stream_id, identity.id):
         return error_response(404, STREAM_NOT_FOUND, f"stream '{stream_id}' が見つかりません")
 
     target_identity = request.query_params.get("identity")
@@ -584,12 +782,16 @@ async def delete_member(request: Request) -> Response:
 
 @require_authn
 async def list_members(request: Request) -> Response:
+    identity: Identity = request.state.identity
     stream_id = request.path_params["stream_id"]
     registry = _get_registry(request)
+    # 非メンバーには存在しない stream_id と同一の 404 を返し、member 構成を露呈しない
+    # （identity-authz.md §2.1, A2A 1.0 §7.5）。
+    if not registry.is_member(stream_id, identity.id):
+        return error_response(404, STREAM_NOT_FOUND, f"stream '{stream_id}' が見つかりません")
     members = registry.list_members(stream_id)
     if members is None:
         return error_response(404, STREAM_NOT_FOUND, f"stream '{stream_id}' が見つかりません")
-    # read は全許可（identity-authz.md §2.1）。membership 照合はしない。
     return JSONResponse({"members": members})
 
 
