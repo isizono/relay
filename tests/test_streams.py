@@ -699,6 +699,43 @@ class TestPostStreamMessage:
         assert r.json()["matched_members"] == 0
 
 
+class TestPostStreamMessageRateLimit:
+    """stream レーン投函（POST /streams/{id}/messages）の per-identity rate limit。"""
+
+    @pytest.fixture()
+    def limited_client(self, tmp_path):
+        settings = Settings(
+            db_path=str(tmp_path / "srl.db"),
+            server_log_path=str(tmp_path / "srl.jsonl"),
+            dispatcher_lock_path=str(tmp_path / "srl.lock"),
+            auth_tokens={"tok-a": "agent-a"},
+            publish_rate_limit_per_second=1,
+        )
+        app = create_app(settings)
+        with TestClient(app) as c:
+            yield c
+
+    def test_within_limit_returns_202(self, limited_client):
+        limited_client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        r = limited_client.post(
+            "/streams/s1/messages", json={"body": "m1"}, headers=_auth("tok-a")
+        )
+        assert r.status_code == 202
+
+    def test_over_limit_returns_429_with_retry_after(self, limited_client):
+        limited_client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        ok = limited_client.post(
+            "/streams/s1/messages", json={"body": "m1"}, headers=_auth("tok-a")
+        )
+        assert ok.status_code == 202
+        limited = limited_client.post(
+            "/streams/s1/messages", json={"body": "m2"}, headers=_auth("tok-a")
+        )
+        assert limited.status_code == 429
+        assert limited.json()["code"] == "RateLimitExceededError"
+        assert "Retry-After" in limited.headers
+
+
 class TestAckStream:
     def test_read_member_can_ack_and_deletes_outbox_entries(self, client, settings):
         import sqlite3

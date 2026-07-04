@@ -64,6 +64,14 @@ DEFAULT_MAX_STREAMS_PER_IDENTITY = 1000
 DEFAULT_MAX_SUBSCRIPTIONS_TOTAL = 20000
 DEFAULT_MAX_SUBSCRIPTIONS_PER_IDENTITY = 1000
 
+# publish / subscribe の入力フィールド上限（DoS 防御）。無制限の title 文字列や大量の
+# label は registry / outbox のメモリを膨らませる。値は routing key（label）と表示用
+# 見出し（title）の実運用サイズを目安にした現実的な初期値で、いずれも設定可能。
+# title 上限 200 は relay-v2-wire-api.md §5.4 の記載（max 200 UTF-8 chars）に揃える。
+DEFAULT_MAX_TITLE_LENGTH = 200
+DEFAULT_MAX_LABELS_COUNT = 32
+DEFAULT_MAX_LABEL_LENGTH = 128
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -106,6 +114,11 @@ class Settings:
     max_streams_per_identity: int = DEFAULT_MAX_STREAMS_PER_IDENTITY
     max_subscriptions_total: int = DEFAULT_MAX_SUBSCRIPTIONS_TOTAL
     max_subscriptions_per_identity: int = DEFAULT_MAX_SUBSCRIPTIONS_PER_IDENTITY
+
+    # 入力フィールド上限（DoS 防御）
+    max_title_length: int = DEFAULT_MAX_TITLE_LENGTH
+    max_labels_count: int = DEFAULT_MAX_LABELS_COUNT
+    max_label_length: int = DEFAULT_MAX_LABEL_LENGTH
 
 
 def _load_auth_tokens_from_env() -> dict[str, str]:
@@ -201,6 +214,15 @@ def load_settings_from_env() -> Settings:
                 "RELAY_MAX_SUBSCRIPTIONS_PER_IDENTITY",
                 DEFAULT_MAX_SUBSCRIPTIONS_PER_IDENTITY,
             )
+        ),
+        max_title_length=int(
+            os.environ.get("RELAY_MAX_TITLE_LENGTH", DEFAULT_MAX_TITLE_LENGTH)
+        ),
+        max_labels_count=int(
+            os.environ.get("RELAY_MAX_LABELS_COUNT", DEFAULT_MAX_LABELS_COUNT)
+        ),
+        max_label_length=int(
+            os.environ.get("RELAY_MAX_LABEL_LENGTH", DEFAULT_MAX_LABEL_LENGTH)
         ),
     )
 

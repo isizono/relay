@@ -491,13 +491,13 @@ stream レーン・subscription レーン共通の in-memory dedup store
 wire-api.md §6.3 の擬似キー補完式（`publisher_identity` / scope（stream_id か ref の
 正規化 JSON）/ labels 正規化 / body・title の hash / 受信秒精度 ts）で擬似キーを計算する。
 
-### rate limiting（`POST /publish`、`RateLimiter`）
+### rate limiting（`POST /publish` / `POST /streams/{id}/messages`、`RateLimiter`）
 
-`subscriptions.py` に token bucket 方式の `RateLimiter`（`app.state.publish_rate_limiter`、
-publisher identity ごと）を実装し、`POST /publish` に適用した（wire-api.md §5.4、既定
-100 req/sec、超過時 `429` + `Retry-After` ヘッダ）。`POST /streams/{id}/messages`
-（場投函）への適用は wire-api.md §10 が「残置（実装段階で詰める）」と明記しているため、
-本タスクでは見送った（Resources 実装のまま）。
+`ratelimit.py` に token bucket 方式の `RateLimiter`（`app.state.publish_rate_limiter`、
+publisher identity ごと）を実装し、両 publish レーン（subscription レーン `POST /publish` と
+stream レーン `POST /streams/{id}/messages`）に適用する（wire-api.md §5.4 / §3.2、既定
+100 req/sec、超過時 `429` + `Retry-After` ヘッダ）。両レーンは同一の limiter インスタンスを
+共有するため、1 publisher の publish 流量は両レーン合算で制限される。
 
 ### structured log / server log（`relay/observability.py`）
 

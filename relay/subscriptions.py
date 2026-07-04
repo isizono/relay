@@ -22,7 +22,6 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -55,6 +54,7 @@ from relay.errors import (
     resource_limit_response,
 )
 from relay.identity import Identity, require_authn
+from relay.ratelimit import get_publish_rate_limiter
 
 
 def _now() -> datetime:
@@ -254,44 +254,37 @@ def _get_connection(request: Request) -> sqlite3.Connection:
 
 
 # ---------------------------------------------------------------------------
-# publish レート制限（relay-v2-wire-api.md §5.4、publisher ごと token bucket）
-# ---------------------------------------------------------------------------
-
-
-class RateLimiter:
-    """publisher identity ごとの token bucket rate limiter。"""
-
-    def __init__(self, rate_per_second: int) -> None:
-        self._rate = max(1, rate_per_second)
-        self._lock = threading.Lock()
-        self._buckets: dict[str, tuple[float, float]] = {}
-
-    def allow(self, identity: str) -> tuple[bool, int]:
-        """許可なら `(True, 0)`、拒否なら `(False, retry_after_seconds)`。"""
-        now = time.monotonic()
-        with self._lock:
-            tokens, last = self._buckets.get(identity, (float(self._rate), now))
-            tokens = min(float(self._rate), tokens + (now - last) * self._rate)
-            if tokens >= 1.0:
-                self._buckets[identity] = (tokens - 1.0, now)
-                return True, 0
-            self._buckets[identity] = (tokens, now)
-            retry_after = max(1, int((1.0 - tokens) / self._rate) + 1)
-            return False, retry_after
-
-
-def _get_rate_limiter(request: Request) -> RateLimiter:
-    limiter = getattr(request.app.state, "publish_rate_limiter", None)
-    if limiter is None:
-        settings: Settings = request.app.state.settings
-        limiter = RateLimiter(settings.publish_rate_limit_per_second)
-        request.app.state.publish_rate_limiter = limiter
-    return limiter
-
-
-# ---------------------------------------------------------------------------
 # バリデーションヘルパ
 # ---------------------------------------------------------------------------
+
+
+def _validate_label_caps(labels: list[str], settings: Settings) -> Response | None:
+    """labels の個数上限と各 label の文字列長上限を検査する（型チェック済み前提）。"""
+    if len(labels) > settings.max_labels_count:
+        return error_response(
+            400,
+            LABEL_VALIDATION,
+            f"labels は最大 {settings.max_labels_count} 個までです",
+        )
+    for label in labels:
+        if len(label) > settings.max_label_length:
+            return error_response(
+                400,
+                LABEL_VALIDATION,
+                f"label は 1 個あたり最大 {settings.max_label_length} 文字までです",
+            )
+    return None
+
+
+def _validate_title_cap(title: str, settings: Settings) -> Response | None:
+    """title の文字列長上限を検査する（型チェック済み前提）。"""
+    if len(title) > settings.max_title_length:
+        return error_response(
+            400,
+            INVALID_REQUEST,
+            f"title は最大 {settings.max_title_length} 文字までです",
+        )
+    return None
 
 
 async def _read_json_body(request: Request) -> tuple[dict, Response | None]:
@@ -350,6 +343,7 @@ def _validate_retain_seconds(value: object) -> tuple[int | None, Response | None
 @require_authn
 async def create_subscription(request: Request) -> Response:
     identity: Identity = request.state.identity
+    settings: Settings = request.app.state.settings
     body, err = await _read_json_body(request)
     if err is not None:
         return err
@@ -369,6 +363,9 @@ async def create_subscription(request: Request) -> Response:
         return error_response(400, LABEL_VALIDATION, "labels は非空配列で指定してください（firehose 防止）")
     if not all(isinstance(label, str) for label in labels):
         return error_response(400, LABEL_VALIDATION, "labels は文字列の配列で指定してください")
+    err = _validate_label_caps(labels, settings)
+    if err is not None:
+        return err
 
     lease_ttl, err = _validate_lease_ttl(body.get("lease_ttl"))
     if err is not None:
@@ -535,7 +532,7 @@ async def publish(request: Request) -> Response:
     identity: Identity = request.state.identity
     settings: Settings = request.app.state.settings
 
-    limiter = _get_rate_limiter(request)
+    limiter = get_publish_rate_limiter(request.app.state)
     allowed, retry_after = limiter.allow(identity.id)
     if not allowed:
         observability.inc_metric(
@@ -567,6 +564,12 @@ async def publish(request: Request) -> Response:
             request.app.state, "relay_publish_failed_total", failure_reason="invalid_request"
         )
         return error_response(400, INVALID_REQUEST, "labels は文字列の配列で指定してください")
+    err = _validate_label_caps(labels, settings)
+    if err is not None:
+        observability.inc_metric(
+            request.app.state, "relay_publish_failed_total", failure_reason="invalid_request"
+        )
+        return err
 
     title = body.get("title")
     if title is not None and not isinstance(title, str):
@@ -574,6 +577,13 @@ async def publish(request: Request) -> Response:
             request.app.state, "relay_publish_failed_total", failure_reason="invalid_request"
         )
         return error_response(400, INVALID_REQUEST, "title は文字列で指定してください")
+    if title is not None:
+        err = _validate_title_cap(title, settings)
+        if err is not None:
+            observability.inc_metric(
+                request.app.state, "relay_publish_failed_total", failure_reason="invalid_request"
+            )
+            return err
 
     idempotency_key = body.get("idempotency_key")
     if idempotency_key is not None and not isinstance(idempotency_key, str):

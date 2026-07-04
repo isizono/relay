@@ -766,3 +766,102 @@ class TestPublish:
             )
             assert limited.status_code == 429
             assert "Retry-After" in limited.headers
+
+
+class TestInputFieldCaps:
+    """title 文字列長・labels 個数・label 文字列長のサーバー側上限（POST /subscriptions,
+    POST /publish）。上限内は通り、超過は 400 で拒否されることを検証する。
+    """
+
+    @pytest.fixture()
+    def capped_client(self, tmp_path):
+        from relay.config import Settings
+
+        settings = Settings(
+            db_path=str(tmp_path / "caps.db"),
+            server_log_path=str(tmp_path / "caps.jsonl"),
+            dispatcher_lock_path=str(tmp_path / "caps.lock"),
+            auth_tokens={"tok-a": "agent-a"},
+            max_title_length=10,
+            max_labels_count=3,
+            max_label_length=5,
+        )
+        app = create_app(settings)
+        with TestClient(app) as c:
+            yield c
+
+    # --- POST /subscriptions ---
+
+    def test_subscribe_labels_count_over_cap_returns_400(self, capped_client):
+        r = capped_client.post(
+            "/subscriptions",
+            json={"subscriber": "agent-a", "labels": ["a", "b", "c", "d"]},
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 400
+        assert r.json()["code"] == "LabelValidationError"
+
+    def test_subscribe_label_length_over_cap_returns_400(self, capped_client):
+        r = capped_client.post(
+            "/subscriptions",
+            json={"subscriber": "agent-a", "labels": ["toolong"]},
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 400
+        assert r.json()["code"] == "LabelValidationError"
+
+    def test_subscribe_at_cap_boundary_accepted(self, capped_client):
+        r = capped_client.post(
+            "/subscriptions",
+            json={"subscriber": "agent-a", "labels": ["aaaaa", "b", "c"]},
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 201
+
+    # --- POST /publish ---
+
+    def test_publish_labels_count_over_cap_returns_400(self, capped_client):
+        r = capped_client.post(
+            "/publish",
+            json={
+                "ref": {"type": "decision", "id": 1},
+                "labels": ["a", "b", "c", "d"],
+            },
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 400
+        assert r.json()["code"] == "LabelValidationError"
+
+    def test_publish_label_length_over_cap_returns_400(self, capped_client):
+        r = capped_client.post(
+            "/publish",
+            json={"ref": {"type": "decision", "id": 1}, "labels": ["toolong"]},
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 400
+        assert r.json()["code"] == "LabelValidationError"
+
+    def test_publish_title_length_over_cap_returns_400(self, capped_client):
+        r = capped_client.post(
+            "/publish",
+            json={
+                "ref": {"type": "decision", "id": 1},
+                "labels": ["x"],
+                "title": "x" * 11,
+            },
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 400
+        assert r.json()["code"] == "InvalidRequestError"
+
+    def test_publish_at_cap_boundary_accepted(self, capped_client):
+        r = capped_client.post(
+            "/publish",
+            json={
+                "ref": {"type": "decision", "id": 1},
+                "labels": ["aaaaa", "b", "c"],
+                "title": "x" * 10,
+            },
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 202

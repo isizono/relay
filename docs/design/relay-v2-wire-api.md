@@ -128,6 +128,7 @@ Body: { body: <bytes | UTF-8 text>, ttl?: <seconds>, idempotency_key?: <string> 
 → 403 Forbidden   (投函者が write 権限を持つ member でない)
 → 404 Not Found   (場が存在しない / close 済みで露呈回避)
 → 410 Gone        (場が close 済み、新規投函拒否)
+→ 429 Too Many Requests { Retry-After }   (publisher ごと rate limit 超過, default 100 req/sec。§5.4 と共通)
 ```
 
 - 投函者 identity は HTTP 認証で確定（§identity 別書 FR-5）。
@@ -140,6 +141,8 @@ Body: { body: <bytes | UTF-8 text>, ttl?: <seconds>, idempotency_key?: <string> 
   決まる。投函者自身も read 権限を持てば配達対象に含む（自己メッセージの無視は subscriber 側の判断）。
 - **stream_seq は付与しない**（廃止）。場メッセージも subscription レーンと同じ `publish_id`
   （グローバル単調）で識別・順序づけされる（§4）。
+- 投函には §5.4 の publisher ごと rate limit を掛ける（subscription レーン `POST /publish` と
+  同一の token bucket を publisher identity 単位で共有する。超過は `429` + `Retry-After`）。
 
 ### 3.3 membership API
 
@@ -202,7 +205,7 @@ R1 + 本書 §0.1 により **`publish_id` 1 系統**に確定。
 POST /subscriptions
 Body: {
   subscriber: <identity>,            // 認証済みハンドル
-  labels: [<string>, ...],           // 順序無視・重複削除して set 扱い。空配列は 400
+  labels: [<string>, ...],           // 順序無視・重複削除して set 扱い。空配列は 400。個数/文字列長上限あり（§6.9）
   lease_ttl?: <seconds>,             // default 300, min 30, max 86400
   delivery_options?: {
     retain_seconds?: <int>           // outbox エントリの保持上限秒数。default 86400(24h), min 60, max 86400（§6.4）
@@ -259,11 +262,12 @@ DELETE /subscriptions/{subscription_id}
 POST /publish
 Body: {
   ref: { type: <string>, id: <int | string> },
-  labels: [<string>, ...],
-  title?: <string>,                  // max 200 UTF-8 chars, relay は truncate しない（publisher 責任）
+  labels: [<string>, ...],           // 個数上限・1 個あたり文字列長上限あり（§6.9）
+  title?: <string>,                  // 文字列長上限あり。超過は 400（relay は truncate せず拒否、§6.9）
   idempotency_key?: <string>         // 15 分内同一キーは dedup
 }
 → 202 Accepted { publish_id, matched_subscriptions: <int> }
+→ 400 Bad Request   (labels 上限超過 = LabelValidationError / title 上限超過 = InvalidRequestError。§6.9)
 → 429 Too Many Requests { Retry-After }   (publisher ごと rate limit 超過, default 100 req/sec)
 ```
 
@@ -442,6 +446,18 @@ relay のメモリを枯渇させられる。両 registry に以下を課す。
   未配達メッセージの配達経路を絶たない）。除去は dispatcher の polling cycle（§6.2）で駆動する。
   除去は warn 構造化ログ（§7.3）で観測する。
 
+### 6.9 入力フィールド上限（DoS 防御）
+
+無制限の `title` 文字列や大量の `label` は registry / outbox のメモリを膨らませられる。個々の
+入力フィールドに以下の上限を課す（`payload` 全体のサイズ上限は別途、§8 の `413` 系で扱う）。
+
+- **title**: 文字列長の上限（`POST /publish`）。超過は `400`（`InvalidRequestError`）。relay は
+  truncate せず拒否する（暗黙の切り詰めで publisher の意図を書き換えない）。
+- **labels**: 配列の要素数上限と、各 label の文字列長上限（`POST /publish` / `POST /subscriptions`）。
+  超過は `400`（`LabelValidationError`）。
+- 上限値は設定可能で、既定は routing key（label）と表示用見出し（title）の実運用サイズを目安に
+  置く。
+
 ---
 
 ## 7. observability
@@ -534,7 +550,6 @@ publisher → POST /publish { ref, labels, title?, idempotency_key? }
 - **マッチング性能**: subset 判定を 10,000 subscriptions × 100 labels で p99 200ms に収める（inverted index 等）。
 - **場メンバーの SSE 受信開始**: `GET /events` に member の場を自動含めるか、明示 `stream_ids=` も受けるか（本書は「認証 identity の member 場を自動含む」前提。明示指定オプションは実装段階で要否判断）。
 - **物理 schema / engine**: outbox table 定義・SQLite vs LMDB（A#1193 確定待ち）。
-- **rate limit の場投函への適用**: §5.4 の publisher rate limit を場投函にも掛けるか。
 
 ---
 

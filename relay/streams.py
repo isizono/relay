@@ -51,6 +51,7 @@ from relay.config import (
 from relay.errors import (
     INVALID_REQUEST,
     MEMBERSHIP_REQUIRED,
+    RATE_LIMIT_EXCEEDED,
     STREAM_ALREADY_EXISTS,
     STREAM_GONE,
     STREAM_NOT_FOUND,
@@ -59,6 +60,7 @@ from relay.errors import (
     resource_limit_response,
 )
 from relay.identity import Identity, require_authn
+from relay.ratelimit import get_publish_rate_limiter
 
 Access = Literal["read", "write", "read_write"]
 _VALID_ACCESS: frozenset[str] = frozenset({"read", "write", "read_write"})
@@ -446,6 +448,18 @@ async def post_stream_message(request: Request) -> Response:
     identity: Identity = request.state.identity
     stream_id = request.path_params["stream_id"]
     registry = _get_registry(request)
+
+    limiter = get_publish_rate_limiter(request.app.state)
+    allowed, retry_after = limiter.allow(identity.id)
+    if not allowed:
+        observability.inc_metric(
+            request.app.state, "relay_publish_failed_total", failure_reason="rate_limited"
+        )
+        response = error_response(
+            429, RATE_LIMIT_EXCEEDED, "投函のレート制限を超過しました"
+        )
+        response.headers["Retry-After"] = str(retry_after)
+        return response
 
     record = registry.get(stream_id)
     if record is None:
