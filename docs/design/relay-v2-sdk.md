@@ -472,6 +472,8 @@ reconciliation の本筋ロジック（labels → 内部 tool 呼び出しの翻
 - 30 秒以内に何も読まれなければ TCP close と扱う（relay 側 keepalive 間隔は 30 秒、機能要件 v3 FR-4.6）。
 - event 単位の dedup は `(subscription_id, publish_id)` で行う。SDK 内に LRU set（直近 10000 件）を持つ。
 - 再接続の指数バックオフは §3.4 参照。
+- **不正フレーム耐性**: server 由来の 1 フレームの破損（壊れた JSON / payload が object でない / `publish_id` 欠落・型不正 / `ref` `labels` の型不正）で受信ループを落とさない。当該フレームを warning ログ付きで skip し、受信を継続する。
+- **受信量上限**: 生 wire に対して 2 つの上限を課し、memory を無制限に食わない。1 frame の `data` 累積 byte 数（`SSE_MAX_FRAME_BYTES`、既定 1 MiB）と、改行未達のまま 1 行としてバッファできる byte 数（`SSE_MAX_BUFFER_BYTES`、既定 1 MiB）。超過した frame は破棄して warning ログを出し、次の frame 境界で同期を回復して受信を継続する。
 
 ### 4.3 JWS 署名生成 / 検証
 

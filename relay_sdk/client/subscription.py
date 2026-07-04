@@ -22,7 +22,7 @@ from typing import Callable, Iterator, Sequence
 import httpx
 
 from relay_sdk import config as sdk_config
-from relay_sdk.client.sse import parse_sse_lines
+from relay_sdk.client.sse import parse_sse_byte_stream
 from relay_sdk.errors import PermanentError, RelayProtocolError, TransientError
 from relay_sdk.http import (
     delete_subscription,
@@ -337,7 +337,11 @@ class Subscription:
                 raise_for_sse_status(resp)  # 404/410 → PermanentError, 5xx → TransientError
                 self._response = resp
                 try:
-                    for frame in parse_sse_lines(resp.iter_lines()):
+                    for frame in parse_sse_byte_stream(
+                        resp.iter_bytes(),
+                        max_frame_bytes=sdk_config.SSE_MAX_FRAME_BYTES,
+                        max_buffer_bytes=sdk_config.SSE_MAX_BUFFER_BYTES,
+                    ):
                         if self._closed:
                             return
                         self._attempt = 0  # bytes 受信 = 接続健全。backoff をリセット。
@@ -345,6 +349,13 @@ class Subscription:
                         # （event 専用の分岐にすると、event が keepalive 間隔より
                         # 高頻度に届く状況で lease renew も ack retry も発火しなくなる）。
                         self._run_periodic_maintenance()
+                        if frame.kind == "overflow":
+                            # 受信量上限超過で破棄した frame。受信は継続する。
+                            _events_logger.warning(
+                                "SSE frame を破棄しました（受信量上限超過, subscription=%s）",
+                                self._subscription_id,
+                            )
+                            continue
                         if frame.kind == "comment":
                             continue
                         if frame.event != "notification" or not frame.data:
@@ -364,13 +375,35 @@ class Subscription:
             raise TransientError(f"SSE 接続エラー: {exc}") from exc
 
     def _handle_notification(self, data_str: str) -> Event | None:
-        data = json.loads(data_str)
+        # 不正フレーム（壊れた JSON / 型不整合 / 必須フィールド欠落）は skip して受信を
+        # 継続する。サーバ由来の 1 フレームの破損が受信ループ全体を落とさないようにする。
+        try:
+            data = json.loads(data_str)
+        except ValueError:  # JSONDecodeError を含む
+            _events_logger.warning(
+                "SSE frame を skip しました（不正な JSON payload, subscription=%s）",
+                self._subscription_id,
+            )
+            return None
+        if not isinstance(data, dict):
+            _events_logger.warning(
+                "SSE frame を skip しました（payload が object でない, subscription=%s）",
+                self._subscription_id,
+            )
+            return None
         target = data.get("delivery_target", "")
-        if not target.startswith("sub:"):
+        if not isinstance(target, str) or not target.startswith("sub:"):
             # 場レーン（body のみ）は Event 型（ref ベース）の対象外。subscribe() は
             # subscription を張るだけで場 membership を張らないため通常到達しない。
             return None
-        publish_id = data["publish_id"]
+        publish_id = data.get("publish_id")
+        # publish_id は dedup key / ack カーソルに使うため int 必須（bool は除外）。
+        if not isinstance(publish_id, int) or isinstance(publish_id, bool):
+            _events_logger.warning(
+                "SSE frame を skip しました（publish_id 欠落/不正, subscription=%s）",
+                self._subscription_id,
+            )
+            return None
         key = (self._subscription_id, publish_id)
         if key in self._seen:
             _events_logger.debug(
@@ -381,10 +414,14 @@ class Subscription:
             return None
         self._seen_add(key)
 
-        ref = data.get("ref") or {}
+        ref = data.get("ref")
+        if not isinstance(ref, dict):
+            ref = {}
         ref_type = ref.get("type", "")
         ref_id = ref.get("id", "")
-        labels = data.get("labels") or []
+        labels = data.get("labels")
+        if not isinstance(labels, list):
+            labels = []
         title = data.get("title")
 
         # yield 前に INFO 記録（handler が例外で落ちても受信文脈がログに残る、§3.2.1）。
