@@ -10,11 +10,15 @@ import os
 
 # §6 の default 値。
 DEFAULT_POLL_INTERVAL_SECONDS = 0.5
-DEFAULT_MAX_RETRY = 5
-DEFAULT_INITIAL_BACKOFF_SECONDS = 0.1
-DEFAULT_BACKOFF_FACTOR = 2.0
+# outbox retry は Full Jitter（base=1s, cap=300s）。恒久的失敗は即 DLQ、一時的失敗は
+# TRANSIENT_RETRY_DEADLINE_SECONDS（既定 24h）再送し続けてもダメなら DLQ。
+DEFAULT_RETRY_BACKOFF_BASE_SECONDS = 1.0
+DEFAULT_RETRY_BACKOFF_CAP_SECONDS = 300.0
+DEFAULT_TRANSIENT_RETRY_DEADLINE_SECONDS = 86400.0
 DEFAULT_DLQ_GC_INTERVAL_SECONDS = 3600.0
 DEFAULT_SSE_KEEPALIVE_SECONDS = 30.0
+# SSE 再接続も Full Jitter（base=1s, cap=30s）。回数ベースの諦めは撤去、死活判定は lease に一本化。
+DEFAULT_SSE_RECONNECT_BACKOFF_BASE_SECONDS = 1.0
 DEFAULT_SSE_RECONNECT_BACKOFF_CAP_SECONDS = 30.0
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
 
@@ -31,11 +35,6 @@ DEDUP_LRU_SIZE = 10000
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
     return float(raw) if raw not in (None, "") else default
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    return int(raw) if raw not in (None, "") else default
 
 
 def env_base_url(explicit: str | None) -> str:
@@ -57,19 +56,21 @@ def env_poll_interval_seconds() -> float:
     return int(ms) / 1000.0
 
 
-def env_max_retry() -> int:
-    return _env_int("RELAY_OUTBOX_MAX_RETRY", DEFAULT_MAX_RETRY)
-
-
-def env_initial_backoff_seconds() -> float:
-    ms = os.environ.get("RELAY_OUTBOX_INITIAL_BACKOFF_MS")
+def env_retry_backoff_base_seconds() -> float:
+    ms = os.environ.get("RELAY_OUTBOX_RETRY_BACKOFF_BASE_MS")
     if ms in (None, ""):
-        return DEFAULT_INITIAL_BACKOFF_SECONDS
+        return DEFAULT_RETRY_BACKOFF_BASE_SECONDS
     return int(ms) / 1000.0
 
 
-def env_backoff_factor() -> float:
-    return _env_float("RELAY_OUTBOX_BACKOFF_FACTOR", DEFAULT_BACKOFF_FACTOR)
+def env_retry_backoff_cap_seconds() -> float:
+    return _env_float("RELAY_OUTBOX_RETRY_BACKOFF_CAP_S", DEFAULT_RETRY_BACKOFF_CAP_SECONDS)
+
+
+def env_transient_retry_deadline_seconds() -> float:
+    return _env_float(
+        "RELAY_OUTBOX_TRANSIENT_RETRY_DEADLINE_S", DEFAULT_TRANSIENT_RETRY_DEADLINE_SECONDS
+    )
 
 
 def env_dlq_gc_interval_seconds() -> float:
@@ -80,10 +81,10 @@ def env_sse_keepalive_seconds() -> float:
     return _env_float("RELAY_SSE_KEEPALIVE_S", DEFAULT_SSE_KEEPALIVE_SECONDS)
 
 
-def env_reconnect_max_attempts() -> int | None:
-    """`RELAY_SSE_RECONNECT_MAX_ATTEMPTS`。`0` は無限（None）として扱う（§6）。"""
-    n = _env_int("RELAY_SSE_RECONNECT_MAX_ATTEMPTS", 0)
-    return None if n == 0 else n
+def env_sse_reconnect_backoff_base_seconds() -> float:
+    return _env_float(
+        "RELAY_SSE_RECONNECT_BACKOFF_BASE_S", DEFAULT_SSE_RECONNECT_BACKOFF_BASE_SECONDS
+    )
 
 
 def env_reconnect_backoff_cap_seconds() -> float:

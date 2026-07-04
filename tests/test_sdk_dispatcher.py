@@ -52,8 +52,8 @@ class TestDispatchCycle:
 
         with _mock_client(handler) as client:
             delivered = _dispatch_once(
-                conn, client, max_retry=5, initial_backoff_seconds=0.01,
-                backoff_factor=2.0, backoff_until={},
+                conn, client, retry_backoff_base_seconds=0.01, retry_backoff_cap_seconds=300.0,
+                transient_retry_deadline_seconds=86400.0, backoff_until={},
             )
         assert delivered == 1
         row = conn.execute("SELECT * FROM relay_outbox WHERE id = ?", (row_id,)).fetchone()
@@ -68,8 +68,8 @@ class TestDispatchCycle:
 
         with _mock_client(handler) as client:
             _dispatch_once(
-                conn, client, max_retry=5, initial_backoff_seconds=0.01,
-                backoff_factor=2.0, backoff_until={},
+                conn, client, retry_backoff_base_seconds=0.01, retry_backoff_cap_seconds=300.0,
+                transient_retry_deadline_seconds=86400.0, backoff_until={},
             )
         row = conn.execute("SELECT * FROM relay_outbox WHERE id = ?", (row_id,)).fetchone()
         assert row["dead_at"] is not None
@@ -85,13 +85,15 @@ class TestDispatchCycle:
         backoff_until: dict[int, float] = {}
         with _mock_client(handler) as client:
             _dispatch_once(
-                conn, client, max_retry=5, initial_backoff_seconds=10.0,
-                backoff_factor=2.0, backoff_until=backoff_until,
+                conn, client, retry_backoff_base_seconds=10.0, retry_backoff_cap_seconds=300.0,
+                transient_retry_deadline_seconds=86400.0, backoff_until=backoff_until,
             )
         row = conn.execute("SELECT * FROM relay_outbox WHERE id = ?", (row_id,)).fetchone()
         assert row["retry_count"] == 1
         assert row["dead_at"] is None
         assert row_id in backoff_until  # 次回 polling まで待つ
+        # Full Jitter: [0, min(cap, base * 2**0)] = [0, 10] に収まる。
+        assert 0.0 <= backoff_until[row_id] - time.monotonic() <= 10.0
 
     def test_backoff_gates_retry(self, conn):
         """backoff 中の行は同一 cycle で再送されない。"""
@@ -103,15 +105,19 @@ class TestDispatchCycle:
             return httpx.Response(503)
 
         with _mock_client(handler) as client:
-            _dispatch_once(conn, client, max_retry=5, initial_backoff_seconds=100.0,
-                           backoff_factor=2.0, backoff_until={})
+            _dispatch_once(conn, client, retry_backoff_base_seconds=100.0,
+                           retry_backoff_cap_seconds=300.0,
+                           transient_retry_deadline_seconds=86400.0, backoff_until={})
             # まだ backoff 中（100s）なので次 cycle では POST が発生しない。
             backoff = {row_id: time.monotonic() + 100.0}
-            _dispatch_once(conn, client, max_retry=5, initial_backoff_seconds=100.0,
-                           backoff_factor=2.0, backoff_until=backoff)
+            _dispatch_once(conn, client, retry_backoff_base_seconds=100.0,
+                           retry_backoff_cap_seconds=300.0,
+                           transient_retry_deadline_seconds=86400.0, backoff_until=backoff)
         assert calls["n"] == 1
 
-    def test_transient_reaches_max_retry_then_dead(self, conn):
+    def test_transient_within_deadline_keeps_retrying(self, conn):
+        """24h（既定 transient_retry_deadline_seconds）以内は retry 回数によらず dead 化しない
+        回帰テスト（旧実装は max_retry=5 回で機械的に dead 化していた）。"""
         row_id = _enqueue(conn)
 
         def handler(request):
@@ -122,11 +128,35 @@ class TestDispatchCycle:
             for _ in range(5):
                 backoff_until.clear()  # backoff を無効化して即リトライさせる
                 _dispatch_once(
-                    conn, client, max_retry=5, initial_backoff_seconds=0.0,
-                    backoff_factor=2.0, backoff_until=backoff_until,
+                    conn, client, retry_backoff_base_seconds=0.0, retry_backoff_cap_seconds=300.0,
+                    transient_retry_deadline_seconds=86400.0, backoff_until=backoff_until,
                 )
         row = conn.execute("SELECT * FROM relay_outbox WHERE id = ?", (row_id,)).fetchone()
         assert row["retry_count"] == 5
+        assert row["dead_at"] is None
+
+    def test_transient_reaches_deadline_then_dead(self, conn):
+        """created_at から transient_retry_deadline_seconds を過ぎた行は、次の transient
+        failure で dead 化する（enqueue から 24h 再送し続けてもダメなら DLQ、§2.1）。"""
+        row_id = _enqueue(conn)
+        old_created_at = (datetime.now(timezone.utc) - timedelta(hours=25)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        conn.execute(
+            "UPDATE relay_outbox SET created_at = ? WHERE id = ?", (old_created_at, row_id)
+        )
+        conn.commit()
+
+        def handler(request):
+            return httpx.Response(503)
+
+        with _mock_client(handler) as client:
+            _dispatch_once(
+                conn, client, retry_backoff_base_seconds=0.01, retry_backoff_cap_seconds=300.0,
+                transient_retry_deadline_seconds=86400.0, backoff_until={},
+            )
+        row = conn.execute("SELECT * FROM relay_outbox WHERE id = ?", (row_id,)).fetchone()
+        assert row["retry_count"] == 1
         assert row["dead_at"] is not None
 
     def test_429_respects_retry_after(self, conn):
@@ -138,9 +168,10 @@ class TestDispatchCycle:
         backoff_until: dict[int, float] = {}
         before = time.monotonic()
         with _mock_client(handler) as client:
-            _dispatch_once(conn, client, max_retry=5, initial_backoff_seconds=0.01,
-                           backoff_factor=2.0, backoff_until=backoff_until)
-        # Retry-After=7 が backoff に反映される（初回 backoff 0.01 ではなく ~7）。
+            _dispatch_once(conn, client, retry_backoff_base_seconds=0.01,
+                           retry_backoff_cap_seconds=300.0,
+                           transient_retry_deadline_seconds=86400.0, backoff_until=backoff_until)
+        # Retry-After=7 が backoff に反映される（Full Jitter の base 0.01 ではなく ~7）。
         assert backoff_until[row_id] - before >= 6.0
 
 
@@ -205,7 +236,7 @@ class TestDaemonAgainstFakeRelay:
                     relay_base_url=fake.base_url,
                     agent_card_path=fake.fake_agent_card_path(),
                     poll_interval_seconds=0.03,
-                    initial_backoff_seconds=0.02,
+                    retry_backoff_base_seconds=0.02,
                     stop_event=stop,
                 ),
                 daemon=True,
@@ -261,8 +292,8 @@ class TestMalformedRow:
 
         with _mock_client(handler) as client:
             delivered = _dispatch_once(
-                conn, client, max_retry=5, initial_backoff_seconds=0.01,
-                backoff_factor=2.0, backoff_until={},
+                conn, client, retry_backoff_base_seconds=0.01, retry_backoff_cap_seconds=300.0,
+                transient_retry_deadline_seconds=86400.0, backoff_until={},
             )
 
         assert delivered == 1  # good 行はクラッシュせず配達された

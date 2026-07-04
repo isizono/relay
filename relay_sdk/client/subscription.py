@@ -22,6 +22,7 @@ from typing import Callable, Iterator, Sequence
 import httpx
 
 from relay_sdk import config as sdk_config
+from relay_sdk.backoff import full_jitter
 from relay_sdk.client.sse import parse_sse_lines
 from relay_sdk.errors import PermanentError, RelayProtocolError, TransientError
 from relay_sdk.http import (
@@ -92,8 +93,8 @@ class Subscription:
         retain_seconds: int | None,
         auto_ack: bool,
         on_display: Callable[[EventDisplay], None] | None,
-        reconnect_max_attempts: int | None,
         keepalive_seconds: float,
+        reconnect_backoff_base_seconds: float,
         reconnect_backoff_cap_seconds: float,
     ) -> None:
         self._client = client
@@ -105,8 +106,8 @@ class Subscription:
         self._retain_seconds = retain_seconds
         self._auto_ack = auto_ack
         self._on_display = on_display
-        self._reconnect_max_attempts = reconnect_max_attempts
         self._keepalive_seconds = keepalive_seconds
+        self._backoff_base = reconnect_backoff_base_seconds
         self._backoff_cap = reconnect_backoff_cap_seconds
 
         self._closed = False
@@ -240,7 +241,9 @@ class Subscription:
     def _resubscribe(self) -> None:
         """subscription_id 失効時に新規 POST /subscriptions を行い id を更新する（§3.4）。
 
-        transient 失敗は backoff して再試行。RelayProtocolError（labels 不正等）は caller へ。
+        transient 失敗は backoff して再試行し続ける（回数上限は無い。死活判定は lease
+        renew 側に一本化しており、resubscribe 自体を諦める概念を持たない）。
+        RelayProtocolError（labels 不正等）は caller へ。
         """
         self._ack_buffer = None  # 旧 subscription 宛の ack は無効。
         while not self._closed:
@@ -257,26 +260,22 @@ class Subscription:
                 self._attempt = 0
                 return
             except TransientError:
-                delay = self._next_reconnect_delay()
-                # reconnect_max_attempts 到達後（delay is None）も resubscribe 自体は
-                # 諦めない。ここでの None を「sleep 無し」と読むと、_next_reconnect_delay
-                # が None を返し続ける間 backoff_cap を無視して POST /subscriptions を
-                # 連打するホットループになる（medium3）。その場合は backoff_cap で待つ。
-                time.sleep(delay if delay is not None else self._backoff_cap)
+                time.sleep(self._next_reconnect_delay())
 
     # -- reconnect backoff ------------------------------------------------
 
-    def _next_reconnect_delay(self) -> float | None:
-        """次の再接続までの待機秒。max_attempts 到達なら None（resubscribe へ切替、§3.4）。
+    def _next_reconnect_delay(self) -> float:
+        """次の再接続までの待機秒（Full Jitter、§3.4）。
 
-        即時 1 回 → 1s, 2s, 4s, 8s, 16s, cap（既定 30s）。
+        即時 1 回 → 2 回目以降は `random(0, min(cap, base * 2 ** attempt))`
+        （既定 base=1s, cap=30s）。回数上限は無く、死活判定は lease renew に一本化する
+        （`404` / `410` を受け取った場合のみ `_resubscribe()` へ切り替える）。
         """
-        if (
-            self._reconnect_max_attempts is not None
-            and self._attempt >= self._reconnect_max_attempts
-        ):
-            return None
-        delay = 0.0 if self._attempt == 0 else min(2.0 ** (self._attempt - 1), self._backoff_cap)
+        delay = (
+            0.0
+            if self._attempt == 0
+            else full_jitter(self._backoff_base, self._backoff_cap, self._attempt - 1)
+        )
         self._attempt += 1
         return delay
 
@@ -303,18 +302,14 @@ class Subscription:
                 continue
             except TransientError:
                 delay = self._next_reconnect_delay()
-                if delay is None:
-                    self._resubscribe()
-                elif delay:
+                if delay:
                     time.sleep(delay)
                 continue
             # clean EOF（relay 側 stream 終了）→ 再接続。
             if self._closed:
                 break
             delay = self._next_reconnect_delay()
-            if delay is None:
-                self._resubscribe()
-            elif delay:
+            if delay:
                 time.sleep(delay)
 
     def _stream_once(self) -> Iterator[Event]:
@@ -444,7 +439,6 @@ def subscribe(
     retain_seconds: int | None = None,
     auto_ack: bool = True,
     on_display: Callable[[EventDisplay], None] | None = None,
-    reconnect_max_attempts: int | None = None,
 ) -> Subscription:
     """relay に `POST /subscriptions` を投げて subscription_id を採番する（§3.1）。
 
@@ -490,7 +484,7 @@ def subscribe(
         retain_seconds=retain_seconds,
         auto_ack=auto_ack,
         on_display=on_display,
-        reconnect_max_attempts=reconnect_max_attempts,
         keepalive_seconds=sdk_config.env_sse_keepalive_seconds(),
+        reconnect_backoff_base_seconds=sdk_config.env_sse_reconnect_backoff_base_seconds(),
         reconnect_backoff_cap_seconds=sdk_config.env_reconnect_backoff_cap_seconds(),
     )

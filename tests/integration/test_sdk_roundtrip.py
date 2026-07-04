@@ -88,7 +88,7 @@ def _run_sdk_dispatcher(db_path: str, base_url: str, card: str, stop: threading.
             relay_base_url=base_url,
             agent_card_path=card,
             poll_interval_seconds=0.02,
-            initial_backoff_seconds=0.02,
+            retry_backoff_base_seconds=0.02,
             stop_event=stop,
         ),
         daemon=True,
