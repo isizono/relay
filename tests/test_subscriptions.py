@@ -15,6 +15,7 @@ from relay.config import (
     MAX_RETAIN_SECONDS,
     MIN_LEASE_TTL_SECONDS,
     MIN_RETAIN_SECONDS,
+    Settings,
 )
 from relay.subscriptions import SubscriptionRegistry
 
@@ -643,8 +644,6 @@ class TestPublish:
         assert r.status_code == 401
 
     def test_rate_limit_returns_429_with_retry_after(self, tmp_path):
-        from relay.config import Settings
-
         limited_settings = Settings(
             db_path=str(tmp_path / "rl.db"),
             server_log_path=str(tmp_path / "rl.jsonl"),
@@ -667,3 +666,85 @@ class TestPublish:
             )
             assert limited.status_code == 429
             assert "Retry-After" in limited.headers
+
+    def test_body_exceeding_default_cap_returns_413(self, client):
+        """既定の payload 上限（256 KiB）を超える body（title が肥大化）は 413 で拒否される。"""
+        r = client.post(
+            "/publish",
+            json={
+                "ref": {"type": "decision", "id": 1},
+                "labels": ["x"],
+                "title": "t" * 300_000,
+            },
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 413
+        assert r.json()["code"] == "PayloadTooLargeError"
+
+
+class TestPublishPayloadCapConfigurable:
+    """`Settings.max_payload_bytes` を明示的に小さくして 413 境界を決定的に検証する。"""
+
+    def _client(self, tmp_path, max_payload_bytes: int) -> TestClient:
+        settings = Settings(
+            db_path=str(tmp_path / "test_relay.db"),
+            server_log_path=str(tmp_path / "test_relay.jsonl"),
+            dispatcher_lock_path=str(tmp_path / "test_relay.lock"),
+            auth_tokens={"tok-a": "agent-a"},
+            max_payload_bytes=max_payload_bytes,
+        )
+        return TestClient(create_app(settings))
+
+    def test_body_over_configured_cap_returns_413(self, tmp_path):
+        with self._client(tmp_path, max_payload_bytes=50) as client:
+            r = client.post(
+                "/publish",
+                json={"ref": {"type": "decision", "id": 1}, "labels": ["x" * 100]},
+                headers=_auth("tok-a"),
+            )
+        assert r.status_code == 413
+        assert r.json()["code"] == "PayloadTooLargeError"
+
+    def test_body_within_configured_cap_is_accepted(self, tmp_path):
+        with self._client(tmp_path, max_payload_bytes=1000) as client:
+            r = client.post(
+                "/publish",
+                json={"ref": {"type": "decision", "id": 1}, "labels": ["x"]},
+                headers=_auth("tok-a"),
+            )
+        assert r.status_code == 202
+
+
+class TestCreateSubscriptionPayloadTooLarge:
+    def test_labels_exceeding_default_cap_returns_413(self, client):
+        r = client.post(
+            "/subscriptions",
+            json={"subscriber": "agent-a", "labels": ["x" * 300_000]},
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 413
+        assert r.json()["code"] == "PayloadTooLargeError"
+
+
+class TestRenewLeasePayloadTooLarge:
+    def test_oversized_optional_body_returns_413(self, tmp_path):
+        settings = Settings(
+            db_path=str(tmp_path / "test_relay.db"),
+            server_log_path=str(tmp_path / "test_relay.jsonl"),
+            dispatcher_lock_path=str(tmp_path / "test_relay.lock"),
+            auth_tokens={"tok-a": "agent-a"},
+            max_payload_bytes=50,
+        )
+        with TestClient(create_app(settings)) as client:
+            r = client.post(
+                "/subscriptions", json={"subscriber": "agent-a", "labels": ["x"]},
+                headers=_auth("tok-a"),
+            )
+            sid = r.json()["subscription_id"]
+            r2 = client.put(
+                f"/subscriptions/{sid}/lease",
+                json={"lease_ttl": 300, "padding": "p" * 100},
+                headers=_auth("tok-a"),
+            )
+        assert r2.status_code == 413
+        assert r2.json()["code"] == "PayloadTooLargeError"

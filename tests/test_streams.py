@@ -539,6 +539,49 @@ class TestPostStreamMessage:
         assert r.status_code == 410
         assert r.json()["code"] == "StreamGoneError"
 
+    def test_body_exceeding_default_cap_returns_413(self, client):
+        """既定の payload 上限（256 KiB）を超える body は 413 で拒否される。"""
+        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        r = client.post(
+            "/streams/s1/messages",
+            json={"body": "x" * 300_000},
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 413
+        assert r.json()["code"] == "PayloadTooLargeError"
+
+
+class TestPostStreamMessagePayloadCapConfigurable:
+    """`Settings.max_payload_bytes` を明示的に小さくして 413 境界を決定的に検証する。"""
+
+    def _client(self, tmp_path, max_payload_bytes: int) -> TestClient:
+        settings = Settings(
+            db_path=str(tmp_path / "test_relay.db"),
+            server_log_path=str(tmp_path / "test_relay.jsonl"),
+            auth_tokens={"tok-a": "agent-a"},
+            max_payload_bytes=max_payload_bytes,
+        )
+        return TestClient(create_app(settings))
+
+    def test_body_over_configured_cap_returns_413(self, tmp_path):
+        with self._client(tmp_path, max_payload_bytes=50) as client:
+            client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+            r = client.post(
+                "/streams/s1/messages",
+                json={"body": "x" * 100},
+                headers=_auth("tok-a"),
+            )
+        assert r.status_code == 413
+        assert r.json()["code"] == "PayloadTooLargeError"
+
+    def test_body_within_configured_cap_is_accepted(self, tmp_path):
+        with self._client(tmp_path, max_payload_bytes=1000) as client:
+            client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+            r = client.post(
+                "/streams/s1/messages", json={"body": "hello"}, headers=_auth("tok-a")
+            )
+        assert r.status_code == 202
+
     def test_missing_body_returns_400(self, client):
         client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
         r = client.post("/streams/s1/messages", json={}, headers=_auth("tok-a"))

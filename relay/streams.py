@@ -29,6 +29,7 @@ enqueue 時点で計算した期限を書き込み、DLQ sweep（`relay.delivery
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from dataclasses import dataclass, field
@@ -44,6 +45,7 @@ from relay.config import DEFAULT_RETAIN_SECONDS, MAX_RETAIN_SECONDS, MIN_RETAIN_
 from relay.errors import (
     INVALID_REQUEST,
     MEMBERSHIP_REQUIRED,
+    PAYLOAD_TOO_LARGE,
     STREAM_ALREADY_EXISTS,
     STREAM_GONE,
     STREAM_NOT_FOUND,
@@ -255,9 +257,48 @@ def _validate_retain_seconds(value: object, *, field_name: str) -> tuple[int | N
     return value, None
 
 
+async def _read_capped_body(request: Request) -> tuple[bytes, Response | None]:
+    """`Settings.max_payload_bytes` を超える request body を 413 で拒否する。
+
+    `Content-Length` ヘッダで早期に拒否できる場合は body を読まずに拒否する。ヘッダが
+    無い/信頼できない（chunked transfer 等）場合に備え、`request.stream()` を読み進める
+    間も上限超過を検知し、上限に達した時点で残りを読み切る前に打ち切る（全体をメモリに
+    読み切ってからサイズ判定すると、判定自体が DoS の踏み台になる。セキュリティ監査
+    finding H-4/F2 の「`await request.json()` が全体メモリ読込」という指摘への対応）。
+    """
+    settings: Settings = request.app.state.settings
+    max_bytes = settings.max_payload_bytes
+
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > max_bytes:
+                return b"", error_response(
+                    413,
+                    PAYLOAD_TOO_LARGE,
+                    f"リクエストボディが上限（{max_bytes} bytes）を超えています",
+                )
+        except ValueError:
+            pass  # 不正な Content-Length は実読み込み側の検証に委ねる
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_bytes:
+            return b"", error_response(
+                413, PAYLOAD_TOO_LARGE, f"リクエストボディが上限（{max_bytes} bytes）を超えています"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks), None
+
+
 async def _read_json_body(request: Request) -> tuple[dict, Response | None]:
+    raw, err = await _read_capped_body(request)
+    if err is not None:
+        return {}, err
     try:
-        body = await request.json()
+        body = json.loads(raw) if raw else None
     except Exception:
         return {}, error_response(400, INVALID_REQUEST, "リクエストボディが不正な JSON です")
     if not isinstance(body, dict):
@@ -368,7 +409,9 @@ async def post_stream_message(request: Request) -> Response:
     body, err = await _read_json_body(request)
     if err is not None:
         observability.inc_metric(
-            request.app.state, "relay_publish_failed_total", failure_reason="invalid_request"
+            request.app.state,
+            "relay_publish_failed_total",
+            failure_reason="payload_too_large" if err.status_code == 413 else "invalid_request",
         )
         return err
 

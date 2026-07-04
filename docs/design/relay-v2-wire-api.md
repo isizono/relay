@@ -417,6 +417,21 @@ Body: { up_to_publish_id: <int> }
 - 再接続時、relay 側に該当 outbox が無ければ単に再 push 対象ゼロ（無音）。subscriber は別途
   定期 full reconciliation で publisher に当たる（SDK 側 3 段階 reconciliation、別書）。
 
+### 6.8 request body サイズ上限
+
+- body を受け取る全 endpoint（`POST /streams`, `POST /streams/{id}/messages`,
+  `PUT /streams/{id}/members`, `POST /streams/{id}/ack`, `POST /subscriptions`,
+  `PUT /subscriptions/{id}/lease`, `POST /subscriptions/{id}/ack`, `POST /publish`）で共通の
+  request body サイズ上限（既定 256 KiB）を設ける。超過時は `413 Payload Too Large`
+  （`PayloadTooLargeError`）。
+- 上限値は本書や機能要件文書に明記された数値ではなく、一般的なメッセージング API の慣行
+  （例: Amazon SQS のメッセージサイズ上限 256KiB）を参考にした実装既定値。運用側は
+  `RELAY_MAX_PAYLOAD_BYTES` 環境変数で上書きできる。
+- 個別フィールド（`body` / `title` / `labels` 等）ごとの長さ上限は設けず、request body 全体の
+  バイト数のみを見る。理由: セキュリティ監査で指摘された脅威は「特定フィールドが大きすぎる」
+  ことではなく「`await request.json()` が任意サイズの body を無条件に全部メモリへ読み込む」こと
+  自体であるため、body 全体を対象にする方が発生源に近い。
+
 ---
 
 ## 7. observability
@@ -470,6 +485,7 @@ Body: { up_to_publish_id: <int> }
 | `404` | 不存在（露呈回避含む） | 場 / subscription 不在, 非所有 subscription への操作（§5.7） |
 | `409` | 競合 | stream_id 既存 |
 | `410` | 消滅 / 期限切れ | close 済み場への投函, 所有者本人による lease 切れ subscription への操作（registry 残存時のみ。§5.7） |
+| `413` | request body サイズ超過 | request body が上限（既定 256 KiB、§6.8）を超過 |
 | `429` | rate limit | publisher ごと publish 上限 |
 | `503` | 一時不能 | outbox 障害（disk full / DB corrupt） |
 

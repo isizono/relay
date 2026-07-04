@@ -40,6 +40,12 @@ DEFAULT_ACK_TIMEOUT_SECONDS = 60.0
 # identity-authz.md §4.2: identity 自体は relay 再起動を跨いで disk 永続化される。
 DEFAULT_AGENT_CARD_CACHE_TTL_SECONDS = 3600  # 1h
 
+# request body のサイズ上限（bytes、セキュリティ監査 finding H-4/F2: PayloadTooLargeError が
+# 定義のみで未配線だった点の解消）。relay-v2-wire-api.md 等の仕様書に具体的なバイト数の
+# 記載は無いため、一般的なメッセージング API の慣行（例: Amazon SQS のメッセージサイズ上限
+# 256KiB）を参考にした値であり、実測に基づく数値ではない。
+DEFAULT_MAX_PAYLOAD_BYTES = 262_144  # 256 KiB
+
 # lease 切れ済み subscription を in-memory registry に残しておく猶予秒数
 # （relay-v2-wire-api.md §5.7 の 410 ヒントを再接続の遅い subscriber にも
 # 一定時間だけ提供するため）。この猶予を過ぎたら registry から物理的に除去する
@@ -83,6 +89,7 @@ class Settings:
     subscription_registry_retention_seconds: float = (
         DEFAULT_SUBSCRIPTION_REGISTRY_RETENTION_SECONDS
     )
+    max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES
 
 
 def _load_auth_tokens_from_env() -> dict[str, str]:
@@ -153,6 +160,9 @@ def load_settings_from_env() -> Settings:
                 "RELAY_SUBSCRIPTION_REGISTRY_RETENTION_SECONDS",
                 DEFAULT_SUBSCRIPTION_REGISTRY_RETENTION_SECONDS,
             )
+        ),
+        max_payload_bytes=int(
+            os.environ.get("RELAY_MAX_PAYLOAD_BYTES", DEFAULT_MAX_PAYLOAD_BYTES)
         ),
     )
 
