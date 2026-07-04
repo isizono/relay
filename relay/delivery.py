@@ -27,6 +27,8 @@ retry → DLQ 化ループ）、DLQ sweep（`dead_at` から 7 日後の物理 D
     4. DLQ 物理削除: `dead_at` から 7 日経過した `dlq` 行を DELETE する。
     5. subscription registry 掃除: lease 切れから猶予期間（既定 1 時間）を過ぎた
        subscription を in-memory registry から除去する（無制限メモリ増加の防止）。
+    6. stream registry 掃除: close から猶予期間（既定 1 時間）を過ぎ、未配達 outbox が
+       drain し切った stream を in-memory registry から除去する（同上の防止、5 と対称）。
 
 - keepalive（30 秒ごとの `: keepalive` コメント行）は SSE 送信側の generator が
   `asyncio.wait_for(queue.get(), timeout=...)` のタイムアウトとして自前で生成する
@@ -627,6 +629,39 @@ def _sweep_expired_subscription_registry(
             observability.inc_metric(app_state, "relay_subscription_lease_expirations_total")
 
 
+def _sweep_idle_streams(
+    db_conn: sqlite3.Connection, stream_registry, settings: Settings, app_state=None
+) -> None:
+    """close から猶予期間を過ぎ、未配達 outbox エントリが無い stream を registry から除去する。
+
+    subscription 側 `_sweep_expired_subscription_registry` と対称の idle-GC。close された
+    まま放置された stream record による registry の無制限成長を防ぐ。
+
+    subscription lane は lease 切れが `_sweep_permanent_errors` で outbox を DLQ へ drain
+    するのに対し、close 済み stream の outbox は close 後も retain 期間まで配達を継続する
+    （wire-api.md §3.4）。そのため候補（`idle_closed_ids`）を無条件に除去すると未配達
+    エントリの配達経路（`read_streams_for_identity` 経由の dispatch）を絶つ。これを避け、
+    未配達 outbox が drain し切った（ack 済み / retain 超過で DLQ 化済み）stream だけを除去
+    する。close 済み stream は新規 outbox を増やせない（POST は 410）ため、一度空なら空の
+    ままで、除去は安全である。
+    """
+    candidates = stream_registry.idle_closed_ids(settings.stream_registry_retention_seconds)
+    for stream_id in candidates:
+        pending = db_conn.execute(
+            "SELECT 1 FROM outbox WHERE target_type = 'stream' AND stream_id = ? LIMIT 1",
+            (stream_id,),
+        ).fetchone()
+        if pending is not None:
+            continue
+        if stream_registry.evict(stream_id) and app_state is not None:
+            observability.record_event(
+                app_state,
+                "stream_registry_evicted",
+                level="warning",
+                stream_id=stream_id,
+            )
+
+
 # ---------------------------------------------------------------------------
 # dispatcher 本体（polling loop）
 # ---------------------------------------------------------------------------
@@ -646,6 +681,7 @@ async def dispatch_once(app) -> None:
         _sweep_permanent_errors(db_conn, sub_registry, app_state=app.state)
         _sweep_stream_permanent_errors(db_conn, stream_registry, app_state=app.state)
         _sweep_dlq_physical_delete(db_conn, settings)
+        _sweep_idle_streams(db_conn, stream_registry, settings, app_state=app.state)
         db_conn.commit()
         _sweep_expired_subscription_registry(sub_registry, settings, app_state=app.state)
     finally:

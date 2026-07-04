@@ -29,7 +29,7 @@ import pytest
 import uvicorn
 from starlette.testclient import TestClient
 
-from relay import db, delivery, observability, subscriptions
+from relay import db, delivery, observability, streams, subscriptions
 from relay.app import create_app
 from relay.config import Settings
 from relay.streams import StreamRegistry
@@ -891,6 +891,69 @@ class TestSubscriptionRegistrySweep:
 
         assert sub_registry.get(long_expired.subscription_id) is None
         assert sub_registry.get(alive.subscription_id) is not None
+
+
+class TestStreamRegistrySweep:
+    """dispatch_once が close 済み idle stream の掃除まで一貫して行うことを検証する。"""
+
+    def _closed_at_past_grace(self, settings) -> str:
+        return (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=settings.stream_registry_retention_seconds + 1)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def test_dispatch_once_evicts_drained_idle_closed_stream(self, settings):
+        asyncio.run(self._run_evicts(settings))
+
+    async def _run_evicts(self, settings):
+        db.init_db(settings.db_path)
+        app = create_app(settings)
+        stream_registry = streams.get_registry_from_state(app.state)
+
+        stream_registry.create("s-idle", "agent-a", None)
+        stream_registry.close("s-idle")
+        stream_registry.get("s-idle").closed_at = self._closed_at_past_grace(settings)
+
+        await delivery.dispatch_once(app)
+
+        # 未配達 outbox が無く猶予を過ぎた close 済み stream は registry から消える。
+        assert stream_registry.get("s-idle") is None
+
+    def test_dispatch_once_keeps_idle_closed_stream_with_pending_outbox(self, settings):
+        asyncio.run(self._run_keeps(settings))
+
+    async def _run_keeps(self, settings):
+        db.init_db(settings.db_path)
+        app = create_app(settings)
+        stream_registry = streams.get_registry_from_state(app.state)
+
+        stream_registry.create("s-pending", "agent-a", None)
+        # read 権限を持つ member を残し、permanent-error sweep が outbox を DLQ 化しないようにする。
+        stream_registry.put_member("s-pending", "agent-b", "read")
+        stream_registry.close("s-pending")
+        stream_registry.get("s-pending").closed_at = self._closed_at_past_grace(settings)
+
+        # retain 未超過の未配達 outbox エントリを 1 件残す（expires_at を将来に置く）。
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        conn = db.get_connection(settings.db_path)
+        try:
+            conn.execute(
+                "INSERT INTO outbox"
+                " (target_type, stream_id, member_identity, publish_id, payload,"
+                " enqueued_at, expires_at)"
+                " VALUES ('stream', 's-pending', 'agent-b', 1, ?, ?, ?)",
+                (b"hi", future, future),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        await delivery.dispatch_once(app)
+
+        # 未配達エントリが drain し切っていないので evict されず registry に残る。
+        assert stream_registry.get("s-pending") is not None
 
 
 # ---------------------------------------------------------------------------

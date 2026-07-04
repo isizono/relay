@@ -40,14 +40,23 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from relay import db, idempotency, observability
-from relay.config import DEFAULT_RETAIN_SECONDS, MAX_RETAIN_SECONDS, MIN_RETAIN_SECONDS, Settings
+from relay.config import (
+    DEFAULT_MAX_STREAMS_PER_IDENTITY,
+    DEFAULT_MAX_STREAMS_TOTAL,
+    DEFAULT_RETAIN_SECONDS,
+    MAX_RETAIN_SECONDS,
+    MIN_RETAIN_SECONDS,
+    Settings,
+)
 from relay.errors import (
     INVALID_REQUEST,
     MEMBERSHIP_REQUIRED,
     STREAM_ALREADY_EXISTS,
     STREAM_GONE,
     STREAM_NOT_FOUND,
+    ResourceLimitExceeded,
     error_response,
+    resource_limit_response,
 )
 from relay.identity import Identity, require_authn
 
@@ -55,8 +64,12 @@ Access = Literal["read", "write", "read_write"]
 _VALID_ACCESS: frozenset[str] = frozenset({"read", "write", "read_write"})
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return _now().strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +82,11 @@ class StreamRecord:
     stream_id: str
     created_at: str
     default_ttl: int | None
+    creator_identity: str
     state: Literal["open", "closed"] = "open"
+    # open→closed へ遷移した時刻（ISO8601 UTC、秒精度）。open のうちは None。
+    # idle-GC の猶予計算に使う。冪等な再 close では更新しない（最初の close 時刻を保つ）。
+    closed_at: str | None = None
     members: dict[str, Access] = field(default_factory=dict)
 
 
@@ -78,11 +95,25 @@ class StreamRegistry:
 
     `threading.Lock` で単純に排他する。relay-v2-wire-api.md §0 の R1 原則により disk
     永続化しない（relay 再起動で消える。docs/ARCHITECTURE.md 参照）。
+
+    資源上限（`max_total` / `max_per_identity`）は DoS 防御。`create` 時に registry 全体
+    の登録数と作成者 identity の登録数を検査し、超過すると `ResourceLimitExceeded` を送出
+    する（判定と挿入は同一 lock 下で atomic に行い、並行 create による上限すり抜けを防ぐ）。
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        max_total: int = DEFAULT_MAX_STREAMS_TOTAL,
+        max_per_identity: int = DEFAULT_MAX_STREAMS_PER_IDENTITY,
+    ) -> None:
         self._lock = threading.Lock()
         self._streams: dict[str, StreamRecord] = {}
+        self._max_total = max_total
+        self._max_per_identity = max_per_identity
+        # creator_identity ごとの現存 stream 数。上限判定を O(1) にするため create/evict で
+        # 増減させる。0 になった identity は key を落とす（identity 空間での無制限成長を防ぐ）。
+        # 不変条件: sum(_per_creator_count.values()) == len(_streams)。
+        self._per_creator_count: dict[str, int] = {}
 
     def create(
         self, stream_id: str, creator_identity: str, default_ttl: int | None
@@ -91,16 +122,39 @@ class StreamRegistry:
 
         作成者は bootstrap として write 権限を持つ member として自動登録される
         （wire-api.md §3.1）。
+
+        Raises:
+            ResourceLimitExceeded: registry 総数または作成者 identity の登録数が上限に
+                達している場合（既存 stream_id の再作成は新規スロットを消費しないため
+                この検査より前に None を返す）。
         """
         with self._lock:
             if stream_id in self._streams:
                 return None
+            if len(self._streams) >= self._max_total:
+                raise ResourceLimitExceeded("total")
+            if self._per_creator_count.get(creator_identity, 0) >= self._max_per_identity:
+                raise ResourceLimitExceeded("per_identity")
             record = StreamRecord(
-                stream_id=stream_id, created_at=_now_iso(), default_ttl=default_ttl
+                stream_id=stream_id,
+                created_at=_now_iso(),
+                default_ttl=default_ttl,
+                creator_identity=creator_identity,
             )
             record.members[creator_identity] = "write"
             self._streams[stream_id] = record
+            self._per_creator_count[creator_identity] = (
+                self._per_creator_count.get(creator_identity, 0) + 1
+            )
             return record
+
+    def _decr_creator(self, creator_identity: str) -> None:
+        """`creator_identity` の現存 stream 数を 1 減らす（lock 保持下で呼ぶこと）。"""
+        remaining = self._per_creator_count.get(creator_identity, 0) - 1
+        if remaining <= 0:
+            self._per_creator_count.pop(creator_identity, None)
+        else:
+            self._per_creator_count[creator_identity] = remaining
 
     def get(self, stream_id: str) -> StreamRecord | None:
         with self._lock:
@@ -110,11 +164,48 @@ class StreamRegistry:
         """新規投函を止める（close）。存在しない stream_id は no-op（呼び出し側で 404 判定済み前提）。
 
         close は冪等: 既に closed な stream への再 close は状態を変えず成功扱いにする。
+        `closed_at` は open→closed への遷移時のみ記録し、再 close では上書きしない
+        （idle-GC の猶予起点を最初の close 時刻に固定する）。
         """
         with self._lock:
             record = self._streams.get(stream_id)
-            if record is not None:
+            if record is not None and record.state != "closed":
                 record.state = "closed"
+                record.closed_at = _now_iso()
+
+    def idle_closed_ids(self, older_than_seconds: float) -> list[str]:
+        """close から `older_than_seconds` 秒以上経過した close 済み stream_id の一覧。
+
+        idle-GC の除去候補選定。ここでは「close 済み かつ 猶予経過」だけを判定し、実際の
+        除去は未配達 outbox エントリが drain し切ったことを確認してから `evict` で行う
+        （`relay.delivery._sweep_idle_streams`）。`closed_at` は秒精度の固定幅 ISO8601 UTC
+        文字列なので辞書順比較が時刻順比較に一致する。
+        """
+        cutoff = (_now() - timedelta(seconds=older_than_seconds)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        with self._lock:
+            return [
+                stream_id
+                for stream_id, record in self._streams.items()
+                if record.state == "closed"
+                and record.closed_at is not None
+                and record.closed_at <= cutoff
+            ]
+
+    def evict(self, stream_id: str) -> bool:
+        """close 済み stream を registry から除去する。除去できたら True。
+
+        open な stream（配達継続中で live）や不在 stream は除去せず False を返す。
+        `idle_closed_ids` で候補選定 → outbox drain 確認 → 本メソッドで除去、の順で使う。
+        """
+        with self._lock:
+            record = self._streams.get(stream_id)
+            if record is None or record.state != "closed":
+                return False
+            del self._streams[stream_id]
+            self._decr_creator(record.creator_identity)
+            return True
 
     def put_member(self, stream_id: str, identity: str, access: Access) -> None:
         with self._lock:
@@ -210,7 +301,14 @@ def get_registry_from_state(app_state) -> StreamRegistry:
     """
     registry = getattr(app_state, "stream_registry", None)
     if registry is None:
-        registry = StreamRegistry()
+        settings: Settings | None = getattr(app_state, "settings", None)
+        if settings is not None:
+            registry = StreamRegistry(
+                max_total=settings.max_streams_total,
+                max_per_identity=settings.max_streams_per_identity,
+            )
+        else:
+            registry = StreamRegistry()
         app_state.stream_registry = registry
     return registry
 
@@ -286,7 +384,10 @@ async def create_stream(request: Request) -> Response:
         return err
 
     registry = _get_registry(request)
-    record = registry.create(stream_id, identity.id, default_ttl)
+    try:
+        record = registry.create(stream_id, identity.id, default_ttl)
+    except ResourceLimitExceeded as exc:
+        return resource_limit_response("stream", exc.scope)
     if record is None:
         return error_response(
             409, STREAM_ALREADY_EXISTS, f"stream '{stream_id}' は既に存在します"

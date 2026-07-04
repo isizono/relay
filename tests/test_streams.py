@@ -9,8 +9,11 @@ structural authZ（write 権限 membership 照合、identity-authz.md §2.2）�
 import pytest
 from starlette.testclient import TestClient
 
+from datetime import datetime, timedelta, timezone
+
 from relay.app import create_app
 from relay.config import Settings
+from relay.errors import ResourceLimitExceeded
 from relay.streams import StreamRegistry
 
 
@@ -142,6 +145,102 @@ class TestStreamRegistry:
         assert registry.read_members("nope") == []
 
 
+def _past_iso(seconds: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+class TestStreamRegistryResourceLimits:
+    def test_total_limit_rejects_create_beyond_cap(self):
+        registry = StreamRegistry(max_total=2, max_per_identity=100)
+        registry.create("s1", "agent-a", None)
+        registry.create("s2", "agent-b", None)
+        with pytest.raises(ResourceLimitExceeded) as exc:
+            registry.create("s3", "agent-c", None)
+        assert exc.value.scope == "total"
+
+    def test_per_identity_limit_rejects_third_from_same_creator(self):
+        registry = StreamRegistry(max_total=100, max_per_identity=2)
+        registry.create("s1", "agent-a", None)
+        registry.create("s2", "agent-a", None)
+        with pytest.raises(ResourceLimitExceeded) as exc:
+            registry.create("s3", "agent-a", None)
+        assert exc.value.scope == "per_identity"
+
+    def test_per_identity_limit_is_counted_per_creator(self):
+        registry = StreamRegistry(max_total=100, max_per_identity=1)
+        registry.create("s1", "agent-a", None)
+        # agent-a は上限だが agent-b は自分の枠を消費して作成できる。
+        assert registry.create("s2", "agent-b", None) is not None
+
+    def test_duplicate_stream_id_returns_none_before_total_limit_check(self):
+        registry = StreamRegistry(max_total=1, max_per_identity=100)
+        registry.create("s1", "agent-a", None)
+        # 既存 stream_id の再作成は新規スロットを消費しないため上限例外ではなく None(409)。
+        assert registry.create("s1", "agent-b", None) is None
+
+    def test_close_alone_does_not_free_per_identity_slot(self):
+        registry = StreamRegistry(max_total=100, max_per_identity=1)
+        registry.create("s1", "agent-a", None)
+        registry.close("s1")
+        with pytest.raises(ResourceLimitExceeded):
+            registry.create("s2", "agent-a", None)
+
+    def test_evict_frees_per_identity_slot(self):
+        registry = StreamRegistry(max_total=100, max_per_identity=1)
+        registry.create("s1", "agent-a", None)
+        registry.close("s1")
+        assert registry.evict("s1") is True
+        # evict で record が消えたので agent-a は再び作成できる。
+        assert registry.create("s2", "agent-a", None) is not None
+
+
+class TestStreamRegistryIdleEviction:
+    def test_closed_at_is_set_only_on_open_to_closed_transition(self):
+        registry = StreamRegistry()
+        registry.create("s1", "agent-a", None)
+        assert registry.get("s1").closed_at is None
+        registry.close("s1")
+        first_closed_at = registry.get("s1").closed_at
+        assert first_closed_at is not None
+        registry.close("s1")  # 冪等な再 close は closed_at を上書きしない。
+        assert registry.get("s1").closed_at == first_closed_at
+
+    def test_idle_closed_ids_returns_only_closed_past_grace(self):
+        registry = StreamRegistry()
+        registry.create("still-open", "agent-a", None)  # open のまま
+        registry.create("recently-closed", "agent-b", None)
+        registry.close("recently-closed")  # 猶予内の close
+        registry.create("long-closed", "agent-c", None)
+        registry.close("long-closed")
+        registry.get("long-closed").closed_at = _past_iso(7200)  # 2h 前に close
+        assert registry.idle_closed_ids(older_than_seconds=3600) == ["long-closed"]
+
+    def test_idle_closed_ids_empty_when_nothing_past_grace(self):
+        registry = StreamRegistry()
+        registry.create("s1", "agent-a", None)
+        registry.close("s1")
+        assert registry.idle_closed_ids(older_than_seconds=3600) == []
+
+    def test_evict_removes_closed_stream(self):
+        registry = StreamRegistry()
+        registry.create("s1", "agent-a", None)
+        registry.close("s1")
+        assert registry.evict("s1") is True
+        assert registry.get("s1") is None
+
+    def test_evict_refuses_open_stream(self):
+        registry = StreamRegistry()
+        registry.create("s1", "agent-a", None)
+        assert registry.evict("s1") is False
+        assert registry.get("s1") is not None
+
+    def test_evict_missing_stream_returns_false(self):
+        registry = StreamRegistry()
+        assert registry.evict("nope") is False
+
+
 # ---------------------------------------------------------------------------
 # HTTP 統合テスト
 # ---------------------------------------------------------------------------
@@ -205,6 +304,43 @@ class TestCreateStream:
     def test_requires_auth(self, client):
         r = client.post("/streams", json={"stream_id": "s1"})
         assert r.status_code == 401
+
+
+class TestCreateStreamResourceLimits:
+    @pytest.fixture()
+    def limited_client(self, tmp_path):
+        settings = Settings(
+            db_path=str(tmp_path / "limited.db"),
+            server_log_path=str(tmp_path / "limited.jsonl"),
+            auth_tokens={"tok-a": "agent-a", "tok-b": "agent-b"},
+            max_streams_total=3,
+            max_streams_per_identity=2,
+        )
+        app = create_app(settings)
+        with TestClient(app) as c:
+            yield c
+
+    def test_within_limits_returns_201(self, limited_client):
+        r = limited_client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        assert r.status_code == 201
+
+    def test_per_identity_limit_returns_429(self, limited_client):
+        limited_client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        limited_client.post("/streams", json={"stream_id": "s2"}, headers=_auth("tok-a"))
+        # agent-a の 3 件目は per-identity 上限(2)超過で拒否される。
+        r = limited_client.post("/streams", json={"stream_id": "s3"}, headers=_auth("tok-a"))
+        assert r.status_code == 429
+        assert r.json()["code"] == "ResourceLimitExceededError"
+
+    def test_total_limit_returns_429(self, limited_client):
+        # agent-a 2 件 + agent-b 1 件で total 上限(3)に到達させる。
+        limited_client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        limited_client.post("/streams", json={"stream_id": "s2"}, headers=_auth("tok-a"))
+        limited_client.post("/streams", json={"stream_id": "s3"}, headers=_auth("tok-b"))
+        # agent-b は per-identity 枠に空きがあるが total 上限で拒否される。
+        r = limited_client.post("/streams", json={"stream_id": "s4"}, headers=_auth("tok-b"))
+        assert r.status_code == 429
+        assert r.json()["code"] == "ResourceLimitExceededError"
 
 
 class TestGetStream:

@@ -107,10 +107,13 @@ POST /streams
 Body: { stream_id: <string>, default_ttl?: <seconds> }
 → 201 Created { stream_id, created_at }
 → 409 Conflict  (stream_id 既存)
+→ 429 Too Many Requests  (registry 資源上限: 総数 / 作成者 identity あたり。§6.8)
 ```
 
 - `stream_id` は呼び出し側が決める文字列（識別子）。
 - `default_ttl` は場メッセージの outbox retain default（省略時は relay 既定、§6.4）。
+- registry 資源上限に達している場合は `429`（`ResourceLimitExceededError`）で作成を拒否する（§6.8）。
+  既存 `stream_id` の再作成（`409`）は新規スロットを消費しないため上限判定より前に評価する。
 - 作成者 identity は当該場の write 権限を持つ member（`access: "write"`）として自動登録される
   （bootstrap。これがないと最初の member を追加できる identity が存在しない。identity 別書 §2.2。
   受信も必要なら作成後に自分の access を `read_write` に更新する）。
@@ -168,6 +171,9 @@ DELETE /streams/{stream_id}
 - close は **新規投函を止めるだけ**。archive は作らない。
 - close 後の `POST .../messages` は `410 Gone`。
 - close 時点で outbox に残っている未配達エントリは **retain 期間まで配達を継続**（close は投函口を閉じるだけで配達は止めない）。
+- close 済み場の in-memory record は idle-GC の対象になる（§6.8）。close から猶予期間を過ぎ、かつ
+  その場の未配達 outbox エントリが drain し切ったものを registry から除去する。除去後の同名 `stream_id`
+  は不在（`GET` は `404`）となり、再作成が可能になる。
 
 ---
 
@@ -204,9 +210,11 @@ Body: {
 }
 → 201 Created { subscription_id, lease_expires_at }
 → 400 Bad Request   (labels == [] : firehose 防止)
+→ 429 Too Many Requests  (registry 資源上限: 総数 / subscriber あたり。§6.8)
 ```
 
 - relay が `subscription_id`（UUID）を採番して返す。labels 変更は「新 subscribe + 旧 unsubscribe」で表現。
+- registry 資源上限に達している場合は `429`（`ResourceLimitExceededError`）で subscribe を拒否する（§6.8）。
 - `subscriber` は呼び出し元の認証済み identity と一致しなければならない（不一致は `403`。代理 subscribe
   は認めない）。以後この subscription への操作はこの identity に限定される（§5.7）。
 - 同一 `(subscriber, labels)` でも複数 subscription を持てる（独立 lease）。
@@ -417,6 +425,23 @@ Body: { up_to_publish_id: <int> }
 - 再接続時、relay 側に該当 outbox が無ければ単に再 push 対象ゼロ（無音）。subscriber は別途
   定期 full reconciliation で publisher に当たる（SDK 側 3 段階 reconciliation、別書）。
 
+### 6.8 registry 資源上限 + idle-GC（DoS 防御）
+
+stream / subscription registry は in-memory（§0 R1）で、無制限に作成できると単一 peer が
+relay のメモリを枯渇させられる。両 registry に以下を課す。
+
+- **総数上限 + per-identity 上限**: 作成時に registry 全体の登録数と、その identity（stream は
+  作成者、subscription は subscriber）の登録数を検査する。いずれか超過なら作成を拒否し
+  `429 Too Many Requests`（`ResourceLimitExceededError`）を返す。上限値は設定可能で、既定は
+  「想定同時 peer 数 × 1 peer あたり想定リソース数」を目安に置く。判定と登録は atomic に行い、
+  並行作成による上限すり抜けを防ぐ。既存 `stream_id` の再作成（`409`）は新規スロットを消費
+  しないため上限判定より前に評価する。
+- **idle-GC**: subscription は lease 切れから猶予期間を過ぎたものを registry から除去する（§5.7）。
+  stream は close から猶予期間を過ぎ、かつ未配達 outbox エントリが drain し切ったものを除去する
+  （close 済み場は新規 outbox を増やせない〈§3.4〉ため、未配達が無ければ以後も無く、除去は
+  未配達メッセージの配達経路を絶たない）。除去は dispatcher の polling cycle（§6.2）で駆動する。
+  除去は warn 構造化ログ（§7.3）で観測する。
+
 ---
 
 ## 7. observability
@@ -470,7 +495,7 @@ Body: { up_to_publish_id: <int> }
 | `404` | 不存在（露呈回避含む） | 場 / subscription 不在, 非所有 subscription への操作（§5.7） |
 | `409` | 競合 | stream_id 既存 |
 | `410` | 消滅 / 期限切れ | close 済み場への投函, 所有者本人による lease 切れ subscription への操作（registry 残存時のみ。§5.7） |
-| `429` | rate limit | publisher ごと publish 上限 |
+| `429` | rate limit / 資源上限 | publisher ごと publish 上限, registry 資源上限（stream / subscription 作成の総数 / per-identity。§6.8） |
 | `503` | 一時不能 | outbox 障害（disk full / DB corrupt） |
 
 - 認可エラーは「リソース存在を露呈しない」（A2A §7.5）。`404` / `403` を使い分ける（詳細は identity 別書）。

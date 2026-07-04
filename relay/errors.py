@@ -28,8 +28,33 @@ LABEL_VALIDATION = "LabelValidationError"
 INVALID_REQUEST = "InvalidRequestError"
 PAYLOAD_TOO_LARGE = "PayloadTooLargeError"
 RATE_LIMIT_EXCEEDED = "RateLimitExceededError"
+RESOURCE_LIMIT_EXCEEDED = "ResourceLimitExceededError"
 SUBSCRIBER_MISMATCH = "SubscriberMismatchError"
 OUTBOX_UNAVAILABLE = "OutboxUnavailableError"
+
+
+class ResourceLimitExceeded(Exception):
+    """registry の資源上限（総数 / identity 単位）を超過して作成が拒否されたことを表す。
+
+    HTTP 層では `resource_limit_response` で 429 + `ResourceLimitExceededError` に変換する。
+    `scope` は "total"（registry 全体の上限）または "per_identity"（1 identity あたりの
+    上限）で、応答メッセージの出し分けに使う。registry のロック下で送出されるため、
+    呼び出し側 handler で必ず捕捉すること（未捕捉のまま Starlette に抜けると 500 になる）。
+    """
+
+    def __init__(self, scope: str) -> None:
+        super().__init__(scope)
+        self.scope = scope
+
+
+def resource_limit_response(resource: str, scope: str) -> "JSONResponse":
+    """資源上限超過（`ResourceLimitExceeded`）を 429 error envelope に変換する。"""
+    dimension = "総数" if scope == "total" else "1 identity あたりの数"
+    return error_response(
+        429,
+        RESOURCE_LIMIT_EXCEEDED,
+        f"{resource} の{dimension}が上限に達しています",
+    )
 
 
 def error_response(

@@ -34,6 +34,8 @@ from starlette.routing import Route
 from relay import db, idempotency, observability
 from relay.config import (
     DEFAULT_LEASE_TTL_SECONDS,
+    DEFAULT_MAX_SUBSCRIPTIONS_PER_IDENTITY,
+    DEFAULT_MAX_SUBSCRIPTIONS_TOTAL,
     DEFAULT_RETAIN_SECONDS,
     MAX_LEASE_TTL_SECONDS,
     MAX_RETAIN_SECONDS,
@@ -48,7 +50,9 @@ from relay.errors import (
     SUBSCRIBER_MISMATCH,
     SUBSCRIPTION_GONE,
     SUBSCRIPTION_NOT_FOUND,
+    ResourceLimitExceeded,
     error_response,
+    resource_limit_response,
 )
 from relay.identity import Identity, require_authn
 
@@ -82,11 +86,25 @@ class SubscriptionRegistry:
     `StreamRegistry`（`relay/streams.py`）と対称の設計。relay-v2-wire-api.md §0 の
     R1 原則により disk 永続化しない（relay 再起動で消える。subscriber は re-subscribe
     で自己修復する）。
+
+    資源上限（`max_total` / `max_per_identity`）は DoS 防御。`create` 時に registry 全体
+    の登録数と subscriber の登録数を検査し、超過すると `ResourceLimitExceeded` を送出する
+    （判定と挿入は同一 lock 下で atomic に行い、並行 create による上限すり抜けを防ぐ）。
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        max_total: int = DEFAULT_MAX_SUBSCRIPTIONS_TOTAL,
+        max_per_identity: int = DEFAULT_MAX_SUBSCRIPTIONS_PER_IDENTITY,
+    ) -> None:
         self._lock = threading.Lock()
         self._subs: dict[str, SubscriptionRecord] = {}
+        self._max_total = max_total
+        self._max_per_identity = max_per_identity
+        # subscriber ごとの現存 subscription 数。上限判定を O(1) にするため
+        # create/delete/evict_expired で増減させる。0 になった subscriber は key を落とす。
+        # 不変条件: sum(_per_subscriber_count.values()) == len(_subs)。
+        self._per_subscriber_count: dict[str, int] = {}
 
     def create(
         self,
@@ -95,7 +113,17 @@ class SubscriptionRegistry:
         lease_ttl: int,
         retain_seconds: int,
     ) -> SubscriptionRecord:
+        """新規 subscription を作成する。
+
+        Raises:
+            ResourceLimitExceeded: registry 総数または subscriber の登録数が上限に
+                達している場合。
+        """
         with self._lock:
+            if len(self._subs) >= self._max_total:
+                raise ResourceLimitExceeded("total")
+            if self._per_subscriber_count.get(subscriber, 0) >= self._max_per_identity:
+                raise ResourceLimitExceeded("per_identity")
             subscription_id = str(uuid.uuid4())
             record = SubscriptionRecord(
                 subscription_id=subscription_id,
@@ -106,7 +134,18 @@ class SubscriptionRegistry:
                 retain_seconds=retain_seconds,
             )
             self._subs[subscription_id] = record
+            self._per_subscriber_count[subscriber] = (
+                self._per_subscriber_count.get(subscriber, 0) + 1
+            )
             return record
+
+    def _decr_subscriber(self, subscriber: str) -> None:
+        """`subscriber` の現存 subscription 数を 1 減らす（lock 保持下で呼ぶこと）。"""
+        remaining = self._per_subscriber_count.get(subscriber, 0) - 1
+        if remaining <= 0:
+            self._per_subscriber_count.pop(subscriber, None)
+        else:
+            self._per_subscriber_count[subscriber] = remaining
 
     def get(self, subscription_id: str) -> SubscriptionRecord | None:
         with self._lock:
@@ -139,7 +178,9 @@ class SubscriptionRegistry:
 
     def delete(self, subscription_id: str) -> None:
         with self._lock:
-            self._subs.pop(subscription_id, None)
+            record = self._subs.pop(subscription_id, None)
+            if record is not None:
+                self._decr_subscriber(record.subscriber)
 
     def evict_expired(self, older_than_seconds: float) -> list[str]:
         """lease が `older_than_seconds` 秒より前に切れた subscription を registry から除去する。
@@ -159,7 +200,8 @@ class SubscriptionRegistry:
                 if record.lease_expires_at <= cutoff
             ]
             for subscription_id in expired_ids:
-                del self._subs[subscription_id]
+                record = self._subs.pop(subscription_id)
+                self._decr_subscriber(record.subscriber)
             return expired_ids
 
     def count(self) -> int:
@@ -189,7 +231,14 @@ def get_registry_from_state(app_state) -> SubscriptionRegistry:
     """
     registry = getattr(app_state, "subscription_registry", None)
     if registry is None:
-        registry = SubscriptionRegistry()
+        settings: Settings | None = getattr(app_state, "settings", None)
+        if settings is not None:
+            registry = SubscriptionRegistry(
+                max_total=settings.max_subscriptions_total,
+                max_per_identity=settings.max_subscriptions_per_identity,
+            )
+        else:
+            registry = SubscriptionRegistry()
         app_state.subscription_registry = registry
     return registry
 
@@ -339,7 +388,10 @@ async def create_subscription(request: Request) -> Response:
         retain_seconds = DEFAULT_RETAIN_SECONDS
 
     registry = get_registry(request)
-    record = registry.create(identity.id, frozenset(labels), lease_ttl, retain_seconds)
+    try:
+        record = registry.create(identity.id, frozenset(labels), lease_ttl, retain_seconds)
+    except ResourceLimitExceeded as exc:
+        return resource_limit_response("subscription", exc.scope)
     observability.record_event(
         request.app.state,
         "subscribe",
