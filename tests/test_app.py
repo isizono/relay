@@ -87,8 +87,9 @@ class TestOutboxUnavailable:
 
     def test_sqlite_error_returns_503(self, client, monkeypatch):
         headers = {"Authorization": "Bearer tok-abc"}
-        r = client.post("/streams", json={"stream_id": "s1"}, headers=headers)
+        r = client.post("/streams", json={"name": "s1"}, headers=headers)
         assert r.status_code == 201
+        stream_id = r.json()["stream_id"]
 
         import sqlite3
 
@@ -100,7 +101,7 @@ class TestOutboxUnavailable:
         monkeypatch.setattr(db_module, "get_connection", _boom)
 
         r = client.post(
-            "/streams/s1/messages", json={"body": "hello"}, headers=headers
+            f"/streams/{stream_id}/messages", json={"body": "hello"}, headers=headers
         )
         assert r.status_code == 503
         assert r.json()["code"] == "OutboxUnavailableError"

@@ -16,6 +16,7 @@ from relay.config import (
     MIN_LEASE_TTL_SECONDS,
     MIN_RETAIN_SECONDS,
 )
+from relay.errors import ResourceLimitExceeded
 from relay.subscriptions import SubscriptionRegistry
 
 
@@ -146,6 +147,49 @@ class TestSubscriptionRegistry:
         assert registry.evict_expired(older_than_seconds=3600) == []
 
 
+class TestSubscriptionRegistryResourceLimits:
+    def test_total_limit_rejects_create_beyond_cap(self):
+        registry = SubscriptionRegistry(max_total=2, max_per_identity=100)
+        registry.create("agent-a", frozenset({"x"}), 300, 86400)
+        registry.create("agent-b", frozenset({"x"}), 300, 86400)
+        with pytest.raises(ResourceLimitExceeded) as exc:
+            registry.create("agent-c", frozenset({"x"}), 300, 86400)
+        assert exc.value.scope == "total"
+
+    def test_per_identity_limit_rejects_third_from_same_subscriber(self):
+        registry = SubscriptionRegistry(max_total=100, max_per_identity=2)
+        registry.create("agent-a", frozenset({"x"}), 300, 86400)
+        registry.create("agent-a", frozenset({"y"}), 300, 86400)
+        with pytest.raises(ResourceLimitExceeded) as exc:
+            registry.create("agent-a", frozenset({"z"}), 300, 86400)
+        assert exc.value.scope == "per_identity"
+
+    def test_per_identity_limit_is_counted_per_subscriber(self):
+        registry = SubscriptionRegistry(max_total=100, max_per_identity=1)
+        registry.create("agent-a", frozenset({"x"}), 300, 86400)
+        # agent-a は上限だが agent-b は自分の枠で作成できる。
+        assert registry.create("agent-b", frozenset({"x"}), 300, 86400) is not None
+
+    def test_delete_frees_per_identity_slot(self):
+        registry = SubscriptionRegistry(max_total=100, max_per_identity=1)
+        record = registry.create("agent-a", frozenset({"x"}), 300, 86400)
+        with pytest.raises(ResourceLimitExceeded):
+            registry.create("agent-a", frozenset({"y"}), 300, 86400)
+        registry.delete(record.subscription_id)
+        # delete で枠が空いたので同一 subscriber が再び作成できる。
+        assert registry.create("agent-a", frozenset({"y"}), 300, 86400) is not None
+
+    def test_evict_expired_frees_per_identity_slot(self):
+        from datetime import datetime, timedelta, timezone
+
+        registry = SubscriptionRegistry(max_total=100, max_per_identity=1)
+        record = registry.create("agent-a", frozenset({"x"}), 300, 86400)
+        record.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=7200)
+        assert registry.evict_expired(older_than_seconds=3600) == [record.subscription_id]
+        # evict で枠が空いたので同一 subscriber が再び作成できる。
+        assert registry.create("agent-a", frozenset({"y"}), 300, 86400) is not None
+
+
 # ---------------------------------------------------------------------------
 # matching() 性能ベンチマーク（wire-api.md §10: 10,000 subs × 100 labels で p99 200ms）
 # ---------------------------------------------------------------------------
@@ -171,7 +215,11 @@ class TestMatchingPerformance:
         rng = random.Random(42)
         vocab = [f"label:{i}" for i in range(500)]
 
-        registry = SubscriptionRegistry()
+        # 単一 subscriber に SUBSCRIPTION_COUNT 件を積むベンチマークなので、DoS 防御の
+        # per-identity 上限（本番既定 1000）を SUBSCRIPTION_COUNT まで引き上げて構築する。
+        registry = SubscriptionRegistry(
+            max_total=self.SUBSCRIPTION_COUNT, max_per_identity=self.SUBSCRIPTION_COUNT
+        )
         for _ in range(self.SUBSCRIPTION_COUNT):
             k = rng.randint(1, 5)
             registry.create("agent-x", frozenset(rng.sample(vocab, k)), 300, 86400)
@@ -207,7 +255,11 @@ class TestMatchingPerformance:
         vocab = [f"label:{i}" for i in range(self.PUBLISH_LABEL_COUNT)]
         publish_labels = frozenset(vocab)
 
-        registry = SubscriptionRegistry()
+        # 単一 subscriber に SUBSCRIPTION_COUNT 件を積むベンチマークなので、DoS 防御の
+        # per-identity 上限（本番既定 1000）を SUBSCRIPTION_COUNT まで引き上げて構築する。
+        registry = SubscriptionRegistry(
+            max_total=self.SUBSCRIPTION_COUNT, max_per_identity=self.SUBSCRIPTION_COUNT
+        )
         for _ in range(self.SUBSCRIPTION_COUNT):
             # 各 subscription は publish labels の subset（= 必ずマッチ）。
             registry.create("agent-x", frozenset({rng.choice(vocab)}), 300, 86400)
@@ -346,6 +398,53 @@ class TestCreateSubscription:
         assert r.status_code == 401
 
 
+class TestCreateSubscriptionResourceLimits:
+    @pytest.fixture()
+    def limited_client(self, tmp_path):
+        from relay.config import Settings
+
+        settings = Settings(
+            db_path=str(tmp_path / "limited.db"),
+            server_log_path=str(tmp_path / "limited.jsonl"),
+            dispatcher_lock_path=str(tmp_path / "limited.lock"),
+            auth_tokens={"tok-a": "agent-a", "tok-b": "agent-b"},
+            max_subscriptions_total=3,
+            max_subscriptions_per_identity=2,
+        )
+        app = create_app(settings)
+        with TestClient(app) as c:
+            yield c
+
+    def _subscribe(self, client, token, subscriber, label):
+        return client.post(
+            "/subscriptions",
+            json={"subscriber": subscriber, "labels": [label]},
+            headers=_auth(token),
+        )
+
+    def test_within_limits_returns_201(self, limited_client):
+        r = self._subscribe(limited_client, "tok-a", "agent-a", "x")
+        assert r.status_code == 201
+
+    def test_per_identity_limit_returns_429(self, limited_client):
+        self._subscribe(limited_client, "tok-a", "agent-a", "x")
+        self._subscribe(limited_client, "tok-a", "agent-a", "y")
+        # agent-a の 3 件目は per-identity 上限(2)超過で拒否される。
+        r = self._subscribe(limited_client, "tok-a", "agent-a", "z")
+        assert r.status_code == 429
+        assert r.json()["code"] == "ResourceLimitExceededError"
+
+    def test_total_limit_returns_429(self, limited_client):
+        # agent-a 2 件 + agent-b 1 件で total 上限(3)に到達させる。
+        self._subscribe(limited_client, "tok-a", "agent-a", "x")
+        self._subscribe(limited_client, "tok-a", "agent-a", "y")
+        self._subscribe(limited_client, "tok-b", "agent-b", "x")
+        # agent-b は per-identity 枠に空きがあるが total 上限で拒否される。
+        r = self._subscribe(limited_client, "tok-b", "agent-b", "y")
+        assert r.status_code == 429
+        assert r.json()["code"] == "ResourceLimitExceededError"
+
+
 class TestRenewLease:
     def _subscribe(self, client, token="tok-a", subscriber="agent-a", labels=None):
         r = client.post(
@@ -371,6 +470,16 @@ class TestRenewLease:
         r = client.put(f"/subscriptions/{sid}/lease", json={}, headers=_auth("tok-b"))
         assert r.status_code == 404
         assert r.json()["code"] == "SubscriptionNotFoundError"
+
+    def test_non_owner_404_indistinguishable_from_missing(self, client):
+        # 他人の subscription_id を名指ししても、存在する subscription への非所有アクセスと
+        # 不在 id へのアクセスが同一の 404 SubscriptionNotFoundError になり、存在を露呈しない。
+        # 403 SubscriberMismatch は返さない（それは代理 subscribe 拒否専用で参照系では使わない）。
+        sid = self._subscribe(client)
+        other = client.put(f"/subscriptions/{sid}/lease", json={}, headers=_auth("tok-b"))
+        missing = client.put("/subscriptions/nope/lease", json={}, headers=_auth("tok-b"))
+        assert other.status_code == missing.status_code == 404
+        assert other.json()["code"] == missing.json()["code"] == "SubscriptionNotFoundError"
 
     def test_missing_subscription_returns_404(self, client):
         r = client.put("/subscriptions/nope/lease", json={}, headers=_auth("tok-a"))
@@ -593,9 +702,11 @@ class TestPublish:
 
     def test_publish_id_is_global_monotonic_across_lanes(self, client):
         """subscription レーンと stream レーンで publish_id を共有（グローバル単調）。"""
-        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        sid = client.post(
+            "/streams", json={"name": "s1"}, headers=_auth("tok-a")
+        ).json()["stream_id"]
         r1 = client.post(
-            "/streams/s1/messages", json={"body": "hello"}, headers=_auth("tok-a")
+            f"/streams/{sid}/messages", json={"body": "hello"}, headers=_auth("tok-a")
         )
         r2 = client.post(
             "/publish",
@@ -667,3 +778,102 @@ class TestPublish:
             )
             assert limited.status_code == 429
             assert "Retry-After" in limited.headers
+
+
+class TestInputFieldCaps:
+    """title 文字列長・labels 個数・label 文字列長のサーバー側上限（POST /subscriptions,
+    POST /publish）。上限内は通り、超過は 400 で拒否されることを検証する。
+    """
+
+    @pytest.fixture()
+    def capped_client(self, tmp_path):
+        from relay.config import Settings
+
+        settings = Settings(
+            db_path=str(tmp_path / "caps.db"),
+            server_log_path=str(tmp_path / "caps.jsonl"),
+            dispatcher_lock_path=str(tmp_path / "caps.lock"),
+            auth_tokens={"tok-a": "agent-a"},
+            max_title_length=10,
+            max_labels_count=3,
+            max_label_length=5,
+        )
+        app = create_app(settings)
+        with TestClient(app) as c:
+            yield c
+
+    # --- POST /subscriptions ---
+
+    def test_subscribe_labels_count_over_cap_returns_400(self, capped_client):
+        r = capped_client.post(
+            "/subscriptions",
+            json={"subscriber": "agent-a", "labels": ["a", "b", "c", "d"]},
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 400
+        assert r.json()["code"] == "LabelValidationError"
+
+    def test_subscribe_label_length_over_cap_returns_400(self, capped_client):
+        r = capped_client.post(
+            "/subscriptions",
+            json={"subscriber": "agent-a", "labels": ["toolong"]},
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 400
+        assert r.json()["code"] == "LabelValidationError"
+
+    def test_subscribe_at_cap_boundary_accepted(self, capped_client):
+        r = capped_client.post(
+            "/subscriptions",
+            json={"subscriber": "agent-a", "labels": ["aaaaa", "b", "c"]},
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 201
+
+    # --- POST /publish ---
+
+    def test_publish_labels_count_over_cap_returns_400(self, capped_client):
+        r = capped_client.post(
+            "/publish",
+            json={
+                "ref": {"type": "decision", "id": 1},
+                "labels": ["a", "b", "c", "d"],
+            },
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 400
+        assert r.json()["code"] == "LabelValidationError"
+
+    def test_publish_label_length_over_cap_returns_400(self, capped_client):
+        r = capped_client.post(
+            "/publish",
+            json={"ref": {"type": "decision", "id": 1}, "labels": ["toolong"]},
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 400
+        assert r.json()["code"] == "LabelValidationError"
+
+    def test_publish_title_length_over_cap_returns_400(self, capped_client):
+        r = capped_client.post(
+            "/publish",
+            json={
+                "ref": {"type": "decision", "id": 1},
+                "labels": ["x"],
+                "title": "x" * 11,
+            },
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 400
+        assert r.json()["code"] == "InvalidRequestError"
+
+    def test_publish_at_cap_boundary_accepted(self, capped_client):
+        r = capped_client.post(
+            "/publish",
+            json={
+                "ref": {"type": "decision", "id": 1},
+                "labels": ["aaaaa", "b", "c"],
+                "title": "x" * 10,
+            },
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 202

@@ -63,6 +63,7 @@ class FakeRelay:
         self._silence = False
         self._drop_generation = 0
         self._stop = False
+        self._raw_injections: list[bytes] = []
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._make_handler())
         self._server.fake = self  # handler から参照
@@ -135,6 +136,15 @@ class FakeRelay:
         """
         with self._lock:
             self._silence = enabled
+
+    def inject_raw_sse(self, blob: bytes) -> None:
+        """アクティブな SSE stream に任意の生バイト列をそのまま書き込む。
+
+        壊れた JSON / 未知 event 型 / フィールド欠落 / 途中切断された行など、正規経路
+        （`publish`）では作れない不正フレームを注入し、受信ループの耐性を検証する用途。
+        """
+        with self._lock:
+            self._raw_injections.append(blob)
 
     # -- test convenience -------------------------------------------------
 
@@ -374,8 +384,11 @@ class FakeRelay:
                                 if sub_id in fake._lost or sub_id not in fake._subs:
                                     return
                             silent = fake._silence
+                            injected: list[bytes] = []
                             pending: list[dict] = []
                             if not silent:
+                                injected = fake._raw_injections
+                                fake._raw_injections = []
                                 for sub_id in ids:
                                     for entry in fake._outbox.get(sub_id, []):
                                         if entry["publish_id"] > cursors[sub_id]:
@@ -386,6 +399,9 @@ class FakeRelay:
                             # （接続自体は close しない）。
                             time.sleep(0.02)
                             continue
+                        for blob in injected:
+                            self.wfile.write(blob)
+                            self.wfile.flush()
                         for entry in pending:
                             self._write_sse_event(entry)
                             sid = entry["delivery_target"].split(":", 1)[1]

@@ -48,6 +48,33 @@ DEFAULT_AGENT_CARD_CACHE_TTL_SECONDS = 3600  # 1h
 # 猶予の長さは機能上の互換性には影響しない。
 DEFAULT_SUBSCRIPTION_REGISTRY_RETENTION_SECONDS = 3600  # 1h
 
+# close 済み stream を in-memory registry に残しておく猶予秒数。この猶予を過ぎ、かつ
+# その stream の未配達 outbox エントリが drain し切ったものだけを registry から除去する
+# （close されたまま放置された stream record による registry の無制限成長を防ぐ）。
+# subscription 側 lease 猶予（上記）と対称。
+DEFAULT_STREAM_REGISTRY_RETENTION_SECONDS = 3600  # 1h
+
+# stream / subscription registry の資源上限（DoS 防御）。total は registry 全体、
+# per-identity は 1 identity が保持できる数の上限（単一 peer による総枠の占有を防ぐ）。
+# in-memory record は 1 件あたり高々 1KB 程度で、total 上限でも registry 全体のメモリは
+# 数十 MB 未満に収まる。値は「想定同時 peer 数（〜20）× 1 peer あたり想定リソース数
+# （〜1000）」を目安に total を置き、per-identity をその 1/20 とした現実的な初期値。
+DEFAULT_MAX_STREAMS_TOTAL = 20000
+DEFAULT_MAX_STREAMS_PER_IDENTITY = 1000
+DEFAULT_MAX_SUBSCRIPTIONS_TOTAL = 20000
+DEFAULT_MAX_SUBSCRIPTIONS_PER_IDENTITY = 1000
+
+# publish / subscribe の入力フィールド上限（DoS 防御）。無制限の title 文字列や大量の
+# label は registry / outbox のメモリを膨らませる。値は routing key（label）と表示用
+# 見出し（title）の実運用サイズを目安にした現実的な初期値で、いずれも設定可能。
+# title 上限 200 は relay-v2-wire-api.md §5.4 の記載（max 200 UTF-8 chars）に揃える。
+DEFAULT_MAX_TITLE_LENGTH = 200
+DEFAULT_MAX_LABELS_COUNT = 32
+DEFAULT_MAX_LABEL_LENGTH = 128
+# stream の name は canonical stream_id（"{creator}:{name}"）の一部として registry・outbox・
+# delivery target key に埋め込まれるため、label と同じ識別子系の上限に揃える。
+DEFAULT_MAX_STREAM_NAME_LENGTH = 128
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -83,6 +110,19 @@ class Settings:
     subscription_registry_retention_seconds: float = (
         DEFAULT_SUBSCRIPTION_REGISTRY_RETENTION_SECONDS
     )
+    stream_registry_retention_seconds: float = DEFAULT_STREAM_REGISTRY_RETENTION_SECONDS
+
+    # registry 資源上限（DoS 防御）
+    max_streams_total: int = DEFAULT_MAX_STREAMS_TOTAL
+    max_streams_per_identity: int = DEFAULT_MAX_STREAMS_PER_IDENTITY
+    max_subscriptions_total: int = DEFAULT_MAX_SUBSCRIPTIONS_TOTAL
+    max_subscriptions_per_identity: int = DEFAULT_MAX_SUBSCRIPTIONS_PER_IDENTITY
+
+    # 入力フィールド上限（DoS 防御）
+    max_title_length: int = DEFAULT_MAX_TITLE_LENGTH
+    max_labels_count: int = DEFAULT_MAX_LABELS_COUNT
+    max_label_length: int = DEFAULT_MAX_LABEL_LENGTH
+    max_stream_name_length: int = DEFAULT_MAX_STREAM_NAME_LENGTH
 
 
 def _load_auth_tokens_from_env() -> dict[str, str]:
@@ -153,6 +193,40 @@ def load_settings_from_env() -> Settings:
                 "RELAY_SUBSCRIPTION_REGISTRY_RETENTION_SECONDS",
                 DEFAULT_SUBSCRIPTION_REGISTRY_RETENTION_SECONDS,
             )
+        ),
+        stream_registry_retention_seconds=float(
+            os.environ.get(
+                "RELAY_STREAM_REGISTRY_RETENTION_SECONDS",
+                DEFAULT_STREAM_REGISTRY_RETENTION_SECONDS,
+            )
+        ),
+        max_streams_total=int(
+            os.environ.get("RELAY_MAX_STREAMS_TOTAL", DEFAULT_MAX_STREAMS_TOTAL)
+        ),
+        max_streams_per_identity=int(
+            os.environ.get(
+                "RELAY_MAX_STREAMS_PER_IDENTITY", DEFAULT_MAX_STREAMS_PER_IDENTITY
+            )
+        ),
+        max_subscriptions_total=int(
+            os.environ.get(
+                "RELAY_MAX_SUBSCRIPTIONS_TOTAL", DEFAULT_MAX_SUBSCRIPTIONS_TOTAL
+            )
+        ),
+        max_subscriptions_per_identity=int(
+            os.environ.get(
+                "RELAY_MAX_SUBSCRIPTIONS_PER_IDENTITY",
+                DEFAULT_MAX_SUBSCRIPTIONS_PER_IDENTITY,
+            )
+        ),
+        max_title_length=int(
+            os.environ.get("RELAY_MAX_TITLE_LENGTH", DEFAULT_MAX_TITLE_LENGTH)
+        ),
+        max_labels_count=int(
+            os.environ.get("RELAY_MAX_LABELS_COUNT", DEFAULT_MAX_LABELS_COUNT)
+        ),
+        max_label_length=int(
+            os.environ.get("RELAY_MAX_LABEL_LENGTH", DEFAULT_MAX_LABEL_LENGTH)
         ),
     )
 

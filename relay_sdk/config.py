@@ -31,6 +31,13 @@ MAX_TITLE_CHARS = 200
 # SSE dedup LRU の保持件数（relay-v2-sdk.md §4.2）。
 DEDUP_LRU_SIZE = 10000
 
+# SSE 受信の memory 安全上限（relay-v2-sdk.md §4.2）。relay の notification frame は
+# 数 KB 程度（ref + labels + title<=200 chars）。壊れた/悪意ある巨大 frame や、改行を
+# 送らないサーバに対してメモリを無制限に食わないための頭打ち。生 wire に対する上限
+# なので JSON decode 前に効く。
+SSE_MAX_FRAME_BYTES = 1 << 20  # 1 frame（event）の data 累積 byte 上限（1 MiB）
+SSE_MAX_BUFFER_BYTES = 1 << 20  # 改行未達の 1 行としてバッファできる byte 上限（1 MiB）
+
 
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)

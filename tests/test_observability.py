@@ -80,13 +80,62 @@ class TestRecordEvent:
         app_state, settings = _state(tmp_path)
         total = observability.RECENT_WARNINGS_MAXLEN + 5
         for i in range(total):
-            observability.record_event(app_state, "dispatcher_error", level="warning", seq=i)
+            observability.record_event(
+                app_state, "outbox_dead", level="warning", publish_id=i
+            )
 
         warnings = list(app_state.recent_warnings)
         assert len(warnings) == observability.RECENT_WARNINGS_MAXLEN
-        # 最も古い 5 件（seq=0..4）は捨てられ、直近分だけが残る。
-        assert warnings[0]["seq"] == 5
-        assert warnings[-1]["seq"] == total - 1
+        # 最も古い 5 件（publish_id=0..4）は捨てられ、直近分だけが残る。
+        assert warnings[0]["publish_id"] == 5
+        assert warnings[-1]["publish_id"] == total - 1
+
+    def test_recent_warnings_omits_free_form_reason(self, tmp_path):
+        app_state, settings = _state(tmp_path)
+        observability.record_event(
+            app_state, "authn_failed", level="warning", reason="bad token abc123 secret"
+        )
+
+        warning = list(app_state.recent_warnings)[0]
+        assert warning["event"] == "authn_failed"
+        assert "reason" not in warning
+        # full な entry（reason 込み）はサーバーログ側に残る。
+        entry = json.loads(open(settings.server_log_path, encoding="utf-8").readline())
+        assert entry["reason"] == "bad token abc123 secret"
+
+    def test_recent_warnings_omits_peer_identity(self, tmp_path):
+        app_state, settings = _state(tmp_path)
+        observability.record_event(
+            app_state,
+            "sse_slow_consumer_disconnect",
+            level="warning",
+            identity="agent-secret",
+        )
+
+        warning = list(app_state.recent_warnings)[0]
+        assert warning["event"] == "sse_slow_consumer_disconnect"
+        assert "identity" not in warning
+        assert "agent-secret" not in json.dumps(warning)
+
+    def test_recent_warnings_keeps_structural_identifiers(self, tmp_path):
+        app_state, settings = _state(tmp_path)
+        observability.record_event(
+            app_state,
+            "outbox_dead",
+            level="warning",
+            publish_id=7,
+            target_type="stream",
+            stream_id="s1",
+            subscription_id="sub-1",
+            error_code="RetainExceeded",
+        )
+
+        warning = list(app_state.recent_warnings)[0]
+        assert warning["publish_id"] == 7
+        assert warning["target_type"] == "stream"
+        assert warning["stream_id"] == "s1"
+        assert warning["subscription_id"] == "sub-1"
+        assert warning["error_code"] == "RetainExceeded"
 
     def test_recent_warnings_works_without_settings(self, tmp_path):
         """ファイル sink が no-op（settings なし）でも recent_warnings は積まれる。"""
@@ -327,7 +376,7 @@ class TestGetStatusEndpoint:
         assert r.json()["uptime_seconds"] >= 0
 
     def test_counts_reflect_created_stream_and_subscription(self, client):
-        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        client.post("/streams", json={"name": "s1"}, headers=_auth("tok-a"))
         client.post(
             "/subscriptions",
             json={"subscriber": "agent-a", "labels": ["x"]},
@@ -342,13 +391,15 @@ class TestGetStatusEndpoint:
         # bootstrap member（作成者）は既定で write のみ（read を持たない）ため、
         # read_write を明示付与しないと outbox にエントリが作られない
         # （wire-api.md §3.1、`relay/streams.py` の `StreamRegistry.create` docstring 参照）。
-        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        sid = client.post(
+            "/streams", json={"name": "s1"}, headers=_auth("tok-a")
+        ).json()["stream_id"]
         client.put(
-            "/streams/s1/members",
+            f"/streams/{sid}/members",
             json={"identity": "agent-a", "access": "read_write"},
             headers=_auth("tok-a"),
         )
-        client.post("/streams/s1/messages", json={"body": "hi"}, headers=_auth("tok-a"))
+        client.post(f"/streams/{sid}/messages", json={"body": "hi"}, headers=_auth("tok-a"))
 
         body = client.get("/status", headers=_auth("tok-a")).json()
         assert body["outbox_pending_count"] == 1
@@ -367,6 +418,28 @@ class TestGetStatusEndpoint:
             for w in body["recent_warnings"]
         )
 
+    def test_status_does_not_leak_warning_reason_or_identity(self, client):
+        observability.record_event(
+            client.app.state,
+            "authn_failed",
+            level="warning",
+            reason="Bearer leaked-token-xyz rejected",
+        )
+        observability.record_event(
+            client.app.state,
+            "sse_slow_consumer_disconnect",
+            level="warning",
+            identity="agent-victim",
+        )
+        r = client.get("/status", headers=_auth("tok-a"))
+        raw = r.text
+        assert "leaked-token-xyz" not in raw
+        assert "agent-victim" not in raw
+        # warning の存在（種別）自体は残る。
+        events = {w["event"] for w in r.json()["recent_warnings"]}
+        assert "authn_failed" in events
+        assert "sse_slow_consumer_disconnect" in events
+
 
 class TestGetMetricsEndpoint:
     def test_requires_authn(self, client):
@@ -381,18 +454,38 @@ class TestGetMetricsEndpoint:
         assert "# TYPE relay_ack_received_total counter" in r.text
 
     def test_reflects_publish_and_ack_activity(self, client):
-        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        sid = client.post(
+            "/streams", json={"name": "s1"}, headers=_auth("tok-a")
+        ).json()["stream_id"]
         client.put(
-            "/streams/s1/members",
+            f"/streams/{sid}/members",
             json={"identity": "agent-a", "access": "read_write"},
             headers=_auth("tok-a"),
         )
-        client.post("/streams/s1/messages", json={"body": "hi"}, headers=_auth("tok-a"))
-        client.post("/streams/s1/ack", json={"up_to_publish_id": 1}, headers=_auth("tok-a"))
+        client.post(f"/streams/{sid}/messages", json={"body": "hi"}, headers=_auth("tok-a"))
+        client.post(f"/streams/{sid}/ack", json={"up_to_publish_id": 1}, headers=_auth("tok-a"))
 
         body = client.get("/metrics", headers=_auth("tok-a")).text
-        assert 'relay_publish_received_total{publisher_identity="agent-a"} 1' in body
+        assert "relay_publish_received_total 1" in body
         assert "relay_ack_received_total 1" in body
+
+    def test_metrics_do_not_expose_publisher_identity(self, client):
+        sid = client.post(
+            "/streams", json={"name": "s1"}, headers=_auth("tok-a")
+        ).json()["stream_id"]
+        client.put(
+            f"/streams/{sid}/members",
+            json={"identity": "agent-a", "access": "read_write"},
+            headers=_auth("tok-a"),
+        )
+        client.post(f"/streams/{sid}/messages", json={"body": "hi"}, headers=_auth("tok-a"))
+
+        body = client.get("/metrics", headers=_auth("tok-a")).text
+        # カウンタ値は出るが、publisher の identity は label に現れない。
+        # canonical stream_id（"agent-a:s1"）に identity が含まれるが、それも metrics に漏れない。
+        assert "relay_publish_received_total 1" in body
+        assert "publisher_identity" not in body
+        assert "agent-a" not in body
 
     def test_publish_failure_increments_failure_counter_with_reason_label(self, client):
         # 存在しない stream への投函は publish 失敗（stream_not_found）としてカウントされる。

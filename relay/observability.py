@@ -16,10 +16,12 @@ Foundation の元 docstring は「構造化ログ」（`publish_id` で trace �
 **購読者向け読み取り endpoint は一切持たない**（wire-api.md §7.3 が明示的に禁止する
 「`since=N` 型 pull の裏口化」を避けるため）。
 
-`record_event(app_state, event_type, level="info"|"warning", **fields)` の `level` は
-本タスクで追加した統一フィールド。`level="warning"` の event は、サーバーログへの追記に加えて
-`app_state` 上の in-memory リングバッファ（既定 50 件、`RECENT_WARNINGS_MAXLEN`）にも積まれ、
-`GET /status` の `recent_warnings` はこのバッファをそのまま返す。warning 対象は
+`record_event(app_state, event_type, level="info"|"warning", **fields)` の `level="warning"`
+event は、サーバーログへの追記に加えて `app_state` 上の in-memory リングバッファ
+（既定 50 件、`RECENT_WARNINGS_MAXLEN`）にも積まれる。`GET /status` の `recent_warnings` は
+このバッファを返すが、任意の認証済み client に露出するため、バッファには warning の構造的な
+識別子（`_STATUS_WARNING_SAFE_FIELDS`）のみを載せ、free-form な reason / peer identity /
+payload・title 本文は落とす（full な entry はサーバーログ側にのみ残る）。warning 対象は
 DLQ 移動（`outbox_dead`）・subscription registry からの lease 切れ除去
 （`subscription_registry_evicted`）・dispatcher 内部エラー（`dispatcher_error`）・
 SSE slow consumer 強制切断（`sse_slow_consumer_disconnect`）・認証失敗（`authn_failed`）。
@@ -32,8 +34,10 @@ in-memory で積算し、呼び出し側（`streams.py` / `subscriptions.py` / `
 gauge 系（`relay_outbox_depth` / `relay_sse_connections`）は積算せず、`GET /metrics` の
 スクレイプ時点で DB / `ConnectionManager` から実測して都度計算する（カウンタの drift を防ぐため）。
 
-label には `subscription_id` や `delivery_target` を使わない（wire-api.md §7.2、
-subscription_id 露出防止 + label cardinality 爆発の回避）。
+metric の label には peer identity（`publisher_identity`）・`subscription_id`・
+`delivery_target` を使わない（wire-api.md §7.2）。`GET /metrics` は任意の認証済み client が
+読めるため、他 peer の identity 列挙・subscription_id 露出・label cardinality 爆発を避ける。
+publisher identity の trace が要る場合は構造化ログ（`record_event`）側にのみ載せる。
 """
 from __future__ import annotations
 
@@ -58,6 +62,23 @@ _GC_MIN_INTERVAL_SECONDS = 3600  # 期限切れ行の間引きは 1 時間に 1 
 
 # `GET /status` の `recent_warnings` が保持する件数（in-memory リングバッファ、app 単位）。
 RECENT_WARNINGS_MAXLEN = 50
+
+# recent_warnings は `GET /status` で任意の認証済み client に返るため、warning event の
+# フィールドのうち構造的な resource 識別子だけをこの allowlist で通す。free-form な reason /
+# peer identity / payload・title 本文はここに含めない（含めると cross-tenant のユーザーデータ
+# 漏洩になる）。未知フィールドは default-deny で落とすので、新しい warning event が安全でない
+# フィールドを足しても /status からは漏れない。full な entry はサーバーログ sink 側に残る。
+_STATUS_WARNING_SAFE_FIELDS = frozenset(
+    {
+        "lane",
+        "target_type",
+        "publish_id",
+        "stream_id",
+        "subscription_id",
+        "error_code",
+        "oldest_unacked_publish_id",
+    }
+)
 
 _write_lock = threading.Lock()
 
@@ -87,7 +108,9 @@ def record_event(app_state: Any, event_type: str, *, level: str = "info", **fiel
     """構造化ログ 1 件をサーバーログ sink に append する。
 
     `level="warning"`（既定は `"info"`）の event は、`app_state` 上の in-memory
-    `recent_warnings` リングバッファにも同時に積む（`GET /status` 用）。
+    `recent_warnings` リングバッファにも同時に積む（`GET /status` 用）。バッファには
+    `_STATUS_WARNING_SAFE_FIELDS` に載る識別子のみを積み、reason / identity / payload 等は
+    サーバーログ側の full な entry にのみ残す。
 
     `settings` が取れない呼び出し（テストの最小 fixture 等）ではファイル書き込みのみ
     無視して no-op にする（observability は best-effort、配達経路そのものには一切関与しない）。
@@ -95,8 +118,14 @@ def record_event(app_state: Any, event_type: str, *, level: str = "info", **fiel
     entry = {"ts": _ts_format(_now()), "event": event_type, "level": level, **fields}
 
     if level == "warning":
+        safe_view = {
+            "ts": entry["ts"],
+            "event": event_type,
+            "level": level,
+            **{k: v for k, v in fields.items() if k in _STATUS_WARNING_SAFE_FIELDS},
+        }
         with _write_lock:
-            _get_recent_warnings(app_state).append(entry)
+            _get_recent_warnings(app_state).append(safe_view)
 
     settings: Settings | None = getattr(app_state, "settings", None)
     if settings is None:

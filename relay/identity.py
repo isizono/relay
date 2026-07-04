@@ -5,9 +5,9 @@
 - JCS（rfc-8785, MUST）による正規化、JWS（rfc-7515, MAY）による AgentCard 署名 / 検証（§1.2, §1.3）
 - Bearer token 検証（§1.5.1 最小セット: `HTTPAuthSecurityScheme{scheme:"bearer"}`）
 
-authZ（structural / semantic）はこのモジュールの対象外。read は全許可・publish は authN
-のみ・subscribe は authZ 対象外という境界（§2）に従い、各 endpoint 側で structural authZ
-（membership / ownership 照合）を追加で行う。
+authZ（structural / semantic）はこのモジュールの対象外。§2 の境界（instance-global read は
+authN のみ、resource 名指しの参照・状態変更は structural authZ、subscribe は authZ 対象外）に
+従い、structural authZ（membership / ownership 照合）は各 endpoint 側で追加で行う。
 """
 from __future__ import annotations
 

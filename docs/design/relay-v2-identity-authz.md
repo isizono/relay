@@ -28,9 +28,11 @@
 ## 0. 一行で言うと
 
 **relay の identity は A2A 1.0 spec の AgentCard + SecurityScheme + （任意で）JWS 署名で閉じる。
-relay 側 authZ は構造判定（structural authZ）に限定する: read は全許可、subscribe（labels 宣言）は
-authZ 対象外、relay 自身の resource を変更する操作と `subscription_id` を名指しで参照する操作は
-membership / 当事者性（ownership）という relay 内部の構造的事実のみで判定する。relay は command
+relay 側 authZ は構造判定（structural authZ）に限定する: instance-global な read（`GET /status` /
+`GET /metrics` / AgentCard）は authN のみ、特定 resource を名指しで参照する read（stream メタ /
+member 一覧、`subscription_id` を名指しする操作）と relay 自身の resource を変更する操作は
+membership / 当事者性（ownership）という relay 内部の構造的事実のみで判定し、非当事者には存在
+秘匿の `404` を返す（A2A 1.0 spec §7.5）。subscribe（labels 宣言）は authZ 対象外。relay は command
 （close / cancel / spawn 等の ow 命令語彙）を認識しない。「この identity がこの操作をしてよいか」
 という意味判定（semantic authZ）はすべて relay の外、cc-memory MCP handler 内で同期判定する。**
 
@@ -246,19 +248,32 @@ cancel なのか worker の spawn なのか）を判定材料にした時点で 
 > spawn 等）の発行可否ゲート」という表現は、relay が ow の命令語彙を認識するかのように読めるため
 > 本書では採らない（§2.2）。FR-5.5 側の表現は本書に合わせて更新すべきである。
 
-### 2.1 read は全許可
+### 2.1 read は 2 分類（instance-global は authN のみ / resource 名指しは構造判定）
 
-GET 系 endpoint（`GET /streams/{id}`、`GET /streams/{id}/members`、`GET /status`、
+read 系 endpoint は「特定 resource を名指しするか」で扱いが分かれる。
+
+**instance-global read — authN のみ。** 特定 resource を名指ししない endpoint（`GET /status`、
 `GET /metrics`、`GET /.well-known/agent-card.json` 等）は **authN（identity 確認）のみで authZ なし**
 で通す。
 
 - A2A 1.0 spec §7.4 の MUST に従い、認証は全 request に対して行う。
-- 認証済み identity であれば、relay が公開する read 系 endpoint には誰でも access できる。
-- 「特定 entity の閲覧禁止」のような細粒度 read filter は relay は持たない。必要なら publisher 側
-  （cc-memory 側）で公開 vs 非公開を分けて publish する。
-- **例外は `GET /events`**: endpoint 自体は認証のみで開けるが、query の `subscription_ids=` に列挙した
-  各 id には ownership 検証（structural authZ の一部、§2.2）が掛かる。非所有・不明の id を 1 つでも
-  含む接続はワイヤ仕様 §5.5 / §5.7 に従い `404 Not Found` で拒否される。
+- 認証済み identity であれば、これらの endpoint には誰でも access できる。
+
+**resource 名指し read — membership / ownership の構造判定 + 存在秘匿 `404`。** 特定 resource を
+id で名指しして参照する endpoint には §2.2 の構造判定が掛かる。
+
+- `GET /streams/{id}`（stream メタ取得）/ `GET /streams/{id}/members`（member 一覧）: 呼び出し
+  identity が当該 stream の **member であること**（`access` 種別は問わない。write 単独の member —
+  作成者 bootstrap を含む — も自分が属する stream を参照できる）。非メンバーには**不在の
+  stream_id と同一の `404 Not Found`** を返し、stream の存在・member 構成を露呈しない
+  （A2A 1.0 spec §7.5。`403` での拒否は resource 存在の露呈になるため使わない）。
+- `GET /events`: endpoint 自体は認証のみで開けるが、query の `subscription_ids=` に列挙した各 id には
+  ownership 検証（§2.2）が掛かる。非所有・不明の id を 1 つでも含む接続はワイヤ仕様 §5.5 / §5.7 に
+  従い `404 Not Found` で拒否される。
+
+いずれの判定も membership / ownership という構造的事実との照合であり、**message body の内容に
+基づく細粒度 read filter**（「特定 entity の閲覧禁止」等）は relay は持たない（それは意味判定）。
+必要なら publisher 側（cc-memory 側）で公開 vs 非公開を分けて publish する。
 
 ### 2.2 状態変更系は構造判定のみ（relay に command 概念は存在しない）
 
@@ -271,13 +286,19 @@ relay 自身の resource を変更する endpoint、および特定 resource を
 
 | endpoint | 構造判定 |
 |---|---|
-| `POST /streams/{id}/messages`（場への投函） | 投函者が当該 stream の **write 権限を持つ member**（`access: "write" \| "read_write"`）であること |
-| `DELETE /streams/{id}`（stream の close） | 呼び出し identity が当該 stream の write 権限を持つ member であること |
-| `PUT /streams/{id}/members` / `DELETE /streams/{id}/members`（membership 変更） | 呼び出し identity が当該 stream の write 権限を持つ member であること。ただし自分自身の membership 削除（離脱）は本人であれば常に許可する |
+| `POST /streams/{id}/messages`（場への投函） | 投函者が当該 stream の **write 権限を持つ member**（`access: "write" \| "read_write"`）であること。完全非メンバー・不在の stream_id は同一の `404`（存在露呈回避）、write 権限のない member は `403` |
+| `DELETE /streams/{id}`（stream の close） | 呼び出し identity が当該 stream の write 権限を持つ member であること。完全非メンバー・不在の stream_id は同一の `404`（存在露呈回避）、write 権限のない member は `403` |
+| `PUT /streams/{id}/members` / `DELETE /streams/{id}/members`（membership 変更） | 呼び出し identity が当該 stream の write 権限を持つ member であること。ただし自分自身の membership 削除（離脱）は member 本人であれば常に許可する。完全非メンバー（自己離脱の試行を含む）・不在の stream_id は同一の `404`（存在露呈回避）、write 権限のない member による他 member の変更は `403` |
+| `GET /streams/{id}`（メタ取得）/ `GET /streams/{id}/members`（member 一覧） | 呼び出し identity が当該 stream の **member** であること（`access` 種別は問わない、§2.1）。非メンバー・不在の stream_id は同一の `404 Not Found`（存在露呈回避、A2A 1.0 spec §7.5） |
 | `DELETE /subscriptions/{id}`（unsubscribe）/ `PUT /subscriptions/{id}/lease`（lease renew）/ `GET /events` の `subscription_ids=` / `POST /subscriptions/{id}/ack`（ack） | 呼び出し identity がその subscription の **subscriber 本人**であること（ownership 検証、ワイヤ仕様 §5.7）。非所有・不明の id は `404 Not Found`（存在露呈回避） |
-| `POST /streams/{id}/ack`（場レーン ack） | 対象エントリが「場 × 呼び出し identity」に解決される。他 member 宛のエントリは構造上指定できないため ownership 違反が存在しない（ワイヤ仕様 §5.6 / §5.7） |
+| `POST /streams/{id}/ack`（場レーン ack） | 呼び出し identity が当該 stream の **read 権限を持つ member** であること（非該当・不在の場は同一の `404`、ワイヤ仕様 §5.6 / §5.7）。対象エントリは「場 × 呼び出し identity」に解決され、他 member 宛のエントリは構造上指定できないため ownership 違反が存在しない |
 
 - いずれも relay が resource 作成時に機械的に記録した構造的事実との照合であり、意味解釈を含まない。
+- 拒否応答は 2 段階で使い分ける: **完全非メンバー**（membership に不在の identity）には、参照系・
+  書き込み系を問わず不在の stream_id と同一の `404 Not Found` を返す。参照系（§2.1）だけ秘匿しても
+  書き込み endpoint への probe で存在が判別できてはバイパスになるため、全 endpoint で統一する。
+  **権限不足の member**（read 単独 member による投函 / close / membership 変更）は stream の存在を
+  正当に知っているため `403` で理由を区別して返してよい。
 - membership の field は `access`（`"read" | "write" | "read_write"`。write = 投函権、read = 受信権）
   であり、`role` という語彙は relay の状態モデルに置かない（下記の authZ table 不採用と同根）。
 - 「他者の subscription を切る」という操作経路はそもそも存在しない。非所有者からの
@@ -287,6 +308,12 @@ relay 自身の resource を変更する endpoint、および特定 resource を
 - bootstrap: stream 作成者（`POST /streams` の呼び出し identity）は作成時に write 権限を持つ member
   （`access: "write"`）として自動登録される。これがないと、空の stream に最初の member を追加できる
   identity が存在しなくなる。受信も必要なら作成後に自分の access を `read_write` に更新する。
+- stream_id の identity スコープ化: stream_id は作成者 identity でスコープ化された canonical id
+  （`{作成者 identity}:{name}`）であり、作成者は名前空間内の `name` のみを選べる（ワイヤ仕様 §3.1）。
+  これにより、ある identity が別 identity の名前空間で stream を作成することが構造的に不可能になり、
+  予測可能な stream_id を先取りして正規利用者を締め出す / squat した stream に write member として
+  居座る、という名前空間の横取り（squatting）が成立しなくなる。membership（構造判定の材料）と併せ、
+  「誰の stream か」を creator identity として stream_id 自体に構造化する。
 - 「identity → 許可 command 集合」のマッピング（authZ table）は**持たない**。この table の判定には
   「この identity は command を発行できる主体か」という identity の分類が必要であり、それは事実上の
   role 定義である。role 概念を relay に持ち込まないという責務境界（relay = メカニズム / ow =
@@ -294,8 +321,9 @@ relay 自身の resource を変更する endpoint、および特定 resource を
 
 > **note**: 機能要件文書 FR-5.5 は「coarse-grained authZ は relay の責務」と定める。本書はその
 > 実体を上表の構造判定と定義する。publish は構造判定（write 権限の membership）の対象、
-> subscribe は対象外、read は authN のみ（`GET /events` の `subscription_ids=` 参照への ownership
-> 検証を除く）である（§2.1 / §2.3 / §2.4）。
+> subscribe は対象外、read は instance-global（`GET /status` 等）が authN のみ、resource 名指し
+> （stream メタ / member 一覧、`GET /events` の `subscription_ids=` 参照）が構造判定の対象である
+> （§2.1 / §2.3 / §2.4）。
 
 ### 2.3 publish は authN のみ
 
