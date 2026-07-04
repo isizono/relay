@@ -515,10 +515,13 @@ relay v2 は、エージェント間で非同期に流れるメッセージを a
 
 **詳細**:
 
-- read 系 endpoint（GET 各種）は authN のみで通す。「特定 entity の閲覧禁止」のような
-  細粒度 read filter は relay は持たない。必要なら publisher 側で公開 / 非公開を分けて
-  publish する。ただし `GET /events` の `subscription_ids=` に列挙した各 id には
-  ownership 検証（structural authZ の一部）が掛かる。
+- read 系 endpoint は 2 分類。instance-global（`GET /status` / `GET /metrics` / AgentCard 等）
+  は authN のみで通す。特定 resource を名指しする参照（`GET /streams/{id}` のメタ取得 /
+  `GET /streams/{id}/members` の member 一覧、`GET /events` の `subscription_ids=` 参照）には
+  membership / ownership の構造判定（structural authZ の一部）が掛かり、非当事者には不在 id と
+  同一の `404` を返して存在を露呈しない。「特定 entity の閲覧禁止」のような message body の
+  内容に基づく細粒度 read filter は relay は持たない。必要なら publisher 側で公開 / 非公開を
+  分けて publish する。
 - publish は authN のみで通す。「この labels への publish は禁止」のような細粒度 filter は
   relay は持たない。ただし stream への投函は write 権限の membership を要求する
   （structural authZ の一部）。
@@ -528,7 +531,8 @@ relay v2 は、エージェント間で非同期に流れるメッセージを a
   「identity → 許可 command 集合」の authZ table も持たない（それは事実上の role 定義で
   あり、role 概念を relay に持ち込まないという責務境界に反する）。`DELETE /streams/{id}`
   などの状態変更系は write 権限の membership / subscriber 当事者性という構造的事実の照合
-  だけで通す。
+  だけで通す。拒否は 2 段階で、完全非メンバー / 非所有者には不在 id と同一の `404`（存在
+  秘匿）、権限不足の member には `403` を返す。
 - 意味判定（「この identity がこの場の close を呼んでよいか」「この spawn を許可すべき
   状況か」など）は relay の外で、かつ操作の実行と同じプロセス内で同期に行う
   （cc-memory MCP handler 同期ゲート）。これにより「relay が close を受理したが ow 側で

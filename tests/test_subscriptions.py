@@ -471,6 +471,16 @@ class TestRenewLease:
         assert r.status_code == 404
         assert r.json()["code"] == "SubscriptionNotFoundError"
 
+    def test_non_owner_404_indistinguishable_from_missing(self, client):
+        # 他人の subscription_id を名指ししても、存在する subscription への非所有アクセスと
+        # 不在 id へのアクセスが同一の 404 SubscriptionNotFoundError になり、存在を露呈しない。
+        # 403 SubscriberMismatch は返さない（それは代理 subscribe 拒否専用で参照系では使わない）。
+        sid = self._subscribe(client)
+        other = client.put(f"/subscriptions/{sid}/lease", json={}, headers=_auth("tok-b"))
+        missing = client.put("/subscriptions/nope/lease", json={}, headers=_auth("tok-b"))
+        assert other.status_code == missing.status_code == 404
+        assert other.json()["code"] == missing.json()["code"] == "SubscriptionNotFoundError"
+
     def test_missing_subscription_returns_404(self, client):
         r = client.put("/subscriptions/nope/lease", json={}, headers=_auth("tok-a"))
         assert r.status_code == 404

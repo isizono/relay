@@ -267,6 +267,19 @@ class StreamRegistry:
                 return False
             return record.members.get(identity) in ("read", "read_write")
 
+    def is_member(self, stream_id: str, identity: str) -> bool:
+        """`identity` が当該 stream の member かを access 種別を問わず返す。
+
+        参照系（メタ取得 / member 一覧）の structural authZ に使う。write 単独権限の member
+        （作成者 bootstrap は `access: "write"` で登録される）も member として扱い、自身が
+        属する stream を参照できる。不在 stream は非メンバーと同じく False。
+        """
+        with self._lock:
+            record = self._streams.get(stream_id)
+            if record is None:
+                return False
+            return identity in record.members
+
     def read_members(self, stream_id: str) -> list[str]:
         with self._lock:
             record = self._streams.get(stream_id)
@@ -406,12 +419,14 @@ async def create_stream(request: Request) -> Response:
 
 @require_authn
 async def get_stream(request: Request) -> Response:
+    identity: Identity = request.state.identity
     stream_id = request.path_params["stream_id"]
     registry = _get_registry(request)
     record = registry.get(stream_id)
-    if record is None:
+    # 非メンバーには存在しない stream_id と同一の 404 を返し、stream の存在を悟らせない
+    # （identity-authz.md §2.1, A2A 1.0 §7.5）。403 での拒否は resource 存在の露呈になる。
+    if record is None or not registry.is_member(stream_id, identity.id):
         return error_response(404, STREAM_NOT_FOUND, f"stream '{stream_id}' が見つかりません")
-    # read は全許可（identity-authz.md §2.1）。membership 照合はしない。
     return JSONResponse(
         {"stream_id": record.stream_id, "state": record.state, "created_at": record.created_at}
     )
@@ -428,7 +443,10 @@ async def close_stream(request: Request) -> Response:
     stream_id = request.path_params["stream_id"]
     registry = _get_registry(request)
     record = registry.get(stream_id)
-    if record is None:
+    # 完全非メンバーには不在の stream_id と同一の 404 を返し、stream の存在を悟らせない
+    # （identity-authz.md §2.2）。403 を返してよいのは、stream の存在を正当に知っている
+    # 権限不足の member のみ。
+    if record is None or not registry.is_member(stream_id, identity.id):
         return error_response(404, STREAM_NOT_FOUND, f"stream '{stream_id}' が見つかりません")
     if not registry.has_write_access(stream_id, identity.id):
         return error_response(
@@ -467,7 +485,15 @@ async def post_stream_message(request: Request) -> Response:
             request.app.state, "relay_publish_failed_total", failure_reason="stream_not_found"
         )
         return error_response(404, STREAM_NOT_FOUND, f"stream '{stream_id}' が見つかりません")
+    if not registry.is_member(stream_id, identity.id):
+        # 完全非メンバーには不在の stream_id と同一の 404 を返し、stream の存在を悟らせない
+        # （identity-authz.md §2.2）。metric は内部観測用のため真の理由を残す。
+        observability.inc_metric(
+            request.app.state, "relay_publish_failed_total", failure_reason="membership_required"
+        )
+        return error_response(404, STREAM_NOT_FOUND, f"stream '{stream_id}' が見つかりません")
     if not registry.has_write_access(stream_id, identity.id):
+        # 権限不足の member は stream の存在を正当に知っているため 403 で区別してよい。
         observability.inc_metric(
             request.app.state, "relay_publish_failed_total", failure_reason="membership_required"
         )
@@ -587,7 +613,9 @@ async def put_member(request: Request) -> Response:
     registry = _get_registry(request)
 
     record = registry.get(stream_id)
-    if record is None:
+    # 完全非メンバーには不在の stream_id と同一の 404 を返し、stream の存在を悟らせない
+    # （identity-authz.md §2.2）。403 は存在を正当に知っている権限不足 member 専用。
+    if record is None or not registry.is_member(stream_id, identity.id):
         return error_response(404, STREAM_NOT_FOUND, f"stream '{stream_id}' が見つかりません")
     if not registry.has_write_access(stream_id, identity.id):
         return error_response(
@@ -626,7 +654,10 @@ async def delete_member(request: Request) -> Response:
     registry = _get_registry(request)
 
     record = registry.get(stream_id)
-    if record is None:
+    # 完全非メンバーには不在の stream_id と同一の 404 を返し、stream の存在を悟らせない
+    # （identity-authz.md §2.2）。自己離脱パスより先に判定するため、非メンバーの自己離脱
+    # 試行も 404 になる（204 を返すと存在の露呈になる）。
+    if record is None or not registry.is_member(stream_id, identity.id):
         return error_response(404, STREAM_NOT_FOUND, f"stream '{stream_id}' が見つかりません")
 
     target_identity = request.query_params.get("identity")
@@ -662,12 +693,16 @@ async def delete_member(request: Request) -> Response:
 
 @require_authn
 async def list_members(request: Request) -> Response:
+    identity: Identity = request.state.identity
     stream_id = request.path_params["stream_id"]
     registry = _get_registry(request)
+    # 非メンバーには存在しない stream_id と同一の 404 を返し、member 構成を露呈しない
+    # （identity-authz.md §2.1, A2A 1.0 §7.5）。
+    if not registry.is_member(stream_id, identity.id):
+        return error_response(404, STREAM_NOT_FOUND, f"stream '{stream_id}' が見つかりません")
     members = registry.list_members(stream_id)
     if members is None:
         return error_response(404, STREAM_NOT_FOUND, f"stream '{stream_id}' が見つかりません")
-    # read は全許可（identity-authz.md §2.1）。membership 照合はしない。
     return JSONResponse({"members": members})
 
 

@@ -125,8 +125,8 @@ Body: { stream_id: <string>, default_ttl?: <seconds> }
 POST /streams/{stream_id}/messages
 Body: { body: <bytes | UTF-8 text>, ttl?: <seconds>, idempotency_key?: <string> }
 → 202 Accepted { publish_id, matched_members: <int> }
-→ 403 Forbidden   (投函者が write 権限を持つ member でない)
-→ 404 Not Found   (場が存在しない / close 済みで露呈回避)
+→ 403 Forbidden   (write 権限のない member による投函)
+→ 404 Not Found   (場が不在、または投函者が member でない。露呈回避)
 → 410 Gone        (場が close 済み、新規投函拒否)
 → 429 Too Many Requests { Retry-After }   (publisher ごと rate limit 超過, default 100 req/sec。§5.4 と共通)
 ```
@@ -150,17 +150,31 @@ Body: { body: <bytes | UTF-8 text>, ttl?: <seconds>, idempotency_key?: <string> 
 PUT /streams/{stream_id}/members
 Body: { identity: <string>, access: "read" | "write" | "read_write" }
 → 200 OK
+→ 403 Forbidden   (write 権限のない member による変更)
+→ 404 Not Found   (場が不在、または呼び出し元が member でない。露呈回避)
 
 DELETE /streams/{stream_id}/members?identity=<id>
 → 204 No Content
+→ 403 Forbidden   (write 権限のない member による他 member の削除)
+→ 404 Not Found   (場が不在、または呼び出し元が member でない。非メンバーの自己離脱試行を含む。露呈回避)
 
 GET /streams/{stream_id}/members
 → 200 OK { members: [ { identity, access }, ... ] }
+→ 404 Not Found   (場が不在、または呼び出し元が member でない。露呈回避)
 ```
 
 - membership = structural authZ の判定材料（誰が read / write 権限を持つか）のみ。write = 投函権、
   read = 受信権。field 名は `role` ではなく `access` とする（role 概念を relay の状態モデルに
   乗せない、identity 別書 §2.2）。
+- 参照系（`GET /streams/{stream_id}` のメタ取得 / `GET /streams/{stream_id}/members` の member
+  一覧）は当該場の **member 限定**（`access` 種別は問わない）。非メンバーには不在の stream_id と
+  同一の `404` を返し、場の存在・member 構成を露呈しない（identity 別書 §2.1）。
+- 書き込み系（投函 §3.2 / membership 変更 §3.3 / close §3.4）の拒否は 2 段階: **完全非メンバー**には
+  不在の stream_id と同一の `404`（参照系の存在秘匿を書き込み endpoint への probe でバイパスさせ
+  ない）、**write 権限のない member** には `403`（member は場の存在を正当に知っているため露呈に
+  ならない。identity 別書 §2.2）。
+- 自分自身の membership 削除（離脱）は member 本人であれば `access` 種別によらず常に許可する
+  （identity 別書 §2.2）。
 - 「誰が close してよいか」「誰が cancel してよいか」等の semantic な判定は relay は持たない
   （ow 側。identity 別書 §2.5）。
 
@@ -169,6 +183,8 @@ GET /streams/{stream_id}/members
 ```
 DELETE /streams/{stream_id}
 → 204 No Content
+→ 403 Forbidden   (write 権限のない member による close)
+→ 404 Not Found   (場が不在、または呼び出し元が member でない。露呈回避)
 ```
 
 - close は **新規投函を止めるだけ**。archive は作らない。
@@ -518,14 +534,15 @@ relay のメモリを枯渇させられる。両 registry に以下を課す。
 | `202` | 受理（配達は非同期） | 場投函, publish |
 | `204` | 成功・本文なし | unsubscribe, member 削除, 場 close |
 | `400` | 不正リクエスト | labels==[], 必須欠落 |
-| `403` | 認可なし | membership 不足, subscribe の `subscriber` ≠ 認証 identity |
-| `404` | 不存在（露呈回避含む） | 場 / subscription 不在, 非所有 subscription への操作（§5.7） |
+| `403` | 認可なし | member の write 権限不足（投函 / close / membership 変更）, subscribe の `subscriber` ≠ 認証 identity |
+| `404` | 不存在（露呈回避含む） | 場 / subscription 不在, 非所有 subscription への操作（§5.7）, 非メンバーによる場への操作（参照 / 投函 / close / membership 変更。§3.2–3.4） |
 | `409` | 競合 | stream_id 既存 |
 | `410` | 消滅 / 期限切れ | close 済み場への投函, 所有者本人による lease 切れ subscription への操作（registry 残存時のみ。§5.7） |
 | `429` | rate limit / 資源上限 | publisher ごと publish 上限, registry 資源上限（stream / subscription 作成の総数 / per-identity。§6.8） |
 | `503` | 一時不能 | outbox 障害（disk full / DB corrupt） |
 
-- 認可エラーは「リソース存在を露呈しない」（A2A §7.5）。`404` / `403` を使い分ける（詳細は identity 別書）。
+- 認可エラーは「リソース存在を露呈しない」（A2A §7.5）。完全非メンバー / 非所有者には不在 id と
+  同一の `404`、資格を持つ member の権限不足には `403` を使い分ける（詳細は identity 別書 §2.1 / §2.2）。
 
 ---
 

@@ -144,6 +144,24 @@ class TestStreamRegistry:
         registry = StreamRegistry()
         assert registry.read_members("nope") == []
 
+    def test_is_member_true_for_any_access_including_write_only(self):
+        registry = StreamRegistry()
+        registry.create("s1", "agent-a", None)  # 作成者は write のみ
+        registry.put_member("s1", "agent-b", "read")
+        registry.put_member("s1", "agent-c", "read_write")
+        assert registry.is_member("s1", "agent-a") is True
+        assert registry.is_member("s1", "agent-b") is True
+        assert registry.is_member("s1", "agent-c") is True
+
+    def test_is_member_false_for_non_member(self):
+        registry = StreamRegistry()
+        registry.create("s1", "agent-a", None)
+        assert registry.is_member("s1", "stranger") is False
+
+    def test_is_member_false_for_missing_stream(self):
+        registry = StreamRegistry()
+        assert registry.is_member("nope", "agent-a") is False
+
 
 def _past_iso(seconds: int) -> str:
     return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).strftime(
@@ -357,11 +375,42 @@ class TestGetStream:
         assert r.status_code == 404
         assert r.json()["code"] == "StreamNotFoundError"
 
-    def test_read_is_open_to_non_members(self, client):
-        """read は全許可（identity-authz.md §2.1）。membership 不要。"""
+    def test_write_only_creator_can_view(self, client):
+        """作成者は write 単独権限（bootstrap の access="write"）でも自身の stream を参照できる。"""
         client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        r = client.get("/streams/s1", headers=_auth("tok-a"))
+        assert r.status_code == 200
+
+    def test_read_member_can_view(self, client):
+        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        client.put(
+            "/streams/s1/members",
+            json={"identity": "agent-b", "access": "read"},
+            headers=_auth("tok-a"),
+        )
         r = client.get("/streams/s1", headers=_auth("tok-b"))
         assert r.status_code == 200
+        assert r.json()["stream_id"] == "s1"
+
+    def test_read_write_member_can_view(self, client):
+        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        client.put(
+            "/streams/s1/members",
+            json={"identity": "agent-b", "access": "read_write"},
+            headers=_auth("tok-a"),
+        )
+        r = client.get("/streams/s1", headers=_auth("tok-b"))
+        assert r.status_code == 200
+
+    def test_non_member_gets_404_indistinguishable_from_missing(self, client):
+        # 存在する stream への非メンバーアクセスと不在 stream_id へのアクセスが、存在を判別できる
+        # 信号（status_code / error code）で区別できないこと。message は要求 id を echo するだけで
+        # 呼び出し元が既知の値のため露呈にならない。
+        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        existing = client.get("/streams/s1", headers=_auth("tok-b"))
+        missing = client.get("/streams/does-not-exist", headers=_auth("tok-b"))
+        assert existing.status_code == missing.status_code == 404
+        assert existing.json()["code"] == missing.json()["code"] == "StreamNotFoundError"
 
 
 class TestCloseStream:
@@ -371,13 +420,19 @@ class TestCloseStream:
         assert r.status_code == 204
         assert client.get("/streams/s1", headers=_auth("tok-a")).json()["state"] == "closed"
 
-    def test_non_member_forbidden(self, client):
+    def test_non_member_gets_404_indistinguishable_from_missing(self, client):
+        # 完全非メンバーの close 試行は不在 stream_id と同一の 404。GET 側の存在秘匿を
+        # DELETE での probe でバイパスできないこと。
         client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
-        r = client.delete("/streams/s1", headers=_auth("tok-b"))
-        assert r.status_code == 403
-        assert r.json()["code"] == "MembershipRequiredError"
+        existing = client.delete("/streams/s1", headers=_auth("tok-b"))
+        missing = client.delete("/streams/does-not-exist", headers=_auth("tok-b"))
+        assert existing.status_code == missing.status_code == 404
+        assert existing.json()["code"] == missing.json()["code"] == "StreamNotFoundError"
+        # 拒否された close は実際に効いていない
+        assert client.get("/streams/s1", headers=_auth("tok-a")).json()["state"] == "open"
 
     def test_read_only_member_forbidden(self, client):
+        # 権限不足の正規 member は stream の存在を正当に知っているため 403 で区別してよい。
         client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
         client.put(
             "/streams/s1/members",
@@ -386,6 +441,7 @@ class TestCloseStream:
         )
         r = client.delete("/streams/s1", headers=_auth("tok-b"))
         assert r.status_code == 403
+        assert r.json()["code"] == "MembershipRequiredError"
 
     def test_missing_stream_returns_404(self, client):
         r = client.delete("/streams/nope", headers=_auth("tok-a"))
@@ -410,14 +466,35 @@ class TestMembers:
         members = client.get("/streams/s1/members", headers=_auth("tok-a")).json()["members"]
         assert {"identity": "agent-b", "access": "read"} in members
 
-    def test_non_write_member_cannot_add_member(self, client):
+    def test_read_member_cannot_add_member(self, client):
+        # 権限不足の正規 member（read 単独）による membership 変更は 403。
         client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        client.put(
+            "/streams/s1/members",
+            json={"identity": "agent-b", "access": "read"},
+            headers=_auth("tok-a"),
+        )
         r = client.put(
             "/streams/s1/members",
             json={"identity": "agent-c", "access": "read"},
             headers=_auth("tok-b"),
         )
         assert r.status_code == 403
+        assert r.json()["code"] == "MembershipRequiredError"
+
+    def test_non_member_put_member_404_indistinguishable_from_missing(self, client):
+        # 完全非メンバーの membership 変更試行は不在 stream_id と同一の 404（存在 probe 防止）。
+        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        payload = {"identity": "agent-c", "access": "read"}
+        existing = client.put("/streams/s1/members", json=payload, headers=_auth("tok-b"))
+        missing = client.put(
+            "/streams/does-not-exist/members", json=payload, headers=_auth("tok-b")
+        )
+        assert existing.status_code == missing.status_code == 404
+        assert existing.json()["code"] == missing.json()["code"] == "StreamNotFoundError"
+        # 拒否された追加は実際に効いていない
+        members = client.get("/streams/s1/members", headers=_auth("tok-a")).json()["members"]
+        assert all(m["identity"] != "agent-c" for m in members)
 
     def test_invalid_access_value_returns_400(self, client):
         client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
@@ -507,6 +584,34 @@ class TestMembers:
             "/streams/s1/members", params={"identity": "agent-c"}, headers=_auth("tok-b")
         )
         assert r.status_code == 403
+        assert r.json()["code"] == "MembershipRequiredError"
+
+    def test_non_member_delete_member_404_indistinguishable_from_missing(self, client):
+        # 完全非メンバーの member 削除試行は不在 stream_id と同一の 404（存在 probe 防止）。
+        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        existing = client.delete(
+            "/streams/s1/members", params={"identity": "agent-a"}, headers=_auth("tok-b")
+        )
+        missing = client.delete(
+            "/streams/does-not-exist/members",
+            params={"identity": "agent-a"},
+            headers=_auth("tok-b"),
+        )
+        assert existing.status_code == missing.status_code == 404
+        assert existing.json()["code"] == missing.json()["code"] == "StreamNotFoundError"
+        # 拒否された削除は実際に効いていない
+        members = client.get("/streams/s1/members", headers=_auth("tok-a")).json()["members"]
+        assert any(m["identity"] == "agent-a" for m in members)
+
+    def test_non_member_self_removal_returns_404(self, client):
+        # 非メンバーの自己離脱試行も 404。自己離脱パスが membership 判定より先に成立して
+        # 204 を返すと stream の存在露呈になる。
+        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        r = client.delete(
+            "/streams/s1/members", params={"identity": "agent-b"}, headers=_auth("tok-b")
+        )
+        assert r.status_code == 404
+        assert r.json()["code"] == "StreamNotFoundError"
 
     def test_delete_member_missing_stream_returns_404(self, client):
         r = client.delete(
@@ -585,10 +690,23 @@ class TestMembers:
         outbox_after, dlq_after = self._stream_outbox_dlq_counts(settings, "s1", "agent-b")
         assert outbox_after + dlq_after == 1
 
-    def test_list_members_open_to_non_members(self, client):
+    def test_list_members_member_can_view(self, client):
         client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        client.put(
+            "/streams/s1/members",
+            json={"identity": "agent-b", "access": "read"},
+            headers=_auth("tok-a"),
+        )
         r = client.get("/streams/s1/members", headers=_auth("tok-b"))
         assert r.status_code == 200
+        assert {m["identity"] for m in r.json()["members"]} == {"agent-a", "agent-b"}
+
+    def test_list_members_non_member_gets_404_hiding_composition(self, client):
+        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        existing = client.get("/streams/s1/members", headers=_auth("tok-b"))
+        missing = client.get("/streams/does-not-exist/members", headers=_auth("tok-b"))
+        assert existing.status_code == missing.status_code == 404
+        assert existing.json()["code"] == missing.json()["code"] == "StreamNotFoundError"
 
     def test_list_members_missing_stream_returns_404(self, client):
         r = client.get("/streams/nope/members", headers=_auth("tok-a"))
@@ -652,13 +770,31 @@ class TestPostStreamMessage:
             conn.close()
         assert rows == [("s1", "agent-b", publish_id, b"hello")]
 
-    def test_non_write_member_forbidden(self, client):
+    def test_read_only_member_forbidden(self, client):
+        # 権限不足の正規 member（read 単独）による投函は 403。
         client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        client.put(
+            "/streams/s1/members",
+            json={"identity": "agent-b", "access": "read"},
+            headers=_auth("tok-a"),
+        )
         r = client.post(
             "/streams/s1/messages", json={"body": "hello"}, headers=_auth("tok-b")
         )
         assert r.status_code == 403
         assert r.json()["code"] == "MembershipRequiredError"
+
+    def test_non_member_gets_404_indistinguishable_from_missing(self, client):
+        # 完全非メンバーの投函試行は不在 stream_id と同一の 404（POST での存在 probe 防止）。
+        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        existing = client.post(
+            "/streams/s1/messages", json={"body": "hello"}, headers=_auth("tok-b")
+        )
+        missing = client.post(
+            "/streams/does-not-exist/messages", json={"body": "hello"}, headers=_auth("tok-b")
+        )
+        assert existing.status_code == missing.status_code == 404
+        assert existing.json()["code"] == missing.json()["code"] == "StreamNotFoundError"
 
     def test_missing_stream_returns_404(self, client):
         r = client.post(
