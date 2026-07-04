@@ -477,16 +477,27 @@ relay のメモリを枯渇させられる。両 registry に以下を課す。
 }
 ```
 
+- `recent_warnings` の各要素は warning の**種別・発生時刻・構造的な resource 識別子**
+  （`event` / `ts` / `lane` / `target_type` / `publish_id` / `stream_id` / `subscription_id` /
+  `error_code` / `oldest_unacked_publish_id`）のみを載せる。`GET /status` は authN のみ（authZ なし）で
+  任意の認証済み client が読めるため、payload・title 本文や free-form な reason、peer identity は
+  載せない（cross-tenant のユーザーデータ漏洩を避ける）。full な warning entry は relay 内部の
+  サーバーログ sink（§7.3）にのみ残す。
+
 ### 7.2 `GET /metrics`（Prometheus 互換）
 
-`relay_publish_received_total{publisher_identity}` / `relay_push_delivered_total{lane}` /
+`relay_publish_received_total` / `relay_push_delivered_total{lane}` /
 `relay_outbox_depth` / `relay_outbox_dead_total` / `relay_sse_connections` /
 `relay_subscription_lease_expirations_total` / `relay_publish_failed_total{failure_reason}` /
 `relay_ack_received_total` / `relay_sse_slow_consumer_disconnects_total`。
 
-- label に `subscription_id` や `delivery_target` を**使わない**（`lane` = `stream` | `subscription`）。
-  metrics 経由の subscription_id 露出（§5.7 が防ぐ攻撃の前提になる）と label cardinality 爆発の両方を
-  避ける。per-target の追跡は構造化ログ（§7.3、`publish_id` trace）で行う。
+- label に peer identity（`publisher_identity`）・`subscription_id`・`delivery_target` を
+  **使わない**（許可する label は `lane` = `stream` | `subscription` と
+  `failure_reason` の低カーディナリティ enum のみ）。`GET /metrics` は authN のみ（authZ なし）で
+  任意の認証済み client が読めるため、label 経由で他 peer の identity 列挙や subscription_id 露出
+  （§5.7 が防ぐ攻撃の前提になる）を許すと cross-tenant の情報漏洩になる。label cardinality 爆発も
+  避ける。per-publisher / per-target の追跡は構造化ログ（§7.3、`publish_id` / `publisher_identity`
+  trace）で行う。
 
 ### 7.3 構造化ログ + サーバーログ
 

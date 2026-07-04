@@ -653,9 +653,7 @@ async def publish(request: Request) -> Response:
         publisher_identity=identity.id,
         matched_subscriptions=len(matches),
     )
-    observability.inc_metric(
-        request.app.state, "relay_publish_received_total", publisher_identity=identity.id
-    )
+    observability.inc_metric(request.app.state, "relay_publish_received_total")
     return JSONResponse(
         {"publish_id": publish_id, "matched_subscriptions": len(matches)}, status_code=202
     )

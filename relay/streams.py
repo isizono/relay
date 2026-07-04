@@ -569,9 +569,7 @@ async def post_stream_message(request: Request) -> Response:
         stream_id=stream_id,
         matched_members=len(read_members),
     )
-    observability.inc_metric(
-        request.app.state, "relay_publish_received_total", publisher_identity=identity.id
-    )
+    observability.inc_metric(request.app.state, "relay_publish_received_total")
     return JSONResponse(
         {"publish_id": publish_id, "matched_members": len(read_members)}, status_code=202
     )
