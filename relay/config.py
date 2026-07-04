@@ -71,6 +71,9 @@ DEFAULT_MAX_SUBSCRIPTIONS_PER_IDENTITY = 1000
 DEFAULT_MAX_TITLE_LENGTH = 200
 DEFAULT_MAX_LABELS_COUNT = 32
 DEFAULT_MAX_LABEL_LENGTH = 128
+# stream の name は canonical stream_id（"{creator}:{name}"）の一部として registry・outbox・
+# delivery target key に埋め込まれるため、label と同じ識別子系の上限に揃える。
+DEFAULT_MAX_STREAM_NAME_LENGTH = 128
 
 
 @dataclass(frozen=True)
@@ -119,6 +122,7 @@ class Settings:
     max_title_length: int = DEFAULT_MAX_TITLE_LENGTH
     max_labels_count: int = DEFAULT_MAX_LABELS_COUNT
     max_label_length: int = DEFAULT_MAX_LABEL_LENGTH
+    max_stream_name_length: int = DEFAULT_MAX_STREAM_NAME_LENGTH
 
 
 def _load_auth_tokens_from_env() -> dict[str, str]:

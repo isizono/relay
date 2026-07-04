@@ -32,7 +32,10 @@ relay v2 は、エージェント間で非同期に流れるメッセージを a
 
 **詳細**:
 
-- 名前付きの共有空間で、`stream_id`（文字列）で識別する。
+- 名前付きの共有空間で、`stream_id`（文字列）で識別する。`stream_id` は作成者 identity で
+  スコープ化された canonical id（`{作成者 identity}:{name}`）であり、作成時に relay が構築して返す。
+  作成者は名前空間内の `name` のみを選べるため、identity をまたいだ stream_id の衝突・横取り
+  （squatting）が構造的に起きない（ワイヤ / API 仕様 §3.1）。
 - メッセージは投函された瞬間にメンバーへの配達経路（outbox）に転写されるだけで、
   stream という場所には永続蓄積されない（pass-through）。
 - stream は membership（identity ごとの read / write access の集合）を持ち、これが場固有の

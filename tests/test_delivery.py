@@ -1096,9 +1096,12 @@ class TestGetEventsLive:
         assert rows == []
 
     def test_stream_lane_auto_included_without_subscription_ids(self, live_client):
-        live_client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        sid = live_client.post(
+            "/streams", json={"name": "s1"}, headers=_auth("tok-a")
+        ).json()["stream_id"]
+        assert sid == "agent-a:s1"  # 作成者 identity でスコープ化された canonical id
         live_client.put(
-            "/streams/s1/members",
+            f"/streams/{sid}/members",
             json={"identity": "agent-b", "access": "read"},
             headers=_auth("tok-a"),
         )
@@ -1106,7 +1109,7 @@ class TestGetEventsLive:
         with live_client.stream("GET", "/events", headers=_auth("tok-b")) as resp:
             assert resp.status_code == 200
             r = live_client.post(
-                "/streams/s1/messages", json={"body": "hello"}, headers=_auth("tok-a")
+                f"/streams/{sid}/messages", json={"body": "hello"}, headers=_auth("tok-a")
             )
             publish_id = r.json()["publish_id"]
 
@@ -1114,7 +1117,9 @@ class TestGetEventsLive:
             data = json.loads(data_line[len("data:") :].strip())
             assert data["publish_id"] == publish_id
             assert data["body"] == "hello"
-            assert data["delivery_target"] == "stream:s1"
+            # delivery_target は "stream:{canonical stream_id}" = "stream:agent-a:s1"。
+            # stream_id 自体が ":" を含むため、":" は先頭 1 個のみで分割する。
+            assert data["delivery_target"] == f"stream:{sid}" == "stream:agent-a:s1"
 
     def test_unknown_subscription_id_returns_404(self, live_client):
         r = live_client.get("/events?subscription_ids=nope", headers=_auth("tok-a"))

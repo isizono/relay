@@ -104,16 +104,30 @@ SSE 接続（`GET /events`）は **認証済み identity の単一多重化接�
 
 ```
 POST /streams
-Body: { stream_id: <string>, default_ttl?: <seconds> }
-→ 201 Created { stream_id, created_at }
-→ 409 Conflict  (stream_id 既存)
+Body: { name: <string>, default_ttl?: <seconds> }
+→ 201 Created { stream_id, created_at }   (stream_id = 作成者 identity でスコープ化した canonical id)
+→ 400 Bad Request  (name が空 / ':' または '/' を含む / 長さ上限超過)
+→ 409 Conflict  (同一作成者の名前空間内で同名 stream 既存)
 → 429 Too Many Requests  (registry 資源上限: 総数 / 作成者 identity あたり。§6.8)
 ```
 
-- `stream_id` は呼び出し側が決める文字列（識別子）。
+- **stream_id は作成者 identity でスコープ化する**。呼び出し側は名前空間内の `name` のみを指定し、
+  relay は canonical stream_id = `{作成者 identity}:{name}` を構築して `201` で返す。以後の全操作
+  （`GET` / `close` / `messages` / `members` / `ack`）はこの canonical stream_id でアドレスする。
+  - 目的: stream_id を global 名前空間にすると、攻撃者が正規利用者の使いそうな stream_id を予測して
+    先取り（squatting）し、正規 create を `409` で締め出したり squat した stream の write member として
+    居座ったりできる。creator identity を構造的に前置することで、ある identity が別 identity の名前空間で
+    stream を作成することが構造上不可能になり、名前空間の横取りが成立しなくなる。
+  - `name` は非空文字列で、区切り文字 `:` と URL パス区切り `/` を含んではならない（`400`）。これにより
+    canonical 文字列の区切り構造が一意に保たれる。長さには上限を課す（既定 128 文字、設定可能、超過は
+    `400`）。canonical stream_id は registry・outbox・delivery target key に埋め込まれるため、他の
+    入力フィールド上限（§6.9 の title / labels）と同じ DoS 防御の一部。
+  - member は creator から canonical stream_id を out-of-band に知らされる（招待制）ため、member 側で
+    canonical id を再構築する機構は要らない。
 - `default_ttl` は場メッセージの outbox retain default（省略時は relay 既定、§6.4）。
 - registry 資源上限に達している場合は `429`（`ResourceLimitExceededError`）で作成を拒否する（§6.8）。
-  既存 `stream_id` の再作成（`409`）は新規スロットを消費しないため上限判定より前に評価する。
+  同一作成者の名前空間内での既存 stream の再作成（`409`）は新規スロットを消費しないため上限判定より前に
+  評価する。異なる identity は同名 `name` でも別 canonical になるため衝突しない。
 - 作成者 identity は当該場の write 権限を持つ member（`access: "write"`）として自動登録される
   （bootstrap。これがないと最初の member を追加できる identity が存在しない。identity 別書 §2.2。
   受信も必要なら作成後に自分の access を `read_write` に更新する）。
@@ -301,7 +315,8 @@ Accept: text/event-stream
 event: notification
 id: <publish_id>
 data: {
-  delivery_target,        // "sub:<subscription_id>" | "stream:<stream_id>"
+  delivery_target,        // "sub:<subscription_id>" | "stream:<stream_id>"（stream_id は
+                          // ":" を含む canonical id のため、パースは先頭 ":" 1 個のみで分割する）
   publish_id,             // int、グローバル単調（id: 行と同値）
   ref?,                   // subscription レーンのとき
   labels?,                // subscription レーンのとき
@@ -454,8 +469,8 @@ relay のメモリを枯渇させられる。両 registry に以下を課す。
   作成者、subscription は subscriber）の登録数を検査する。いずれか超過なら作成を拒否し
   `429 Too Many Requests`（`ResourceLimitExceededError`）を返す。上限値は設定可能で、既定は
   「想定同時 peer 数 × 1 peer あたり想定リソース数」を目安に置く。判定と登録は atomic に行い、
-  並行作成による上限すり抜けを防ぐ。既存 `stream_id` の再作成（`409`）は新規スロットを消費
-  しないため上限判定より前に評価する。
+  並行作成による上限すり抜けを防ぐ。同一作成者の名前空間内での既存 stream の再作成（canonical
+  stream_id が既存、`409`）は新規スロットを消費しないため上限判定より前に評価する。
 - **idle-GC**: subscription は lease 切れから猶予期間を過ぎたものを registry から除去する（§5.7）。
   stream は close から猶予期間を過ぎ、かつ未配達 outbox エントリが drain し切ったものを除去する
   （close 済み場は新規 outbox を増やせない〈§3.4〉ため、未配達が無ければ以後も無く、除去は
@@ -471,6 +486,9 @@ relay のメモリを枯渇させられる。両 registry に以下を課す。
   truncate せず拒否する（暗黙の切り詰めで publisher の意図を書き換えない）。
 - **labels**: 配列の要素数上限と、各 label の文字列長上限（`POST /publish` / `POST /subscriptions`）。
   超過は `400`（`LabelValidationError`）。
+- **stream の name**: 文字列長の上限（`POST /streams`、§3.1）。超過は `400`（`InvalidRequestError`）。
+  canonical stream_id として registry・outbox・delivery target key に埋め込まれるため識別子系の
+  上限に揃える。
 - 上限値は設定可能で、既定は routing key（label）と表示用見出し（title）の実運用サイズを目安に
   置く。
 
@@ -536,7 +554,7 @@ relay のメモリを枯渇させられる。両 registry に以下を課す。
 | `400` | 不正リクエスト | labels==[], 必須欠落 |
 | `403` | 認可なし | member の write 権限不足（投函 / close / membership 変更）, subscribe の `subscriber` ≠ 認証 identity |
 | `404` | 不存在（露呈回避含む） | 場 / subscription 不在, 非所有 subscription への操作（§5.7）, 非メンバーによる場への操作（参照 / 投函 / close / membership 変更。§3.2–3.4） |
-| `409` | 競合 | stream_id 既存 |
+| `409` | 競合 | 同一作成者の名前空間内で同名 stream 既存（canonical stream_id 既存） |
 | `410` | 消滅 / 期限切れ | close 済み場への投函, 所有者本人による lease 切れ subscription への操作（registry 残存時のみ。§5.7） |
 | `429` | rate limit / 資源上限 | publisher ごと publish 上限, registry 資源上限（stream / subscription 作成の総数 / per-identity。§6.8） |
 | `503` | 一時不能 | outbox 障害（disk full / DB corrupt） |

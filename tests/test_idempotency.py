@@ -266,19 +266,21 @@ class TestCrossIdentityDedup:
 
     def test_stream_lane_same_key_different_identity_not_deduped(self, client):
         """stream レーンで同一 idempotency_key でも identity が違えば別 publish になる。"""
-        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        sid = client.post(
+            "/streams", json={"name": "s1"}, headers=_auth("tok-a")
+        ).json()["stream_id"]
         client.put(
-            "/streams/s1/members",
+            f"/streams/{sid}/members",
             json={"identity": "agent-b", "access": "write"},
             headers=_auth("tok-a"),
         )
         r1 = client.post(
-            "/streams/s1/messages",
+            f"/streams/{sid}/messages",
             json={"body": "hello", "idempotency_key": "shared-key"},
             headers=_auth("tok-a"),
         )
         r2 = client.post(
-            "/streams/s1/messages",
+            f"/streams/{sid}/messages",
             json={"body": "hello", "idempotency_key": "shared-key"},
             headers=_auth("tok-b"),
         )
@@ -321,14 +323,16 @@ class TestReservationReleasedOnPublishFailure:
 
     def test_stream_lane_retry_succeeds_after_db_error(self, client, monkeypatch):
         """stream レーンで DB エラー（503）後、同一キーの再送が予約に阻まれず成功する。"""
-        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        sid = client.post(
+            "/streams", json={"name": "s1"}, headers=_auth("tok-a")
+        ).json()["stream_id"]
 
         def broken_connection(request):
             raise sqlite3.OperationalError("disk I/O error")
 
         monkeypatch.setattr("relay.streams._get_connection", broken_connection)
         r1 = client.post(
-            "/streams/s1/messages",
+            f"/streams/{sid}/messages",
             json={"body": "hello", "idempotency_key": "retry-key"},
             headers=_auth("tok-a"),
         )
@@ -336,7 +340,7 @@ class TestReservationReleasedOnPublishFailure:
 
         monkeypatch.undo()
         r2 = client.post(
-            "/streams/s1/messages",
+            f"/streams/{sid}/messages",
             json={"body": "hello", "idempotency_key": "retry-key"},
             headers=_auth("tok-a"),
         )

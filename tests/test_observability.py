@@ -376,7 +376,7 @@ class TestGetStatusEndpoint:
         assert r.json()["uptime_seconds"] >= 0
 
     def test_counts_reflect_created_stream_and_subscription(self, client):
-        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        client.post("/streams", json={"name": "s1"}, headers=_auth("tok-a"))
         client.post(
             "/subscriptions",
             json={"subscriber": "agent-a", "labels": ["x"]},
@@ -391,13 +391,15 @@ class TestGetStatusEndpoint:
         # bootstrap member（作成者）は既定で write のみ（read を持たない）ため、
         # read_write を明示付与しないと outbox にエントリが作られない
         # （wire-api.md §3.1、`relay/streams.py` の `StreamRegistry.create` docstring 参照）。
-        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        sid = client.post(
+            "/streams", json={"name": "s1"}, headers=_auth("tok-a")
+        ).json()["stream_id"]
         client.put(
-            "/streams/s1/members",
+            f"/streams/{sid}/members",
             json={"identity": "agent-a", "access": "read_write"},
             headers=_auth("tok-a"),
         )
-        client.post("/streams/s1/messages", json={"body": "hi"}, headers=_auth("tok-a"))
+        client.post(f"/streams/{sid}/messages", json={"body": "hi"}, headers=_auth("tok-a"))
 
         body = client.get("/status", headers=_auth("tok-a")).json()
         assert body["outbox_pending_count"] == 1
@@ -452,30 +454,35 @@ class TestGetMetricsEndpoint:
         assert "# TYPE relay_ack_received_total counter" in r.text
 
     def test_reflects_publish_and_ack_activity(self, client):
-        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        sid = client.post(
+            "/streams", json={"name": "s1"}, headers=_auth("tok-a")
+        ).json()["stream_id"]
         client.put(
-            "/streams/s1/members",
+            f"/streams/{sid}/members",
             json={"identity": "agent-a", "access": "read_write"},
             headers=_auth("tok-a"),
         )
-        client.post("/streams/s1/messages", json={"body": "hi"}, headers=_auth("tok-a"))
-        client.post("/streams/s1/ack", json={"up_to_publish_id": 1}, headers=_auth("tok-a"))
+        client.post(f"/streams/{sid}/messages", json={"body": "hi"}, headers=_auth("tok-a"))
+        client.post(f"/streams/{sid}/ack", json={"up_to_publish_id": 1}, headers=_auth("tok-a"))
 
         body = client.get("/metrics", headers=_auth("tok-a")).text
         assert "relay_publish_received_total 1" in body
         assert "relay_ack_received_total 1" in body
 
     def test_metrics_do_not_expose_publisher_identity(self, client):
-        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        sid = client.post(
+            "/streams", json={"name": "s1"}, headers=_auth("tok-a")
+        ).json()["stream_id"]
         client.put(
-            "/streams/s1/members",
+            f"/streams/{sid}/members",
             json={"identity": "agent-a", "access": "read_write"},
             headers=_auth("tok-a"),
         )
-        client.post("/streams/s1/messages", json={"body": "hi"}, headers=_auth("tok-a"))
+        client.post(f"/streams/{sid}/messages", json={"body": "hi"}, headers=_auth("tok-a"))
 
         body = client.get("/metrics", headers=_auth("tok-a")).text
         # カウンタ値は出るが、publisher の identity は label に現れない。
+        # canonical stream_id（"agent-a:s1"）に identity が含まれるが、それも metrics に漏れない。
         assert "relay_publish_received_total 1" in body
         assert "publisher_identity" not in body
         assert "agent-a" not in body

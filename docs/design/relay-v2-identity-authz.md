@@ -308,6 +308,12 @@ relay 自身の resource を変更する endpoint、および特定 resource を
 - bootstrap: stream 作成者（`POST /streams` の呼び出し identity）は作成時に write 権限を持つ member
   （`access: "write"`）として自動登録される。これがないと、空の stream に最初の member を追加できる
   identity が存在しなくなる。受信も必要なら作成後に自分の access を `read_write` に更新する。
+- stream_id の identity スコープ化: stream_id は作成者 identity でスコープ化された canonical id
+  （`{作成者 identity}:{name}`）であり、作成者は名前空間内の `name` のみを選べる（ワイヤ仕様 §3.1）。
+  これにより、ある identity が別 identity の名前空間で stream を作成することが構造的に不可能になり、
+  予測可能な stream_id を先取りして正規利用者を締め出す / squat した stream に write member として
+  居座る、という名前空間の横取り（squatting）が成立しなくなる。membership（構造判定の材料）と併せ、
+  「誰の stream か」を creator identity として stream_id 自体に構造化する。
 - 「identity → 許可 command 集合」のマッピング（authZ table）は**持たない**。この table の判定には
   「この identity は command を発行できる主体か」という identity の分類が必要であり、それは事実上の
   role 定義である。role 概念を relay に持ち込まないという責務境界（relay = メカニズム / ow =

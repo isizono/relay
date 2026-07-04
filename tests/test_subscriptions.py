@@ -702,9 +702,11 @@ class TestPublish:
 
     def test_publish_id_is_global_monotonic_across_lanes(self, client):
         """subscription レーンと stream レーンで publish_id を共有（グローバル単調）。"""
-        client.post("/streams", json={"stream_id": "s1"}, headers=_auth("tok-a"))
+        sid = client.post(
+            "/streams", json={"name": "s1"}, headers=_auth("tok-a")
+        ).json()["stream_id"]
         r1 = client.post(
-            "/streams/s1/messages", json={"body": "hello"}, headers=_auth("tok-a")
+            f"/streams/{sid}/messages", json={"body": "hello"}, headers=_auth("tok-a")
         )
         r2 = client.post(
             "/publish",

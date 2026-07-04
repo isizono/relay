@@ -65,6 +65,51 @@ from relay.ratelimit import get_publish_rate_limiter
 Access = Literal["read", "write", "read_write"]
 _VALID_ACCESS: frozenset[str] = frozenset({"read", "write", "read_write"})
 
+# canonical stream_id は "{creator_identity}{SEP}{name}" 形式で、creator identity を構造的に
+# 前置する。これにより stream_id 名前空間が identity 単位で分割され、ある identity が別 identity
+# の名前空間で stream を作成することが構造的に不可能になる（同名の name を別 identity が使っても
+# canonical が別物になり衝突しない）。
+#
+# 区切り文字 ":" の選定理由:
+# - URL パスの単一セグメント（`[^/]+`）に収まるため、"/" と違い `/streams/{id}/members` 等の
+#   サブリソース経路とルーティング上衝突しない。
+# - name から ":" と "/" を除外する（`_validate_stream_name`）ことで canonical 文字列の区切り
+#   構造が一意に保たれ、delivery target key `stream:{stream_id}:{member_identity}` の
+#   （":" 区切りに依存する）injectivity も維持される。
+# creator identity 自体が ":" / "/" を含まないことは authN 側（管理者管理の識別子）の前提。
+STREAM_ID_SEPARATOR = ":"
+_FORBIDDEN_NAME_CHARS = (STREAM_ID_SEPARATOR, "/")
+
+
+def canonical_stream_id(creator_identity: str, name: str) -> str:
+    """creator identity でスコープ化した canonical stream_id を構築する。"""
+    return f"{creator_identity}{STREAM_ID_SEPARATOR}{name}"
+
+
+def _validate_stream_name(
+    value: object, settings: Settings
+) -> tuple[str | None, Response | None]:
+    """`POST /streams` の `name`（作成者名前空間内の stream 名）を検証する。
+
+    Returns:
+        (検証済み name または None, エラー Response または None) のタプル。
+    """
+    if not isinstance(value, str) or not value:
+        return None, error_response(400, INVALID_REQUEST, "name は必須の非空文字列です")
+    if any(ch in value for ch in _FORBIDDEN_NAME_CHARS):
+        return None, error_response(
+            400,
+            INVALID_REQUEST,
+            "name に ':' および '/' は使用できません",
+        )
+    if len(value) > settings.max_stream_name_length:
+        return None, error_response(
+            400,
+            INVALID_REQUEST,
+            f"name は最大 {settings.max_stream_name_length} 文字までです",
+        )
+    return value, None
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -390,14 +435,15 @@ async def create_stream(request: Request) -> Response:
     if err is not None:
         return err
 
-    stream_id = body.get("stream_id")
-    if not isinstance(stream_id, str) or not stream_id:
-        return error_response(400, INVALID_REQUEST, "stream_id は必須の非空文字列です")
+    name, err = _validate_stream_name(body.get("name"), request.app.state.settings)
+    if err is not None:
+        return err
 
     default_ttl, err = _validate_retain_seconds(body.get("default_ttl"), field_name="default_ttl")
     if err is not None:
         return err
 
+    stream_id = canonical_stream_id(identity.id, name)
     registry = _get_registry(request)
     try:
         record = registry.create(stream_id, identity.id, default_ttl)
