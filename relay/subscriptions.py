@@ -541,41 +541,47 @@ async def publish(request: Request) -> Response:
         body=title,
     )
     store = idempotency.get_store(request.app.state)
-    existing_publish_id = store.check(dedup_key)
+    existing_publish_id = await idempotency.resolve_or_reserve(store, dedup_key)
     if existing_publish_id is not None:
         return JSONResponse(
             {"publish_id": existing_publish_id, "matched_subscriptions": 0}, status_code=202
         )
 
-    registry = get_registry(request)
-    matches = registry.matching(labels_set)
-
-    payload = json.dumps({"ref": ref, "title": title}, ensure_ascii=False).encode("utf-8")
-    labels_json = json.dumps(sorted(labels_set), ensure_ascii=False)
-    now_dt = _now()
-    now = _iso(now_dt)
-
-    conn = _get_connection(request)
+    # 予約獲得後は finalize / release のどちらかで必ず予約を解消する。CancelledError
+    # でも解放が要るため BaseException で受ける。
     try:
-        cur = conn.execute(
-            "INSERT INTO publish_log (lane, stream_id, publisher_identity, enqueued_at)"
-            " VALUES ('subscription', NULL, ?, ?)",
-            (identity.id, now),
-        )
-        publish_id = cur.lastrowid
-        for record in matches:
-            expires_at = _iso(now_dt + timedelta(seconds=record.retain_seconds))
-            conn.execute(
-                "INSERT INTO outbox"
-                " (target_type, subscription_id, publish_id, payload, labels, enqueued_at,"
-                " expires_at)"
-                " VALUES ('subscription', ?, ?, ?, ?, ?, ?)",
-                (record.subscription_id, publish_id, payload, labels_json, now, expires_at),
+        registry = get_registry(request)
+        matches = registry.matching(labels_set)
+
+        payload = json.dumps({"ref": ref, "title": title}, ensure_ascii=False).encode("utf-8")
+        labels_json = json.dumps(sorted(labels_set), ensure_ascii=False)
+        now_dt = _now()
+        now = _iso(now_dt)
+
+        conn = _get_connection(request)
+        try:
+            cur = conn.execute(
+                "INSERT INTO publish_log (lane, stream_id, publisher_identity, enqueued_at)"
+                " VALUES ('subscription', NULL, ?, ?)",
+                (identity.id, now),
             )
-        conn.commit()
-    finally:
-        conn.close()
-    store.register(dedup_key, publish_id)
+            publish_id = cur.lastrowid
+            for record in matches:
+                expires_at = _iso(now_dt + timedelta(seconds=record.retain_seconds))
+                conn.execute(
+                    "INSERT INTO outbox"
+                    " (target_type, subscription_id, publish_id, payload, labels, enqueued_at,"
+                    " expires_at)"
+                    " VALUES ('subscription', ?, ?, ?, ?, ?, ?)",
+                    (record.subscription_id, publish_id, payload, labels_json, now, expires_at),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except BaseException:
+        store.release(dedup_key)
+        raise
+    store.finalize(dedup_key, publish_id)
 
     observability.record_event(
         request.app.state,

@@ -401,41 +401,49 @@ async def post_stream_message(request: Request) -> Response:
         body=message_body,
     )
     store = idempotency.get_store(request.app.state)
-    existing_publish_id = store.check(dedup_key)
+    existing_publish_id = await idempotency.resolve_or_reserve(store, dedup_key)
     if existing_publish_id is not None:
         return JSONResponse(
             {"publish_id": existing_publish_id, "matched_members": 0}, status_code=202
         )
 
-    retain_seconds = _ttl if _ttl is not None else (record.default_ttl or DEFAULT_RETAIN_SECONDS)
-    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=retain_seconds)).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
-
-    read_members = registry.read_members(stream_id)
-    payload = message_body.encode("utf-8")
-    now = _now_iso()
-
-    conn = _get_connection(request)
+    # 予約獲得後は finalize / release のどちらかで必ず予約を解消する。CancelledError
+    # でも解放が要るため BaseException で受ける。
     try:
-        cur = conn.execute(
-            "INSERT INTO publish_log (lane, stream_id, publisher_identity, enqueued_at)"
-            " VALUES ('stream', ?, ?, ?)",
-            (stream_id, identity.id, now),
+        retain_seconds = (
+            _ttl if _ttl is not None else (record.default_ttl or DEFAULT_RETAIN_SECONDS)
         )
-        publish_id = cur.lastrowid
-        for member_identity in read_members:
-            conn.execute(
-                "INSERT INTO outbox"
-                " (target_type, stream_id, member_identity, publish_id, payload, enqueued_at,"
-                " expires_at)"
-                " VALUES ('stream', ?, ?, ?, ?, ?, ?)",
-                (stream_id, member_identity, publish_id, payload, now, expires_at),
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=retain_seconds)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+        read_members = registry.read_members(stream_id)
+        payload = message_body.encode("utf-8")
+        now = _now_iso()
+
+        conn = _get_connection(request)
+        try:
+            cur = conn.execute(
+                "INSERT INTO publish_log (lane, stream_id, publisher_identity, enqueued_at)"
+                " VALUES ('stream', ?, ?, ?)",
+                (stream_id, identity.id, now),
             )
-        conn.commit()
-    finally:
-        conn.close()
-    store.register(dedup_key, publish_id)
+            publish_id = cur.lastrowid
+            for member_identity in read_members:
+                conn.execute(
+                    "INSERT INTO outbox"
+                    " (target_type, stream_id, member_identity, publish_id, payload, enqueued_at,"
+                    " expires_at)"
+                    " VALUES ('stream', ?, ?, ?, ?, ?, ?)",
+                    (stream_id, member_identity, publish_id, payload, now, expires_at),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except BaseException:
+        store.release(dedup_key)
+        raise
+    store.finalize(dedup_key, publish_id)
 
     observability.record_event(
         request.app.state,
