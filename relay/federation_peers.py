@@ -88,13 +88,17 @@ def _b64url_encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
-def sign_detached(payload: dict[str, Any], *, private_key_pem: str) -> dict[str, str]:
+def sign_detached(
+    payload: dict[str, Any], *, private_key_pem: str, kid: str | None = None
+) -> dict[str, str]:
     """`payload` を JCS 正規化し detached JWS（ES256）で署名する。
 
     identity.py の `sign_agent_card` と同一パターン（payload は署名対象 dict から
     再計算できるため JWS 本体には格納しない、`{protected, signature}` の detached 形）。
     `payload["typ"]` があれば protected header の `typ` に写す（異なる用途の署名対象を
-    型で区別し、他コンテキストの署名を誤って通用させない）。
+    型で区別し、他コンテキストの署名を誤って通用させない）。`kid` を渡すと protected
+    header に含める（検証側が verify 前に「どの peer の鍵で検証すべきか」を判定する経路
+    として使う。redemption 署名は peer 未 pin の段階で使うため kid を持たない）。
     """
     canonical = rfc8785.dumps(payload)
     key = ECKey.import_key(private_key_pem)
@@ -102,6 +106,8 @@ def sign_detached(payload: dict[str, Any], *, private_key_pem: str) -> dict[str,
     typ = payload.get("typ")
     if typ is not None:
         protected["typ"] = typ
+    if kid is not None:
+        protected["kid"] = kid
     compact = jws.serialize_compact(protected, canonical, key)
     protected_b64, _payload_b64, signature_b64 = compact.split(".")
     return {"protected": protected_b64, "signature": signature_b64}
