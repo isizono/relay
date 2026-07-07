@@ -31,6 +31,7 @@ RATE_LIMIT_EXCEEDED = "RateLimitExceededError"
 RESOURCE_LIMIT_EXCEEDED = "ResourceLimitExceededError"
 SUBSCRIBER_MISMATCH = "SubscriberMismatchError"
 OUTBOX_UNAVAILABLE = "OutboxUnavailableError"
+INVITE_NOT_FOUND = "InviteNotFoundError"
 
 
 class ResourceLimitExceeded(Exception):

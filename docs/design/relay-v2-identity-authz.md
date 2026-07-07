@@ -198,6 +198,11 @@ A2A 1.0 spec §4.5 は SecurityScheme を OpenAPI 3.2.0 基盤の 5 type で規�
 最小セットでも spec 違反にはならない。relay は Bearer token を A2A 1.0 spec §7.4 の MUST に従い
 「すべての incoming request」に対して検証する。
 
+例外は3つの無認証（公開）route のみ: `GET /`（疎通確認）、`GET /.well-known/agent-card.json`
+（公開 AgentCard 取得）、`POST /invitations/redeem`（招待URL方式の bearer token 配布。
+`relay-v2-wire-api.md` §11）。redeem は認証を持たない代わりに、招待 token の一回性（atomic
+消費）・短い TTL・rate limit・失敗応答の一律 404（存在秘匿）という別統制で守られる。
+
 #### 1.5.2 宣言形式
 
 A2A 1.0 spec の canonical JSON は OpenAPI flat 形（`{"type": "http", "scheme": "bearer"}`）ではなく、
