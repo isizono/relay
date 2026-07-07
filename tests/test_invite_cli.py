@@ -1,17 +1,23 @@
 """relay.invite CLI テストスイート。
 
-`python -m relay.invite` の `new` / `revoke` / `list` サブコマンドと、DB パス解決順序
-（`--db` 明示 → env `RELAY_DB_PATH` → canonical 絶対パス、cwd 相対 fallback なし）を検証する。
-canonical 絶対パス既定はテスト実行者の実ホームディレクトリを指すため、パス解決テストは
-実際に DB へ触れず値の一致のみを確認する。
+`python -m relay.invite` の `new` / `revoke` / `list` / `peer new` / `peer redeem` /
+`peer list` / `peer revoke` サブコマンドと、DB パス解決順序（`--db` 明示 → env
+`RELAY_DB_PATH` → canonical 絶対パス、cwd 相対 fallback なし）を検証する。canonical
+絶対パス既定はテスト実行者の実ホームディレクトリを指すため、パス解決テストは実際に
+DB へ触れず値の一致のみを確認する。
+
+`peer redeem` の実サーバー往復（署名検証・fingerprint 照合込みの正常系）は
+`tests/integration/test_federation_cli_roundtrip.py` でカバーする。ここでは CLI 単体の
+入力検証・エラーハンドリング（実 HTTP を伴わないパス）に絞る。
 """
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
+from joserfc.jwk import ECKey
 
-from relay import credentials, db, invite
+from relay import credentials, db, federation_peers, invite
 
 
 class TestResolveDbPath:
@@ -192,3 +198,184 @@ class TestCmdRevoke:
         db_path = str(tmp_path / "cli.db")
         with pytest.raises(SystemExit):
             invite.main(["revoke", "--db", db_path])
+
+
+class TestCmdNewRejectsAtInIdentity:
+    def test_at_in_identity_returns_nonzero(self, tmp_path):
+        db_path = str(tmp_path / "cli.db")
+        rc = invite.main(["new", "--identity", "orch@bob", "--db", db_path])
+        assert rc != 0
+
+
+def _generate_private_pem() -> str:
+    key = ECKey.generate_key("P-256", private=True)
+    return key.as_pem(private=True).decode("ascii")
+
+
+@pytest.fixture()
+def federation_key(monkeypatch):
+    pem = _generate_private_pem()
+    monkeypatch.setenv("RELAY_JWS_PRIVATE_KEY_PEM", pem)
+    return pem
+
+
+class TestCmdPeerNew:
+    def test_requires_federation_key(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("RELAY_JWS_PRIVATE_KEY_PEM", raising=False)
+        db_path = str(tmp_path / "peer.db")
+        rc = invite.main(["peer", "new", "--handle", "bob", "--db", db_path])
+        assert rc != 0
+
+    def test_rejects_at_in_handle(self, tmp_path, federation_key):
+        db_path = str(tmp_path / "peer.db")
+        rc = invite.main(["peer", "new", "--handle", "bob@x", "--db", db_path])
+        assert rc != 0
+
+    def test_prints_fragment_url_with_token_and_fingerprint(
+        self, tmp_path, federation_key, capsys
+    ):
+        db_path = str(tmp_path / "peer.db")
+        rc = invite.main(
+            [
+                "peer",
+                "new",
+                "--handle",
+                "bob",
+                "--db",
+                db_path,
+                "--base-url",
+                "https://relay-a.example",
+            ]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out.strip()
+        assert out.startswith("https://relay-a.example/federation/peers/redeem#v=1&t=pi_")
+        assert "&fp=" in out
+
+        own_fp = federation_peers.compute_fingerprint(
+            federation_peers.public_jwk_from_pem(federation_key)
+        )
+        assert out.endswith(f"&fp={own_fp}")
+
+        conn = db.get_connection(db_path)
+        try:
+            rows = conn.execute("SELECT * FROM peer_invitations").fetchall()
+        finally:
+            conn.close()
+        assert len(rows) == 1
+        assert rows[0]["handle"] == "bob"
+
+    def test_rejects_none_ttl(self, tmp_path, federation_key):
+        db_path = str(tmp_path / "peer.db")
+        rc = invite.main(
+            ["peer", "new", "--handle", "bob", "--db", db_path, "--ttl", "none"]
+        )
+        assert rc != 0
+
+
+class TestCmdPeerRedeemInputValidation:
+    def test_requires_federation_key(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("RELAY_JWS_PRIVATE_KEY_PEM", raising=False)
+        db_path = str(tmp_path / "peer.db")
+        rc = invite.main(
+            [
+                "peer",
+                "redeem",
+                "https://relay-a.example/federation/peers/redeem#v=1&t=pi_x&fp=y",
+                "--handle",
+                "alice",
+                "--db",
+                db_path,
+            ]
+        )
+        assert rc != 0
+
+    def test_rejects_at_in_handle(self, tmp_path, federation_key):
+        db_path = str(tmp_path / "peer.db")
+        rc = invite.main(
+            [
+                "peer",
+                "redeem",
+                "https://relay-a.example/federation/peers/redeem#v=1&t=pi_x&fp=y",
+                "--handle",
+                "alice@x",
+                "--db",
+                db_path,
+            ]
+        )
+        assert rc != 0
+
+    def test_rejects_url_missing_fragment_params(self, tmp_path, federation_key):
+        db_path = str(tmp_path / "peer.db")
+        rc = invite.main(
+            [
+                "peer",
+                "redeem",
+                "https://relay-a.example/federation/peers/redeem",
+                "--handle",
+                "alice",
+                "--db",
+                db_path,
+            ]
+        )
+        assert rc != 0
+
+    def test_rejects_private_locator_in_url_by_default(self, tmp_path, federation_key, monkeypatch):
+        monkeypatch.delenv("RELAY_FEDERATION_ALLOW_PRIVATE_LOCATORS", raising=False)
+        db_path = str(tmp_path / "peer.db")
+        rc = invite.main(
+            [
+                "peer",
+                "redeem",
+                "https://127.0.0.1:9999/federation/peers/redeem#v=1&t=pi_x&fp=y",
+                "--handle",
+                "alice",
+                "--db",
+                db_path,
+            ]
+        )
+        assert rc != 0
+
+
+class TestCmdPeerList:
+    def test_empty_db_lists_nothing_but_succeeds(self, tmp_path, capsys):
+        db_path = str(tmp_path / "peer.db")
+        rc = invite.main(["peer", "list", "--db", db_path])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "peers:" in out
+
+    def test_lists_pinned_peer(self, tmp_path, capsys):
+        db_path = str(tmp_path / "peer.db")
+        db.init_db(db_path)
+        jwk = ECKey.generate_key("P-256", private=True).as_dict(private=False)
+        fp = federation_peers.compute_fingerprint(jwk)
+        federation_peers.add_peer(
+            db_path, handle="bob", fingerprint=fp, key_jwk=jwk, locator="https://relay-b.example"
+        )
+        rc = invite.main(["peer", "list", "--db", db_path])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "bob" in out
+        assert "active" in out
+
+
+class TestCmdPeerRevoke:
+    def test_revoke_marks_peer_revoked(self, tmp_path):
+        db_path = str(tmp_path / "peer.db")
+        db.init_db(db_path)
+        jwk = ECKey.generate_key("P-256", private=True).as_dict(private=False)
+        fp = federation_peers.compute_fingerprint(jwk)
+        federation_peers.add_peer(
+            db_path, handle="bob", fingerprint=fp, key_jwk=jwk, locator="https://relay-b.example"
+        )
+        rc = invite.main(["peer", "revoke", "--handle", "bob", "--db", db_path])
+        assert rc == 0
+        peer = federation_peers.get_peer_by_handle(db_path, "bob")
+        assert peer["revoked_at"] is not None
+
+    def test_revoke_no_match_returns_nonzero(self, tmp_path):
+        db_path = str(tmp_path / "peer.db")
+        db.init_db(db_path)
+        rc = invite.main(["peer", "revoke", "--handle", "nobody", "--db", db_path])
+        assert rc != 0

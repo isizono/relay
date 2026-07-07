@@ -124,7 +124,9 @@ def build_public_agent_card(settings: Settings) -> dict:
         "capabilities": {
             "streaming": True,
             "pushNotifications": False,
-            "extendedAgentCard": True,
+            # extended AgentCard の応答 handler は未実装のため false 固定
+            # （実装まで capability を宣言しない）。
+            "extendedAgentCard": False,
         },
         "securitySchemes": {
             "bearer": {"httpAuthSecurityScheme": {"scheme": "bearer"}},

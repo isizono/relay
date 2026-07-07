@@ -31,7 +31,9 @@ uv run uvicorn relay.app:app --host 127.0.0.1 --port 8000
 | `RELAY_DB_PATH` | SQLite ファイルパス（outbox / dlq / publish_log / agent_cards のみ永続化） |
 | `RELAY_AUTH_TOKENS` | Bearer token → identity の対応表（JSON object） |
 | `RELAY_SERVER_LOG_PATH` | 構造化ログ + サーバーログ sink（JSON Lines、TTL 90 日） |
-| `RELAY_JWS_PRIVATE_KEY_PEM` / `RELAY_JWS_KID` / `RELAY_JWS_JKU` | AgentCard の ES256 署名（未設定なら署名なし最小セット） |
+| `RELAY_JWS_PRIVATE_KEY_PEM` / `RELAY_JWS_KID` / `RELAY_JWS_JKU` | AgentCard の ES256 署名（未設定なら署名なし最小セット）。federation マシン鍵も兼ねる |
+| `RELAY_BASE_URL` | 自 relay の公開 base URL（federation 招待 URL 生成・redeem 応答の locator に使う） |
+| `RELAY_FEDERATION_ALLOW_PRIVATE_LOCATORS` | 既定 `false`。`true` で federation の outbound dial 先に localhost / private IP を許可（同一ホスト検証・開発用） |
 
 ### 実装状況
 
@@ -45,6 +47,7 @@ uv run uvicorn relay.app:app --host 127.0.0.1 --port 8000
 | Prometheus 互換 metrics | `GET /metrics` | 実装済み |
 | AgentCard 公開 | `GET /.well-known/agent-card.json` | 実装済み |
 | Python SDK（クライアント側） | — | 未実装（`docs/design/relay-v2-sdk.md` は仕様のみ） |
+| federation peer レジストリ（招待ベース鍵ピン留め） | `POST /federation/peers/redeem`、`python -m relay.invite peer new/redeem/list/revoke` | 実装済み（relay 間メッセージ配達自体は未実装） |
 
 テストは旧 `server.py` 分と合わせて [開発](#開発) のコマンド 1 本で実行できる（`tests/` 配下に
 両方のテストファイルが同居している）。
