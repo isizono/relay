@@ -599,7 +599,42 @@ publisher → POST /publish { ref, labels, title?, idempotency_key? }
 
 ---
 
-## 11. 関連
+## 11. 招待URL redeem（無認証 route）
+
+Bearer token 配布を「招待URL方式」で行うための endpoint。identity / authZ 仕様の
+「全 endpoint authN MUST」の例外として、`GET /` / `GET /.well-known/agent-card.json`
+に次ぐ3つ目の無認証 route。
+
+```
+POST /invitations/redeem
+Content-Type: application/json
+
+Request:
+  {"invite_token": "it_<base64url>"}
+
+200 OK:
+  {"bearer_token": "bt_<base64url>",
+   "identity": "cc-memory",
+   "expires_at": null}          # 期限付き credential のときのみ ISO8601 UTC
+
+400 InvalidRequestError:
+  body が非 JSON / invite_token 欠落 / Content-Length が上限（4096 byte）超過
+404 InviteNotFoundError:
+  未知 / 失効 / 既 redeem（すべて同一応答。存在秘匿）
+429 RateLimitExceededError (+ Retry-After):
+  IP キーのレート超過（5 req/s）
+```
+
+- 招待 token の発行は本書の scope 外（HTTP 発行 endpoint は存在しない）。`python -m relay.invite new`
+  というローカル CLI が DB へ直接 INSERT する。
+- redeem は一回性（atomic UPDATE の rowcount 判定）で exactly-once に落ちる。並行 redeem は
+  1 リクエストのみ成功し、他は 404 になる。
+- 発行された bearer token は `Authorization: Bearer <token>` として他の全 endpoint の認証に
+  そのまま使える（既存の静的 `RELAY_AUTH_TOKENS` と同じ検証経路）。
+
+---
+
+## 12. 関連
 
 - 機能要件 v2: cc-memory M#507（+ R1 改訂）
 - 論点#3 決着メモ: `docs/design/topic474-論点3-場history-substrate-決着.md`（別 PR）
