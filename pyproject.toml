@@ -20,7 +20,8 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.0"]
+# pyjwt は tests/test_sdk_auth.py が JWT claim 検証（jwt.decode）に使う test-only 依存。
+dev = ["pyjwt>=2.13.0", "pytest>=8.0"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

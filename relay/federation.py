@@ -120,8 +120,9 @@ async def redeem_peer(request: Request) -> Response:
         )
 
     # 4. token 消費: atomic に check-and-mark する（未知 / 失効 / 既 redeem は一律 404）。
-    # token 消費はこの時点で確定し、後続の署名検証に失敗しても巻き戻さない
-    # （招待 URL の誤所持・総当たりを token 一回性で必ず消尽させる）。
+    # token の一回性（redeemed_at）はこの時点で確定し、後続の署名検証に失敗しても
+    # 巻き戻さない（招待 URL の誤所持・総当たりを token 一回性で必ず消尽させる）。
+    # どの peer に紐づいたか（redeemed_peer_id）は pin 成功後に 8 で別途記録する。
     db_path = settings.db_path
     now = _now_iso()
     result = federation_peers.consume_peer_invite(db_path, invite_token, now)
