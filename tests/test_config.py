@@ -3,7 +3,12 @@ import json
 
 import pytest
 
-from relay.config import Settings, load_settings_from_env, validate_local_identity
+from relay.config import (
+    DEFAULT_MAX_PAYLOAD_BYTES,
+    Settings,
+    load_settings_from_env,
+    validate_local_identity,
+)
 
 
 class TestSettingsDefaults:
@@ -12,6 +17,7 @@ class TestSettingsDefaults:
         assert settings.db_path == "relay.db"
         assert settings.auth_tokens == {}
         assert settings.jws_private_key_pem is None
+        assert settings.max_payload_bytes == DEFAULT_MAX_PAYLOAD_BYTES
 
     def test_registry_limit_defaults(self):
         settings = Settings()
@@ -49,6 +55,16 @@ class TestLoadSettingsFromEnv:
         monkeypatch.setenv("RELAY_AUTH_TOKENS", json.dumps(["not", "an", "object"]))
         with pytest.raises(ValueError):
             load_settings_from_env()
+
+    def test_reads_max_payload_bytes(self, monkeypatch):
+        monkeypatch.setenv("RELAY_MAX_PAYLOAD_BYTES", "1024")
+        settings = load_settings_from_env()
+        assert settings.max_payload_bytes == 1024
+
+    def test_missing_max_payload_bytes_env_defaults(self, monkeypatch):
+        monkeypatch.delenv("RELAY_MAX_PAYLOAD_BYTES", raising=False)
+        settings = load_settings_from_env()
+        assert settings.max_payload_bytes == DEFAULT_MAX_PAYLOAD_BYTES
 
     def test_reads_registry_limits_from_env(self, monkeypatch):
         monkeypatch.setenv("RELAY_MAX_STREAMS_TOTAL", "50")

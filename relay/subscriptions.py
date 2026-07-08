@@ -45,6 +45,7 @@ from relay.config import (
 from relay.errors import (
     INVALID_REQUEST,
     LABEL_VALIDATION,
+    PAYLOAD_TOO_LARGE,
     RATE_LIMIT_EXCEEDED,
     SUBSCRIBER_MISMATCH,
     SUBSCRIPTION_GONE,
@@ -258,6 +259,42 @@ def _get_connection(request: Request) -> sqlite3.Connection:
 # ---------------------------------------------------------------------------
 
 
+async def _read_capped_body(request: Request) -> tuple[bytes, Response | None]:
+    """`Settings.max_payload_bytes` を超える request body を 413 で拒否する。
+
+    `Content-Length` ヘッダで早期に拒否できる場合は body を読まずに拒否する。ヘッダが
+    無い/信頼できない（chunked transfer 等）場合に備え、`request.stream()` を読み進める
+    間も上限超過を検知し、上限に達した時点で残りを読み切る前に打ち切る（全体をメモリに
+    読み切ってからサイズ判定すると、判定自体が DoS の踏み台になる。セキュリティ監査
+    finding H-4/F2 の「`await request.json()` が全体メモリ読込」という指摘への対応）。
+    """
+    settings: Settings = request.app.state.settings
+    max_bytes = settings.max_payload_bytes
+
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > max_bytes:
+                return b"", error_response(
+                    413,
+                    PAYLOAD_TOO_LARGE,
+                    f"リクエストボディが上限（{max_bytes} bytes）を超えています",
+                )
+        except ValueError:
+            pass  # 不正な Content-Length は実読み込み側の検証に委ねる
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_bytes:
+            return b"", error_response(
+                413, PAYLOAD_TOO_LARGE, f"リクエストボディが上限（{max_bytes} bytes）を超えています"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks), None
+
+
 def _validate_label_caps(labels: list[str], settings: Settings) -> Response | None:
     """labels の個数上限と各 label の文字列長上限を検査する（型チェック済み前提）。"""
     if len(labels) > settings.max_labels_count:
@@ -288,8 +325,11 @@ def _validate_title_cap(title: str, settings: Settings) -> Response | None:
 
 
 async def _read_json_body(request: Request) -> tuple[dict, Response | None]:
+    raw, err = await _read_capped_body(request)
+    if err is not None:
+        return {}, err
     try:
-        body = await request.json()
+        body = json.loads(raw) if raw else None
     except Exception:
         return {}, error_response(400, INVALID_REQUEST, "リクエストボディが不正な JSON です")
     if not isinstance(body, dict):
@@ -299,10 +339,18 @@ async def _read_json_body(request: Request) -> tuple[dict, Response | None]:
 
 async def _read_json_body_optional(request: Request) -> tuple[dict, Response | None]:
     """body が空でもよい endpoint 用（PUT /lease は body 省略可）。"""
-    raw = await request.body()
+    raw, err = await _read_capped_body(request)
+    if err is not None:
+        return {}, err
     if not raw:
         return {}, None
-    return await _read_json_body(request)
+    try:
+        body = json.loads(raw)
+    except Exception:
+        return {}, error_response(400, INVALID_REQUEST, "リクエストボディが不正な JSON です")
+    if not isinstance(body, dict):
+        return {}, error_response(400, INVALID_REQUEST, "リクエストボディは JSON object でなければなりません")
+    return body, None
 
 
 def _validate_lease_ttl(value: object) -> tuple[int | None, Response | None]:
@@ -547,7 +595,9 @@ async def publish(request: Request) -> Response:
     body, err = await _read_json_body(request)
     if err is not None:
         observability.inc_metric(
-            request.app.state, "relay_publish_failed_total", failure_reason="invalid_request"
+            request.app.state,
+            "relay_publish_failed_total",
+            failure_reason="payload_too_large" if err.status_code == 413 else "invalid_request",
         )
         return err
 

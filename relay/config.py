@@ -40,6 +40,12 @@ DEFAULT_ACK_TIMEOUT_SECONDS = 60.0
 # identity-authz.md §4.2: identity 自体は relay 再起動を跨いで disk 永続化される。
 DEFAULT_AGENT_CARD_CACHE_TTL_SECONDS = 3600  # 1h
 
+# request body のサイズ上限（bytes、セキュリティ監査 finding H-4/F2: PayloadTooLargeError が
+# 定義のみで未配線だった点の解消）。relay-v2-wire-api.md 等の仕様書に具体的なバイト数の
+# 記載は無いため、一般的なメッセージング API の慣行（例: Amazon SQS のメッセージサイズ上限
+# 256KiB）を参考にした値であり、実測に基づく数値ではない。
+DEFAULT_MAX_PAYLOAD_BYTES = 262_144  # 256 KiB
+
 # lease 切れ済み subscription を in-memory registry に残しておく猶予秒数
 # （relay-v2-wire-api.md §5.7 の 410 ヒントを再接続の遅い subscriber にも
 # 一定時間だけ提供するため）。この猶予を過ぎたら registry から物理的に除去する
@@ -127,6 +133,9 @@ class Settings:
     max_labels_count: int = DEFAULT_MAX_LABELS_COUNT
     max_label_length: int = DEFAULT_MAX_LABEL_LENGTH
     max_stream_name_length: int = DEFAULT_MAX_STREAM_NAME_LENGTH
+
+    # request body 全体のサイズ上限（DoS 防御）
+    max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES
 
     # federation（relay 間連合）。base_url は招待 URL 生成・redeem 応答 card の locator に使う。
     # jws_private_key_pem が未設定なら federation 機能自体を無効化する（fail-closed、
@@ -261,6 +270,9 @@ def load_settings_from_env() -> Settings:
         ),
         max_label_length=int(
             os.environ.get("RELAY_MAX_LABEL_LENGTH", DEFAULT_MAX_LABEL_LENGTH)
+        ),
+        max_payload_bytes=int(
+            os.environ.get("RELAY_MAX_PAYLOAD_BYTES", DEFAULT_MAX_PAYLOAD_BYTES)
         ),
         federation_base_url=os.environ.get("RELAY_BASE_URL"),
         federation_ts_skew_seconds=int(

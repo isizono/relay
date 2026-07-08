@@ -480,7 +480,7 @@ relay のメモリを枯渇させられる。両 registry に以下を課す。
 ### 6.9 入力フィールド上限（DoS 防御）
 
 無制限の `title` 文字列や大量の `label` は registry / outbox のメモリを膨らませられる。個々の
-入力フィールドに以下の上限を課す（`payload` 全体のサイズ上限は別途、§8 の `413` 系で扱う）。
+入力フィールドに以下の上限を課す（`payload` 全体のサイズ上限は別途、§6.10 で扱う）。
 
 - **title**: 文字列長の上限（`POST /publish`）。超過は `400`（`InvalidRequestError`）。relay は
   truncate せず拒否する（暗黙の切り詰めで publisher の意図を書き換えない）。
@@ -491,6 +491,22 @@ relay のメモリを枯渇させられる。両 registry に以下を課す。
   上限に揃える。
 - 上限値は設定可能で、既定は routing key（label）と表示用見出し（title）の実運用サイズを目安に
   置く。
+
+### 6.10 request body サイズ上限
+
+- body を受け取る全 endpoint（`POST /streams`, `POST /streams/{id}/messages`,
+  `PUT /streams/{id}/members`, `POST /streams/{id}/ack`, `POST /subscriptions`,
+  `PUT /subscriptions/{id}/lease`, `POST /subscriptions/{id}/ack`, `POST /publish`）で共通の
+  request body サイズ上限（既定 256 KiB）を設ける。超過時は `413 Payload Too Large`
+  （`PayloadTooLargeError`）。
+- 上限値は本書や機能要件文書に明記された数値ではなく、一般的なメッセージング API の慣行
+  （例: Amazon SQS のメッセージサイズ上限 256KiB）を参考にした実装既定値。運用側は
+  `RELAY_MAX_PAYLOAD_BYTES` 環境変数で上書きできる。
+- 個別フィールド（`body` / `title` / `labels` 等）ごとの長さ上限は §6.9 で別途課すが、本節の
+  request body サイズ上限は request body 全体のバイト数のみを見る。理由: セキュリティ監査で
+  指摘された脅威は「特定フィールドが大きすぎる」ことではなく「`await request.json()` が任意
+  サイズの body を無条件に全部メモリへ読み込む」こと自体であるため、body 全体を対象にする方が
+  発生源に近い。
 
 ---
 
@@ -556,6 +572,7 @@ relay のメモリを枯渇させられる。両 registry に以下を課す。
 | `404` | 不存在（露呈回避含む） | 場 / subscription 不在, 非所有 subscription への操作（§5.7）, 非メンバーによる場への操作（参照 / 投函 / close / membership 変更。§3.2–3.4） |
 | `409` | 競合 | 同一作成者の名前空間内で同名 stream 既存（canonical stream_id 既存） |
 | `410` | 消滅 / 期限切れ | close 済み場への投函, 所有者本人による lease 切れ subscription への操作（registry 残存時のみ。§5.7） |
+| `413` | request body サイズ超過 | request body が上限（既定 256 KiB、§6.10）を超過 |
 | `429` | rate limit / 資源上限 | publisher ごと publish 上限, registry 資源上限（stream / subscription 作成の総数 / per-identity。§6.8） |
 | `503` | 一時不能 | outbox 障害（disk full / DB corrupt） |
 
