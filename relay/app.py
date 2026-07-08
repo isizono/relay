@@ -19,7 +19,16 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from relay import credentials, db, delivery, invitations, observability, streams, subscriptions
+from relay import (
+    credentials,
+    db,
+    delivery,
+    federation,
+    invitations,
+    observability,
+    streams,
+    subscriptions,
+)
 from relay.config import Settings, get_settings
 from relay.errors import OUTBOX_UNAVAILABLE, error_response
 from relay.identity import MEDIA_TYPE_AGENT_CARD, build_public_agent_card
@@ -29,6 +38,9 @@ from relay.ratelimit import RateLimiter
 # 表現できる最小値をそのまま採る。localhost では全 127.0.0.1 で単一 bucket となり
 # 実効はほぼ DoS/spam ガードのみ。
 REDEEM_RATE_LIMIT_PER_SECOND = 5
+
+# peer redeem のレート制限（invitations.redeem と同値、IP キー、federation namespace 別 bucket）。
+FEDERATION_REDEEM_RATE_LIMIT_PER_SECOND = 5
 
 
 async def handle_outbox_unavailable(request: Request, exc: Exception) -> Response:
@@ -83,6 +95,9 @@ def create_app(settings: Settings | None = None) -> Starlette:
             credentials.load_bearers(resolved_settings.db_path, now)
         )
         app.state.redeem_rate_limiter = RateLimiter(REDEEM_RATE_LIMIT_PER_SECOND)
+        app.state.federation_redeem_rate_limiter = RateLimiter(
+            FEDERATION_REDEEM_RATE_LIMIT_PER_SECOND
+        )
 
         # dispatcher はプロセス内シングルトン（file lock で enforce、
         # relay-v2-wire-api.md §6.2）。lock を取れなかった場合はこのプロセスでは
@@ -110,6 +125,7 @@ def create_app(settings: Settings | None = None) -> Starlette:
         *delivery.routes,
         *observability.routes,
         *invitations.routes,
+        *federation.routes,
     ]
 
     app = Starlette(

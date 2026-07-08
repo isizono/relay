@@ -32,6 +32,10 @@ RESOURCE_LIMIT_EXCEEDED = "ResourceLimitExceededError"
 SUBSCRIBER_MISMATCH = "SubscriberMismatchError"
 OUTBOX_UNAVAILABLE = "OutboxUnavailableError"
 INVITE_NOT_FOUND = "InviteNotFoundError"
+PEER_INVITE_NOT_FOUND = "PeerInviteNotFoundError"
+PEER_ALREADY_REGISTERED = "PeerAlreadyRegisteredError"
+FEDERATION_DISABLED = "FederationDisabledError"
+FEDERATION_SIGNATURE_INVALID = "FederationSignatureInvalidError"
 
 
 class ResourceLimitExceeded(Exception):

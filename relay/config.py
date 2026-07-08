@@ -75,6 +75,10 @@ DEFAULT_MAX_LABEL_LENGTH = 128
 # delivery target key に埋め込まれるため、label と同じ識別子系の上限に揃える。
 DEFAULT_MAX_STREAM_NAME_LENGTH = 128
 
+# federation（relay 間連合）の既定値。
+DEFAULT_FEDERATION_TS_SKEW_SECONDS = 300
+DEFAULT_FEDERATION_ALLOW_PRIVATE_LOCATORS = False
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -124,6 +128,33 @@ class Settings:
     max_label_length: int = DEFAULT_MAX_LABEL_LENGTH
     max_stream_name_length: int = DEFAULT_MAX_STREAM_NAME_LENGTH
 
+    # federation（relay 間連合）。base_url は招待 URL 生成・redeem 応答 card の locator に使う。
+    # jws_private_key_pem が未設定なら federation 機能自体を無効化する（fail-closed、
+    # relay 自身の federation マシン鍵は AgentCard 署名鍵と共用のため）。
+    federation_base_url: str | None = None
+    federation_ts_skew_seconds: int = DEFAULT_FEDERATION_TS_SKEW_SECONDS
+    federation_allow_private_locators: bool = DEFAULT_FEDERATION_ALLOW_PRIVATE_LOCATORS
+
+
+def _parse_bool_env(env_var: str, default: bool) -> bool:
+    """`"1"` / `"true"`（大小文字無視）を True、それ以外・未設定を `default` として読む。"""
+    raw = os.environ.get(env_var)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true")
+
+
+def validate_local_identity(identity: str) -> None:
+    """local identity が `@` を含まないことを検証する。
+
+    `@` を含む identity は federation の peer namespace（`sub@handle`）用に構造的に予約
+    されている。local identity にこれを許すと namespace の構造的分離が崩れる。
+    """
+    if "@" in identity:
+        raise ValueError(
+            f"local identity に '@' は使用できません（federation peer namespace 用に予約）: {identity!r}"
+        )
+
 
 def _load_auth_tokens_from_env() -> dict[str, str]:
     """`RELAY_AUTH_TOKENS` 環境変数（JSON: {"<token>": "<identity>"}）から読み込む。"""
@@ -138,7 +169,10 @@ def _load_auth_tokens_from_env() -> dict[str, str]:
         ) from exc
     if not isinstance(parsed, dict):
         raise ValueError("RELAY_AUTH_TOKENS は JSON object でなければなりません")
-    return {str(k): str(v) for k, v in parsed.items()}
+    result = {str(k): str(v) for k, v in parsed.items()}
+    for identity in result.values():
+        validate_local_identity(identity)
+    return result
 
 
 def load_settings_from_env() -> Settings:
@@ -227,6 +261,16 @@ def load_settings_from_env() -> Settings:
         ),
         max_label_length=int(
             os.environ.get("RELAY_MAX_LABEL_LENGTH", DEFAULT_MAX_LABEL_LENGTH)
+        ),
+        federation_base_url=os.environ.get("RELAY_BASE_URL"),
+        federation_ts_skew_seconds=int(
+            os.environ.get(
+                "RELAY_FEDERATION_TS_SKEW_SECONDS", DEFAULT_FEDERATION_TS_SKEW_SECONDS
+            )
+        ),
+        federation_allow_private_locators=_parse_bool_env(
+            "RELAY_FEDERATION_ALLOW_PRIVATE_LOCATORS",
+            DEFAULT_FEDERATION_ALLOW_PRIVATE_LOCATORS,
         ),
     )
 
