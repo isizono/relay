@@ -19,10 +19,28 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from relay import db, delivery, observability, streams, subscriptions
+from relay import (
+    credentials,
+    db,
+    delivery,
+    federation,
+    invitations,
+    observability,
+    streams,
+    subscriptions,
+)
 from relay.config import Settings, get_settings
 from relay.errors import OUTBOX_UNAVAILABLE, error_response
 from relay.identity import MEDIA_TYPE_AGENT_CARD, build_public_agent_card
+from relay.ratelimit import RateLimiter
+
+# 招待 redeem のレート制限（5 req/s、IP キー）。既存 RateLimiter の下限が 1/s のため
+# 表現できる最小値をそのまま採る。localhost では全 127.0.0.1 で単一 bucket となり
+# 実効はほぼ DoS/spam ガードのみ。
+REDEEM_RATE_LIMIT_PER_SECOND = 5
+
+# peer redeem のレート制限（invitations.redeem と同値、IP キー、federation namespace 別 bucket）。
+FEDERATION_REDEEM_RATE_LIMIT_PER_SECOND = 5
 
 
 async def handle_outbox_unavailable(request: Request, exc: Exception) -> Response:
@@ -68,6 +86,19 @@ def create_app(settings: Settings | None = None) -> Starlette:
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         db.init_db(resolved_settings.db_path)
 
+        # 起動時ロード: disk 永続の credential を in-memory auth_tokens へ merge する
+        # （relay 再起動を跨いだ credential の生存）。now は delivery._now_iso() で取得する
+        # （`_now_iso` は delivery.py の module-private だが、app.py は独自の時刻ヘルパーを
+        # 持たないためここでのみ無修飾アクセスする）。
+        now = delivery._now_iso()
+        resolved_settings.auth_tokens.update(
+            credentials.load_bearers(resolved_settings.db_path, now)
+        )
+        app.state.redeem_rate_limiter = RateLimiter(REDEEM_RATE_LIMIT_PER_SECOND)
+        app.state.federation_redeem_rate_limiter = RateLimiter(
+            FEDERATION_REDEEM_RATE_LIMIT_PER_SECOND
+        )
+
         # dispatcher はプロセス内シングルトン（file lock で enforce、
         # relay-v2-wire-api.md §6.2）。lock を取れなかった場合はこのプロセスでは
         # dispatcher を起動しない（他プロセスが既に担っている）。
@@ -93,6 +124,8 @@ def create_app(settings: Settings | None = None) -> Starlette:
         *subscriptions.routes,
         *delivery.routes,
         *observability.routes,
+        *invitations.routes,
+        *federation.routes,
     ]
 
     app = Starlette(

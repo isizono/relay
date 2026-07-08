@@ -251,6 +251,44 @@ sequenceDiagram
 
 ---
 
+## 7. stream レーン: 投函 → member push → ack
+
+stream レーンは subscription レーンと同じ outbox 配達メカを共有するが、配達先の決まり方が異なる。subscription が「labels のマッチング」で配達先を決めるのに対し、stream は **membership**（stream ごとの access mode = `read` / `write` / `read_write`）で決まる。`write` 権限を持つ member が投函し、`read` 権限（`read` / `read_write`）を持つ member へ push される。**`write` のみの member は配達対象外**である。stream のメッセージは relay 内に永続蓄積されず（pass-through）、投函を受けた瞬間に read member ごとの outbox エントリ（キー `(stream_id, member_identity, publish_id)`）に fan-out される。
+
+ack は subscription レーンと対称の cumulative ack で、専用の軽量 endpoint `POST /streams/{stream_id}/ack { up_to_publish_id }` を使う（stream の membership 自体を subscription 化しない設計を保つため独立 endpoint とする）。ack は `read` 権限を持つ member 本人からのみ受け付け、read 権限が無い場合と stream 不在は同一の `404` に隠す。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Wr as Writer member
+    participant Relay
+    participant Outbox as Outbox (SQLite)
+    participant Rd as Reader member
+
+    Wr->>Relay: POST /streams/{id}/messages { body, ttl?, idempotency_key? }
+    Relay->>Relay: write 権限を検証 (write を持たない member は 403)
+    Relay->>Relay: idempotency_key dedup (15min window)
+    Relay->>Relay: read member 集合を算出 (read / read_write、write-only は除外)
+    Relay->>Outbox: INSERT (stream_id, member_identity, publish_id) x read members (single tx)
+    Relay-->>Wr: 202 Accepted { publish_id, matched_members }
+
+    Note over Relay,Outbox: dispatcher polls outbox (100ms - 1s)
+    Relay->>Outbox: SELECT pending stream entries
+    Outbox-->>Relay: pending rows (read member ごと)
+    Relay->>Rd: SSE event: notification (id=publish_id, data={ delivery_target, publish_id, body, delivered_at })
+    Rd->>Rd: process body
+    Rd->>Relay: POST /streams/{id}/ack { up_to_publish_id }
+    Relay->>Relay: read 権限を検証 (read 権限なし / stream 不在は同一の 404)
+    Relay->>Outbox: DELETE WHERE stream_id=? AND member_identity=? AND publish_id <= up_to_publish_id
+    Relay-->>Rd: 200 OK
+```
+
+**permanent error と DLQ（membership 起因）**: stream レーンの outbox エントリは、subscription レーンと同じく retain 超過（default 24h）で DLQ 行きになるほか、**「stream は registry に生存しているが、宛先 member が read 権限を失った」場合に permanent error として DLQ 行き**になる（member 除去、または `read_write` → `write` への降格）。read 権限を失った member は該当 stream の ack もできず（ack は read 権限必須）、放置すると retain 上限まで無音の死重として残るためである。subscription レーンが「subscription_id が registry から消えた」ことを配達不能の指標にできるのに対し、stream の `member_identity` は relay 再起動を跨いで安定する識別子のため、「registry に居ない」だけでは配達不能を定義できない。この非対称性ゆえに **「stream 生存」を AND 条件に含める**ことが restart-safe 性の核心になる（再起動直後は membership registry が空なので、この permanent error は 1 件も発火せず、未配達エントリを誤って dead 化しない）。
+
+ただし **本人による自己離脱（`DELETE /streams/{id}/members?identity=<self>`）は DLQ を経由しない**。subscription レーンの unsubscribe と同型に、未 ack エントリを同一 transaction で即時削除する。明示的な関心放棄は事故ではないため、DLQ・warn ログ（意図しない消滅の観測専用）を汚さない。
+
+---
+
 ## 補足
 
 ### outbox に関する不変条件

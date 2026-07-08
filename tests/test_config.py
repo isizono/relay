@@ -3,7 +3,12 @@ import json
 
 import pytest
 
-from relay.config import DEFAULT_MAX_PAYLOAD_BYTES, Settings, load_settings_from_env
+from relay.config import (
+    DEFAULT_MAX_PAYLOAD_BYTES,
+    Settings,
+    load_settings_from_env,
+    validate_local_identity,
+)
 
 
 class TestSettingsDefaults:
@@ -73,3 +78,47 @@ class TestLoadSettingsFromEnv:
         assert settings.max_subscriptions_total == 60
         assert settings.max_subscriptions_per_identity == 6
         assert settings.stream_registry_retention_seconds == 120
+
+    def test_rejects_at_in_auth_token_identity(self, monkeypatch):
+        monkeypatch.setenv("RELAY_AUTH_TOKENS", json.dumps({"tok-1": "orch@bob"}))
+        with pytest.raises(ValueError):
+            load_settings_from_env()
+
+    def test_reads_federation_settings_defaults(self, monkeypatch):
+        monkeypatch.delenv("RELAY_BASE_URL", raising=False)
+        monkeypatch.delenv("RELAY_FEDERATION_TS_SKEW_SECONDS", raising=False)
+        monkeypatch.delenv("RELAY_FEDERATION_ALLOW_PRIVATE_LOCATORS", raising=False)
+        settings = load_settings_from_env()
+        assert settings.federation_base_url is None
+        assert settings.federation_ts_skew_seconds == 300
+        assert settings.federation_allow_private_locators is False
+
+    def test_reads_federation_settings_from_env(self, monkeypatch):
+        monkeypatch.setenv("RELAY_BASE_URL", "https://relay-a.example")
+        monkeypatch.setenv("RELAY_FEDERATION_TS_SKEW_SECONDS", "60")
+        monkeypatch.setenv("RELAY_FEDERATION_ALLOW_PRIVATE_LOCATORS", "true")
+        settings = load_settings_from_env()
+        assert settings.federation_base_url == "https://relay-a.example"
+        assert settings.federation_ts_skew_seconds == 60
+        assert settings.federation_allow_private_locators is True
+
+    @pytest.mark.parametrize("raw", ["1", "true", "TRUE", "True"])
+    def test_federation_allow_private_locators_truthy_values(self, monkeypatch, raw):
+        monkeypatch.setenv("RELAY_FEDERATION_ALLOW_PRIVATE_LOCATORS", raw)
+        settings = load_settings_from_env()
+        assert settings.federation_allow_private_locators is True
+
+    @pytest.mark.parametrize("raw", ["0", "false", "", "no"])
+    def test_federation_allow_private_locators_falsy_values(self, monkeypatch, raw):
+        monkeypatch.setenv("RELAY_FEDERATION_ALLOW_PRIVATE_LOCATORS", raw)
+        settings = load_settings_from_env()
+        assert settings.federation_allow_private_locators is False
+
+
+class TestValidateLocalIdentity:
+    def test_accepts_plain_identity(self):
+        validate_local_identity("orch")
+
+    def test_rejects_at_sign(self):
+        with pytest.raises(ValueError):
+            validate_local_identity("orch@bob")

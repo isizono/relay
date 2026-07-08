@@ -140,7 +140,8 @@ class TestBuildPublicAgentCard:
         assert card["name"] == "relay"
         assert card["capabilities"]["streaming"] is True
         assert card["capabilities"]["pushNotifications"] is False
-        assert card["capabilities"]["extendedAgentCard"] is True
+        # extended AgentCard の応答 handler は未実装のため false 固定。
+        assert card["capabilities"]["extendedAgentCard"] is False
 
     def test_security_scheme_is_wrapper_key_form(self, settings):
         """OpenAPI flat 形（{"type": "http"}）ではなく discriminated-union wrapper-key 形。"""

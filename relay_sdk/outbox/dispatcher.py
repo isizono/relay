@@ -8,6 +8,9 @@ retry backoff は「同一ループ内で待つのではなく次回 polling ま
 outbox schema には次回リトライ時刻の列が無いため、backoff の刻みは dispatcher プロセスの
 in-memory state（`_backoff_until`）で管理する。dispatcher は単一プロセスのため in-memory で
 十分で、プロセス再起動時は backoff state を失って即リトライになる（at-least-once を壊さない）。
+
+一時的失敗の DLQ 化は retry 回数ではなく `created_at` からの経過時間（既定 24h）で判定する。
+恒久的失敗（認証エラー・payload 不正等）は回数によらず即 DLQ。
 """
 from __future__ import annotations
 
@@ -25,6 +28,7 @@ from pathlib import Path
 import httpx
 
 from relay_sdk import config as sdk_config
+from relay_sdk.backoff import full_jitter
 from relay_sdk.errors import PermanentError, RelayProtocolError, TransientError
 from relay_sdk.http import make_client, post_publish
 
@@ -37,6 +41,10 @@ def _now() -> datetime:
 
 def _now_iso() -> str:
     return _now().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_iso(ts: str) -> datetime:
+    return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -131,9 +139,9 @@ def _dispatch_once(
     conn: sqlite3.Connection,
     client: httpx.Client,
     *,
-    max_retry: int,
-    initial_backoff_seconds: float,
-    backoff_factor: float,
+    retry_backoff_base_seconds: float,
+    retry_backoff_cap_seconds: float,
+    transient_retry_deadline_seconds: float,
     backoff_until: dict[int, float],
 ) -> int:
     """pending 行を 100 件 SELECT して配達を試みる。配達成功件数を返す。"""
@@ -160,7 +168,10 @@ def _dispatch_once(
             delivered += 1
         elif result == _RowResult.TRANSIENT:
             new_retry_count = row["retry_count"] + 1
-            if new_retry_count >= max_retry:
+            # 一時的失敗は enqueue（created_at）から transient_retry_deadline_seconds
+            # （既定 24h）再送し続けてもダメなら dead 化する（§2.1 / §2.3.1）。
+            retrying_since = _parse_iso(row["created_at"])
+            if (_now() - retrying_since).total_seconds() >= transient_retry_deadline_seconds:
                 conn.execute(
                     "UPDATE relay_outbox"
                     " SET retry_count = ?, last_error = ?, dead_at = ? WHERE id = ?",
@@ -168,18 +179,22 @@ def _dispatch_once(
                 )
                 conn.commit()
                 backoff_until.pop(row_id, None)
-                logger.warning("outbox row %s を dead 化（retry 上限到達）: %s", row_id, error)
+                logger.warning(
+                    "outbox row %s を dead 化（transient retry deadline 到達）: %s", row_id, error
+                )
             else:
                 conn.execute(
                     "UPDATE relay_outbox SET retry_count = ?, last_error = ? WHERE id = ?",
                     (new_retry_count, error, row_id),
                 )
                 conn.commit()
-                # 429 は Retry-After を尊重、それ以外は指数バックオフ（§4.4 / §2.3.1）。
+                # 429 は Retry-After を尊重、それ以外は Full Jitter（§4.4 / §2.3.1）。
                 delay = (
                     retry_after
                     if retry_after is not None
-                    else initial_backoff_seconds * (backoff_factor ** row["retry_count"])
+                    else full_jitter(
+                        retry_backoff_base_seconds, retry_backoff_cap_seconds, row["retry_count"]
+                    )
                 )
                 backoff_until[row_id] = time.monotonic() + delay
         else:  # DEAD（permanent error）
@@ -218,9 +233,9 @@ def run_dispatcher(
     jws_key_path: Path | str | None = None,
     bearer_token: str | None = None,
     poll_interval_seconds: float = 0.5,
-    max_retry: int = 5,
-    initial_backoff_seconds: float = 0.1,
-    backoff_factor: float = 2.0,
+    retry_backoff_base_seconds: float = 1.0,
+    retry_backoff_cap_seconds: float = 300.0,
+    transient_retry_deadline_seconds: float = 86400.0,
     dlq_gc_interval_seconds: float = 3600.0,
     http_timeout_seconds: float = 10.0,
     stop_event: threading.Event | None = None,
@@ -254,9 +269,9 @@ def run_dispatcher(
                 _dispatch_once(
                     conn,
                     client,
-                    max_retry=max_retry,
-                    initial_backoff_seconds=initial_backoff_seconds,
-                    backoff_factor=backoff_factor,
+                    retry_backoff_base_seconds=retry_backoff_base_seconds,
+                    retry_backoff_cap_seconds=retry_backoff_cap_seconds,
+                    transient_retry_deadline_seconds=transient_retry_deadline_seconds,
                     backoff_until=backoff_until,
                 )
                 if time.monotonic() - last_gc >= dlq_gc_interval_seconds:

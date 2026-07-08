@@ -9,6 +9,7 @@ import sqlite3
 import pytest
 from starlette.testclient import TestClient
 
+from relay import credentials, db
 from relay.app import create_app
 from relay.config import Settings
 
@@ -76,6 +77,112 @@ class TestNotFound:
     def test_unregistered_route_returns_404(self, client):
         r = client.get("/nonexistent")
         assert r.status_code == 404
+
+
+class TestCredentialBootstrap:
+    """招待 redeem で発行された DB credential の起動時ロードを検証する。
+
+    静的 env token（`Settings.auth_tokens` に直接渡す静的表）と DB 由来の動的
+    credential の併存、および revoke が relay 再起動（= 新しい app インスタンス生成）を
+    跨いで初めて反映されること（restart-bounded）を確認する。
+    """
+
+    def test_db_bearer_survives_restart(self, tmp_path):
+        db_path = str(tmp_path / "boot.db")
+        settings1 = Settings(
+            db_path=db_path,
+            server_log_path=str(tmp_path / "boot.jsonl"),
+            dispatcher_lock_path=str(tmp_path / "boot.lock"),
+        )
+        app1 = create_app(settings1)
+        with TestClient(app1) as c1:
+            token = credentials.issue_invite(
+                db_path,
+                identity="cc-memory",
+                invite_ttl_seconds=900,
+                credential_ttl_seconds=None,
+            )
+            r = c1.post("/invitations/redeem", json={"invite_token": token})
+            assert r.status_code == 200
+            bearer_token = r.json()["bearer_token"]
+
+        # 新しい Settings / app インスタンス（relay 再起動を模す）でも同じ DB から
+        # 起動時ロードされ、bearer が認証を通ること。
+        settings2 = Settings(
+            db_path=db_path,
+            server_log_path=str(tmp_path / "boot.jsonl"),
+            dispatcher_lock_path=str(tmp_path / "boot.lock"),
+        )
+        app2 = create_app(settings2)
+        with TestClient(app2) as c2:
+            r2 = c2.post(
+                "/streams",
+                json={"name": "s1"},
+                headers={"Authorization": f"Bearer {bearer_token}"},
+            )
+            assert r2.status_code == 201
+
+    def test_static_and_db_tokens_coexist(self, tmp_path):
+        db_path = str(tmp_path / "coexist.db")
+        db.init_db(db_path)
+        token = credentials.issue_invite(
+            db_path, identity="db-agent", invite_ttl_seconds=900, credential_ttl_seconds=None
+        )
+        conn = db.get_connection(db_path)
+        try:
+            bearer_token, _, _ = credentials.redeem_invite(conn, token, credentials._now_iso())
+        finally:
+            conn.close()
+
+        settings = Settings(
+            db_path=db_path,
+            server_log_path=str(tmp_path / "coexist.jsonl"),
+            dispatcher_lock_path=str(tmp_path / "coexist.lock"),
+            auth_tokens={"tok-static": "static-agent"},
+        )
+        app = create_app(settings)
+        with TestClient(app) as c:
+            r_static = c.post(
+                "/streams", json={"name": "s1"}, headers={"Authorization": "Bearer tok-static"}
+            )
+            assert r_static.status_code == 201
+            r_db = c.post(
+                "/streams",
+                json={"name": "s2"},
+                headers={"Authorization": f"Bearer {bearer_token}"},
+            )
+            assert r_db.status_code == 201
+
+    def test_revoke_then_reload_fails_auth(self, tmp_path):
+        db_path = str(tmp_path / "revoke.db")
+        db.init_db(db_path)
+        token = credentials.issue_invite(
+            db_path, identity="cc-memory", invite_ttl_seconds=900, credential_ttl_seconds=None
+        )
+        conn = db.get_connection(db_path)
+        try:
+            bearer_token, _, _ = credentials.redeem_invite(conn, token, credentials._now_iso())
+        finally:
+            conn.close()
+
+        # revoke は DB を触るだけで、稼働中の in-memory auth_tokens には影響しない
+        # （relay 再起動まで有効なまま残る、restart-bounded）。ここでは新しい app
+        # インスタンス生成（再起動を模す）まで進めて反映を確認する。
+        credentials.revoke(db_path, identity="cc-memory", now=credentials._now_iso())
+
+        settings = Settings(
+            db_path=db_path,
+            server_log_path=str(tmp_path / "revoke.jsonl"),
+            dispatcher_lock_path=str(tmp_path / "revoke.lock"),
+        )
+        app = create_app(settings)
+        with TestClient(app) as c:
+            r = c.post(
+                "/streams",
+                json={"name": "s1"},
+                headers={"Authorization": f"Bearer {bearer_token}"},
+            )
+            assert r.status_code == 401
 
 
 class TestOutboxUnavailable:

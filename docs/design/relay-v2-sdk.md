@@ -8,12 +8,12 @@
 >
 > | 前提 | 出典 | 本 SDK での具現化 |
 > |---|---|---|
-> | publish 保証 = transactional outbox + at-least-once + retain 24h default | 機能要件 v3 FR-4 | `relay_outbox.publish()` で同一 SQLite tx に INSERT、dispatcher が relay へ POST |
-> | subscription_id は relay が採番、subscriber 持参復旧経路なし（履歴中立） | 機能要件 v3 FR-3.0 / FR-3.2 | `Subscription` は再接続のたびに新規 subscribe を行う |
-> | SSE resume = relay が未 ack outbox を黙って再 push（`Last-Event-ID` 不使用） | 機能要件 v3 FR-4.8 / FR-3.9 | SDK は `Last-Event-ID` ヘッダを送らず、再接続後の cumulative ack カーソルを真実源とする |
-> | ack = subscriber 発の app-level cumulative ack（`POST /subscriptions/{id}/ack { up_to_publish_id }`） | 機能要件 v3 FR-3.10 | `Subscription.ack(up_to_publish_id)` をラップ |
-> | seq 体系 = `publish_id` 1 系統（relay 全体 global 単調） | 機能要件 v3 §4.4 | event payload の `publish_id` がそのまま ack カーソル |
-> | identity = A2A authN（AgentCard + Bearer / JWS）、subscriber 種別中立 | 機能要件 v3 FR-5 | SDK は AgentCard を読み込んで securityScheme を選択、JWS は `pyjwt` 等で署名 |
+> | publish 保証 = transactional outbox + at-least-once + retain 24h default | 機能要件 v2 FR-4 | `relay_outbox.publish()` で同一 SQLite tx に INSERT、dispatcher が relay へ POST |
+> | subscription_id は relay が採番、subscriber 持参復旧経路なし（履歴中立） | 機能要件 v2 FR-3.0 / FR-3.2 | `Subscription` は再接続のたびに新規 subscribe を行う |
+> | SSE resume = relay が未 ack outbox を黙って再 push（`Last-Event-ID` 不使用） | 機能要件 v2 FR-4.8 / FR-3.9 | SDK は `Last-Event-ID` ヘッダを送らず、再接続後の cumulative ack カーソルを真実源とする |
+> | ack = subscriber 発の app-level cumulative ack（`POST /subscriptions/{id}/ack { up_to_publish_id }`） | 機能要件 v2 FR-3.10 | `Subscription.ack(up_to_publish_id)` をラップ |
+> | seq 体系 = `publish_id` 1 系統（relay 全体 global 単調） | 機能要件 v2 §4.4 | event payload の `publish_id` がそのまま ack カーソル |
+> | identity = A2A authN（AgentCard + Bearer / JWS）、subscriber 種別中立 | 機能要件 v2 FR-5 | SDK は AgentCard を読み込んで securityScheme を選択、JWS は `pyjwt` 等で署名 |
 
 ---
 
@@ -27,9 +27,9 @@
 | **dispatcher** | publisher プロセス（または別プロセス）で常駐する relay 配達 daemon。outbox を polling して relay の `POST /publish` を呼ぶ |
 | **subscription_id** | relay が `POST /subscriptions` で採番する UUID。subscriber が `Subscription` を保持している間だけ有効。subscriber プロセス再起動 / lease 切れで失効し、再 subscribe で新 ID を発行する |
 | **publish_id** | relay 全体で global 単調な整数 ID。subscription 内順序・ack カーソル・SSE `id:` 行の三役を兼ねる |
-| **stream** | 機能要件 v3 で言う「場」の SDK 内呼称。membership ベースで配達先が決まる publish 源 |
+| **stream** | 機能要件 v2 で言う「場」の SDK 内呼称。membership ベースで配達先が決まる publish 源 |
 
-> 機能要件 v3 のユビキタス言語は議論中。本書では「stream」を原則使い、「場」とは併記しない。
+> 機能要件 v2 のユビキタス言語は議論中。本書では「stream」を原則使い、「場」とは併記しない。
 
 ---
 
@@ -109,7 +109,7 @@ def publish(
 
     Args:
         conn: 業務 write が乗っている SQLite Connection。SDK は commit / rollback を呼ばない。
-        ref_type: relay 機能要件 v3 FR-3.6 の ref.type（"decision" / "log" / "material" / ...）。
+        ref_type: relay 機能要件 v2 FR-3.6 の ref.type（"decision" / "log" / "material" / ...）。
         ref_id: 業務 entity の PK。
         labels: AND set として扱われる opaque string のリスト。空配列は ValueError。
         title: 200 UTF-8 chars 以内。超過時は publisher 責任で truncate（SDK は truncate しない）。
@@ -176,9 +176,9 @@ def run_dispatcher(
     agent_card_path: Path | str,
     jws_key_path: Path | str | None = None,
     poll_interval_seconds: float = 0.5,
-    max_retry: int = 5,
-    initial_backoff_seconds: float = 0.1,
-    backoff_factor: float = 2.0,
+    retry_backoff_base_seconds: float = 1.0,
+    retry_backoff_cap_seconds: float = 300.0,
+    transient_retry_deadline_seconds: float = 86400.0,
     dlq_gc_interval_seconds: float = 3600.0,
     stop_event: threading.Event | None = None,
 ) -> None:
@@ -196,9 +196,9 @@ def run_dispatcher(
 2. 各行について `POST /publish` を呼ぶ
 3. 成功 → `UPDATE ... SET processed_at = ? WHERE id = ?`
 4. transient error → `UPDATE ... SET retry_count = retry_count + 1, last_error = ? WHERE id = ?`
-   - `retry_count` が `max_retry` に達したらその場で `dead_at` をセット
-   - retry は指数バックオフ（`initial_backoff_seconds * backoff_factor ** retry_count`）で同一ループ内で待つのではなく次回 polling まで待つ
-5. permanent error（HTTP 4xx で `400` / `403` / `404` 系）→ 即 `dead_at` セット
+   - retry は Full Jitter（`random(0, min(retry_backoff_cap_seconds, retry_backoff_base_seconds * 2 ** retry_count))`、既定 base=1 秒・cap=300 秒）で同一ループ内で待つのではなく次回 polling まで待つ。決定的な指数バックオフと異なり、複数 publisher プロセスが同時に relay 障害から復帰する際の一斉 retry（thundering herd）を避けるため、待ち時間は毎回 `[0, ceiling)` から一様乱択する
+   - dead 化は retry 回数ではなく `created_at` からの経過時間で判定する。`transient_retry_deadline_seconds`（既定 24h）を過ぎても配達できなければその場で `dead_at` をセットする。24h 以内は retry 回数に上限を設けず待ち続ける
+5. permanent error（HTTP 4xx で `400` / `403` / `404` 系、認証エラーや payload 不正など）→ retry せず即 `dead_at` セット
 6. dispatcher は `dlq_gc_interval_seconds` ごとに `DELETE FROM relay_outbox WHERE dead_at IS NOT NULL AND dead_at < ?`（`?` は `dead_at` から 7 日前）を実行
 
 #### 2.3.2 `python -m relay_sdk.outbox` — systemd 等から起動
@@ -274,7 +274,6 @@ def subscribe(
     retain_seconds: int | None = None,
     auto_ack: bool = True,
     on_display: Callable[["EventDisplay"], None] | None = None,
-    reconnect_max_attempts: int | None = None,
 ) -> "Subscription":
     """
     relay に POST /subscriptions を投げて subscription_id を採番し、GET /events で SSE 接続を張る。
@@ -282,7 +281,7 @@ def subscribe(
     Args:
         subscriber_identity: 認証済みハンドル文字列。AgentCard と整合する必要がある。
         labels: AND set として扱われる。空配列は relay 側で 400 になるので呼び出し前に ValueError。
-        lease_ttl_seconds: 機能要件 v3 FR-3.2 で min 30, max 86400。
+        lease_ttl_seconds: 機能要件 v2 FR-3.2 で min 30, max 86400。
         retain_seconds: SSE 切断中の outbox 保持秒数。省略時は relay 既定（24h）。
                         lease_ttl とは独立した軸で、大小制約はない（retain > lease は正当）。
         auto_ack: True なら receive() のイテレーションが次に進んだ時点（= 直前に yield した
@@ -292,7 +291,6 @@ def subscribe(
         on_display: 表示・通知用 callback。各 event の yield 直前に EventDisplay を渡して
                     呼ばれる（§3.2.1）。callback 内の例外は SDK が捕捉してログに記録し、
                     配達・ack 進行には影響しない。
-        reconnect_max_attempts: SSE 切断時の再接続最大回数。None なら無限。
 
     Returns:
         Subscription オブジェクト（context manager としても使える）。
@@ -416,8 +414,8 @@ caller 側で「複数 event をバッチして処理してから 1 度に ack �
 ### 3.4 reconnect 戦略
 
 - SSE 切断（TCP close / heartbeat 30s 不在 / EOF）を検知。
-- 即時で 1 回 retry、失敗したら指数バックオフ（1s, 2s, 4s, 8s, 16s, 30s で頭打ち）。
-- `reconnect_max_attempts` に達するか、subscription 操作への `404` / `410`（subscription_id 失効・不明）を受け取ったら新規 subscribe に切り替える（relay 再起動で registry が消えた場合は `404` が返るため、`410` だけを分岐キーにしない）。
+- 即時で 1 回 retry、失敗したら Full Jitter（`random(0, min(cap, base * 2 ** attempt))`、既定 base=1 秒・cap=30 秒）で待って同一 subscription_id に再接続し続ける。決定的な指数バックオフと異なり、relay 再起動直後に多数の subscriber が同時に再接続する一斉 retry（thundering herd）を、待ち時間の乱択で分散させる。
+- 回数ベースの諦め（旧 `reconnect_max_attempts`）は持たない。死活判定は lease renew に一本化しており、subscription 操作への `404` / `410`（subscription_id 失効・不明）を受け取った場合だけ新規 subscribe に切り替える（relay 再起動で registry が消えた場合は `404` が返るため、`410` だけを分岐キーにしない）。
 - 再接続後は relay が自動的に未 ack 分を再 push するため、SDK 側で resume を申告する経路は持たない（`Last-Event-ID` ヘッダは送らない）。
 
 ### 3.5 retain 切れ時の fallback は publisher 直接 pull
@@ -469,16 +467,16 @@ reconciliation の本筋ロジック（labels → 内部 tool 呼び出しの翻
 ### 4.2 SSE 接続管理
 
 - `httpx` の `client.stream("GET", url, headers=...)` を使う。
-- 30 秒以内に何も読まれなければ TCP close と扱う（relay 側 keepalive 間隔は 30 秒、機能要件 v3 FR-4.6）。
+- 30 秒以内に何も読まれなければ TCP close と扱う（relay 側 keepalive 間隔は 30 秒、機能要件 v2 FR-4.6）。
 - event 単位の dedup は `(subscription_id, publish_id)` で行う。SDK 内に LRU set（直近 10000 件）を持つ。
-- 再接続の指数バックオフは §3.4 参照。
+- 再接続の Full Jitter バックオフは §3.4 参照。
 - **不正フレーム耐性**: server 由来の 1 フレームの破損（壊れた JSON / payload が object でない / `publish_id` 欠落・型不正 / `ref` `labels` の型不正）で受信ループを落とさない。当該フレームを warning ログ付きで skip し、受信を継続する。
 - **受信量上限**: 生 wire に対して 2 つの上限を課し、memory を無制限に食わない。1 frame の `data` 累積 byte 数（`SSE_MAX_FRAME_BYTES`、既定 1 MiB）と、改行未達のまま 1 行としてバッファできる byte 数（`SSE_MAX_BUFFER_BYTES`、既定 1 MiB）。超過した frame は破棄して warning ログを出し、次の frame 境界で同期を回復して受信を継続する。
 
 ### 4.3 JWS 署名生成 / 検証
 
 - AgentCard の `securitySchemes` を読み込み、Bearer 用 token を `RELAY_BEARER_TOKEN` 環境変数または `jws_key_path` 経由の私鍵で生成する。
-- relay 側 AgentCard を起動時に取得し、JWS で署名されていれば `/.well-known/jwks.json` の公開鍵で検証する（MAY 要件、機能要件 v3 FR-5.3）。検証失敗時は接続を拒否する。
+- relay 側 AgentCard を起動時に取得し、JWS で署名されていれば `/.well-known/jwks.json` の公開鍵で検証する（MAY 要件、機能要件 v2 FR-5.3）。検証失敗時は接続を拒否する。
 - 署名 / 検証は `pyjwt`（ES256）と `rfc8785`（JCS）を使う。SDK 自体は wrapper として `relay_sdk.http.auth` に閉じ込める。
 
 ### 4.4 エラーハンドリング
@@ -490,7 +488,7 @@ class RelayProtocolError(Exception):
     """relay からの 4xx / 仕様外応答。caller 側で原因を直す必要がある（permanent）。"""
 
 class TransientError(Exception):
-    """5xx / 接続不能 / timeout。dispatcher は指数バックオフで retry、subscriber は SSE 再接続で復帰。"""
+    """5xx / 接続不能 / timeout。dispatcher は Full Jitter backoff で retry、subscriber は SSE 再接続で復帰。"""
 
 class PermanentError(Exception):
     """subscription が失効・不明になった状態（subscription 操作への 404 / 410）。caller 側で再 subscribe が必要。"""
@@ -501,9 +499,9 @@ dispatcher 側のリトライ判定:
 | HTTP 応答 | 分類 | 振る舞い |
 |---|---|---|
 | `2xx` | success | `processed_at` を更新 |
-| `400 / 403 / 404`（`POST /publish` への応答） | `RelayProtocolError` | 即 `dead_at` セット、retry しない |
+| `400 / 403 / 404`（`POST /publish` への応答、認証エラー・payload 不正等） | `RelayProtocolError` | 即 `dead_at` セット、retry しない |
 | `429` | `TransientError` | `Retry-After` ヘッダ尊重、retry_count を進める |
-| `5xx` / timeout / TCP RST | `TransientError` | 指数バックオフで retry |
+| `5xx` / timeout / TCP RST | `TransientError` | Full Jitter backoff で retry（`created_at` から 24h 過ぎても解消しなければ `dead_at` セット） |
 | `404 / 410`（subscription 操作: lease renew / `GET /events` / ack への応答）| `PermanentError` | dispatcher 側では発生しない。subscriber 側で受領したら新規 subscribe に切り替え |
 
 ---
@@ -617,13 +615,13 @@ def process_batch(events: list[Event]) -> None:
 | `RELAY_BEARER_TOKEN` | Bearer token 文字列。`RELAY_JWS_KEY_PATH` と排他 | なし |
 | `RELAY_OUTBOX_DB` | dispatcher が見る SQLite ファイル | なし（dispatcher 起動時必須） |
 | `RELAY_OUTBOX_POLL_INTERVAL_MS` | dispatcher の polling 間隔（ミリ秒） | `500` |
-| `RELAY_OUTBOX_MAX_RETRY` | 同一行の retry 上限 | `5` |
-| `RELAY_OUTBOX_INITIAL_BACKOFF_MS` | retry 初回バックオフ（ミリ秒） | `100` |
-| `RELAY_OUTBOX_BACKOFF_FACTOR` | retry 指数バックオフ係数 | `2.0` |
+| `RELAY_OUTBOX_RETRY_BACKOFF_BASE_MS` | retry の Full Jitter base（ミリ秒） | `1000` |
+| `RELAY_OUTBOX_RETRY_BACKOFF_CAP_S` | retry の Full Jitter cap（秒） | `300` |
+| `RELAY_OUTBOX_TRANSIENT_RETRY_DEADLINE_S` | 一時的失敗を retry し続ける期限（`created_at` からの経過秒）。超過で dead 化 | `86400` |
 | `RELAY_OUTBOX_DLQ_GC_INTERVAL_S` | DLQ GC ループ間隔（秒） | `3600` |
 | `RELAY_SSE_KEEPALIVE_S` | SSE 無通信判定の閾値（秒） | `30` |
-| `RELAY_SSE_RECONNECT_MAX_ATTEMPTS` | 再接続最大回数。`0` なら無限 | `0` |
-| `RELAY_SSE_RECONNECT_BACKOFF_CAP_S` | 再接続バックオフ頭打ち（秒） | `30` |
+| `RELAY_SSE_RECONNECT_BACKOFF_BASE_S` | 再接続の Full Jitter base（秒） | `1` |
+| `RELAY_SSE_RECONNECT_BACKOFF_CAP_S` | 再接続の Full Jitter cap（秒） | `30` |
 | `RELAY_HTTP_TIMEOUT_S` | HTTP request の timeout（秒） | `10` |
 
 環境変数は `subscribe()` / `run_dispatcher()` の引数で override 可能。引数で渡された値が優先される。
@@ -665,7 +663,7 @@ def test_subscriber_receives_published_event() -> None:
 
 - `POST /subscriptions` / `DELETE /subscriptions/{id}` / `PUT /subscriptions/{id}/lease` / `POST /publish` / `POST /subscriptions/{id}/ack` / `GET /events` の最小実装
 - in-memory な outbox（subscription_id -> [Event]）
-- subset マッチング（機能要件 v3 FR-3.3 と同じ）
+- subset マッチング（機能要件 v2 FR-3.3 と同じ）
 - cumulative ack（FR-3.10 と同じ）
 - ack 前切断 → 再接続で再 push（FR-4.8）
 - `fake.simulate_outage()` / `fake.simulate_subscription_loss(subscription_id)`（subscription 操作への 404 / 410 応答の注入）等のフォールト注入 API
@@ -694,7 +692,7 @@ FakeRelay を使う unit test では、§3.2.1 の型分離を回帰から守る
 
 ### 7.3 contract test
 
-SDK が relay へ送る HTTP request / SSE consume の形は relay 機能要件の仕様と整合している必要がある。`tests/contract/` 配下に relay 機能要件 v3 と本書の対応表に基づく契約テストを置き、ワイヤ API ドキュメントを更新したときに SDK 側も追随漏れなく検知できるようにする。
+SDK が relay へ送る HTTP request / SSE consume の形は relay 機能要件の仕様と整合している必要がある。`tests/contract/` 配下に relay 機能要件 v2 と本書の対応表に基づく契約テストを置き、ワイヤ API ドキュメントを更新したときに SDK 側も追随漏れなく検知できるようにする。
 
 ---
 
@@ -711,7 +709,7 @@ SDK が relay へ送る HTTP request / SSE consume の形は relay 機能要件�
 
 ## 9. 関連
 
-- relay 機能要件 v3（凍結）— relay が満たす振る舞いの一次ソース
+- relay 機能要件 v2（凍結）— relay が満たす振る舞いの一次ソース
 - ワイヤ / API 仕様（`relay-v2-wire-api.md`）— 本書が依存する HTTP / SSE プロトコル
 - cc-memory ↔ relay 協調プロトコル v1（cc-memory 側で凍結）— `relay_outbox.publish()` の利用側ガイド
 - identity / authZ 仕様（`relay-v2-identity-authz.md`、別書）— AgentCard / JWS / Bearer の詳細

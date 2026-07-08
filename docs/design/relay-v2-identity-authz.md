@@ -19,7 +19,7 @@
 > - ワイヤプロトコルの endpoint / payload / status code 全集
 >   → `relay-v2-wire-api.md`
 > - cc-memory 連携プロトコル → cc-memory 側にのみ存在（協調プロトコル v1）
-> - 用語の最終確定: relay v2 のユビキタス言語は議論中。本書は暫定的に機能要件文書 v3 の用語に揃え、
+> - 用語の最終確定: relay v2 のユビキタス言語は議論中。本書は暫定的に機能要件文書 v2（物理改稿版）の用語に揃え、
 >   「場」と「stream」が併存する場合は原則「stream」を使う。A2A spec 由来の用語（AgentCard / JWS /
 >   JCS / DID / SecurityScheme）はそのまま英語で書く
 
@@ -197,6 +197,11 @@ A2A 1.0 spec §4.5 は SecurityScheme を OpenAPI 3.2.0 基盤の 5 type で規�
 
 最小セットでも spec 違反にはならない。relay は Bearer token を A2A 1.0 spec §7.4 の MUST に従い
 「すべての incoming request」に対して検証する。
+
+例外は3つの無認証（公開）route のみ: `GET /`（疎通確認）、`GET /.well-known/agent-card.json`
+（公開 AgentCard 取得）、`POST /invitations/redeem`（招待URL方式の bearer token 配布。
+`relay-v2-wire-api.md` §11）。redeem は認証を持たない代わりに、招待 token の一回性（atomic
+消費）・短い TTL・rate limit・失敗応答の一律 404（存在秘匿）という別統制で守られる。
 
 #### 1.5.2 宣言形式
 
