@@ -212,3 +212,24 @@ class TestOutboxUnavailable:
         )
         assert r.status_code == 503
         assert r.json()["code"] == "OutboxUnavailableError"
+
+
+class TestFederationLifespanState:
+    """`require_federation_authn` が参照する per-peer nonce cache / rate limiter が
+    lifespan で初期化されていることを検証する（未初期化だと federation サーフェスへの
+    リクエストが AttributeError で 500 になる、federation v1 設計確定版 builder 申し送り）。
+    """
+
+    def test_federation_nonce_cache_and_rate_limiter_initialized_on_startup(self, tmp_path):
+        from relay import federation_auth
+        from relay.ratelimit import RateLimiter
+
+        settings = Settings(
+            db_path=str(tmp_path / "fed_lifespan.db"),
+            server_log_path=str(tmp_path / "fed_lifespan.jsonl"),
+            dispatcher_lock_path=str(tmp_path / "fed_lifespan.lock"),
+        )
+        app = create_app(settings)
+        with TestClient(app):
+            assert isinstance(app.state.federation_nonce_cache, federation_auth.NonceCache)
+            assert isinstance(app.state.federation_request_rate_limiter, RateLimiter)

@@ -24,6 +24,8 @@ from relay import (
     db,
     delivery,
     federation,
+    federation_auth,
+    federation_inbound,
     invitations,
     observability,
     streams,
@@ -98,6 +100,13 @@ def create_app(settings: Settings | None = None) -> Starlette:
         app.state.federation_redeem_rate_limiter = RateLimiter(
             FEDERATION_REDEEM_RATE_LIMIT_PER_SECOND
         )
+        # `require_federation_authn`（/federation/* 全 endpoint 共通）が参照する
+        # per-peer nonce cache / rate limiter。未初期化のままだと federation サーフェスへの
+        # リクエストが AttributeError で 500 になる（起動時に必ず用意する）。
+        app.state.federation_nonce_cache = federation_auth.NonceCache()
+        app.state.federation_request_rate_limiter = RateLimiter(
+            federation_auth.DEFAULT_PEER_REQUEST_RATE_LIMIT_PER_SECOND
+        )
 
         # dispatcher はプロセス内シングルトン（file lock で enforce、
         # relay-v2-wire-api.md §6.2）。lock を取れなかった場合はこのプロセスでは
@@ -126,6 +135,7 @@ def create_app(settings: Settings | None = None) -> Starlette:
         *observability.routes,
         *invitations.routes,
         *federation.routes,
+        *federation_inbound.routes,
     ]
 
     app = Starlette(

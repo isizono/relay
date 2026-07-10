@@ -12,14 +12,33 @@ opaque key（"s1" 等）として直接扱い、HTTP 統合テストは create �
 以後の操作をアドレスする。
 """
 import pytest
+from joserfc.jwk import ECKey
 from starlette.testclient import TestClient
 
 from datetime import datetime, timedelta, timezone
 
+from relay import federation_peers
 from relay.app import create_app
 from relay.config import DEFAULT_MAX_STREAM_NAME_LENGTH, Settings
 from relay.errors import ResourceLimitExceeded
 from relay.streams import StreamRegistry, canonical_stream_id
+
+
+def _generate_peer_keypair() -> dict:
+    key = ECKey.generate_key("P-256", private=True)
+    return {"public_jwk": key.as_dict(private=False)}
+
+
+def _pin_peer(db_path: str, *, handle: str) -> None:
+    keypair = _generate_peer_keypair()
+    fingerprint = federation_peers.compute_fingerprint(keypair["public_jwk"])
+    federation_peers.add_peer(
+        db_path,
+        handle=handle,
+        fingerprint=fingerprint,
+        key_jwk=keypair["public_jwk"],
+        locator="https://relay-peer.example",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +185,43 @@ class TestStreamRegistry:
     def test_is_member_false_for_missing_stream(self):
         registry = StreamRegistry()
         assert registry.is_member("nope", "agent-a") is False
+
+    def test_create_without_origin_defaults_to_none(self):
+        registry = StreamRegistry()
+        record = registry.create("s1", "agent-a", None)
+        assert record.origin_peer is None
+        assert record.origin_stream_id is None
+
+    def test_create_with_origin_sets_replica_fields(self):
+        registry = StreamRegistry()
+        record = registry.create(
+            "orch@alice:collab", "@alice", None, origin_peer="alice", origin_stream_id="orch:collab"
+        )
+        assert record.origin_peer == "alice"
+        assert record.origin_stream_id == "orch:collab"
+        assert record.creator_identity == "@alice"
+
+    def test_has_peer_write_member_true_for_matching_suffix_with_write_access(self):
+        registry = StreamRegistry()
+        registry.create("s1", "agent-a", None)
+        registry.put_member("s1", "orch@bob", "read_write")
+        assert registry.has_peer_write_member("s1", "bob") is True
+
+    def test_has_peer_write_member_false_for_read_only(self):
+        registry = StreamRegistry()
+        registry.create("s1", "agent-a", None)
+        registry.put_member("s1", "orch@bob", "read")
+        assert registry.has_peer_write_member("s1", "bob") is False
+
+    def test_has_peer_write_member_false_for_different_handle(self):
+        registry = StreamRegistry()
+        registry.create("s1", "agent-a", None)
+        registry.put_member("s1", "orch@bob", "write")
+        assert registry.has_peer_write_member("s1", "carol") is False
+
+    def test_has_peer_write_member_false_for_missing_stream(self):
+        registry = StreamRegistry()
+        assert registry.has_peer_write_member("nope", "bob") is False
 
 
 def _past_iso(seconds: int) -> str:
@@ -799,6 +855,107 @@ class TestMembers:
     def test_list_members_missing_stream_returns_404(self, client):
         r = client.get("/streams/nope/members", headers=_auth("tok-a"))
         assert r.status_code == 404
+
+
+class TestMembersPeerNamespaceValidation:
+    """`put_member` の federation 命名規約検証（federation v1 設計確定版「命名規約」節、v1 で 2 検証）。
+
+    (1) `@` を含む identity は suffix が active な peer handle であること。
+    (2) 1 stream に同居できる peer namespace は 1 つまで。
+    """
+
+    def test_add_member_with_unknown_peer_handle_returns_400(self, client, settings):
+        client.post("/streams", json={"name": "s1"}, headers=_auth("tok-a"))
+        r = client.put(
+            f"/streams/{SID}/members",
+            json={"identity": "orch@notapeer", "access": "read_write"},
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 400
+        assert r.json()["code"] == "InvalidRequestError"
+
+    def test_add_member_with_revoked_peer_handle_returns_400(self, client, settings):
+        _pin_peer(settings.db_path, handle="bob")
+        federation_peers.revoke_peer(settings.db_path, handle="bob")
+        client.post("/streams", json={"name": "s1"}, headers=_auth("tok-a"))
+        r = client.put(
+            f"/streams/{SID}/members",
+            json={"identity": "orch@bob", "access": "read_write"},
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 400
+        assert r.json()["code"] == "InvalidRequestError"
+
+    def test_add_member_with_active_peer_handle_succeeds(self, client, settings):
+        _pin_peer(settings.db_path, handle="bob")
+        client.post("/streams", json={"name": "s1"}, headers=_auth("tok-a"))
+        r = client.put(
+            f"/streams/{SID}/members",
+            json={"identity": "orch@bob", "access": "read_write"},
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 200
+
+    def test_malformed_at_identity_returns_400(self, client, settings):
+        _pin_peer(settings.db_path, handle="bob")
+        client.post("/streams", json={"name": "s1"}, headers=_auth("tok-a"))
+        r = client.put(
+            f"/streams/{SID}/members",
+            json={"identity": "@bob", "access": "read_write"},
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 400
+
+    def test_second_distinct_peer_namespace_is_rejected(self, client, settings):
+        _pin_peer(settings.db_path, handle="bob")
+        _pin_peer(settings.db_path, handle="carol")
+        client.post("/streams", json={"name": "s1"}, headers=_auth("tok-a"))
+        first = client.put(
+            f"/streams/{SID}/members",
+            json={"identity": "orch@bob", "access": "read_write"},
+            headers=_auth("tok-a"),
+        )
+        assert first.status_code == 200
+        second = client.put(
+            f"/streams/{SID}/members",
+            json={"identity": "orch@carol", "access": "read_write"},
+            headers=_auth("tok-a"),
+        )
+        assert second.status_code == 400
+        assert second.json()["code"] == "InvalidRequestError"
+
+    def test_updating_existing_peer_member_of_same_handle_is_allowed(self, client, settings):
+        """同一 peer namespace（同一 handle）内での access 変更は 1-peer 制約に抵触しない。"""
+        _pin_peer(settings.db_path, handle="bob")
+        client.post("/streams", json={"name": "s1"}, headers=_auth("tok-a"))
+        client.put(
+            f"/streams/{SID}/members",
+            json={"identity": "orch@bob", "access": "read_write"},
+            headers=_auth("tok-a"),
+        )
+        r = client.put(
+            f"/streams/{SID}/members",
+            json={"identity": "orch@bob", "access": "read"},
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 200
+
+    def test_second_member_of_same_peer_handle_is_allowed(self, client, settings):
+        """同一 peer namespace 内で複数 sub を持つこと自体は許可される（1 stream 1 peer の
+        「1 peer」は handle 単位の制約であり、sub の数は制約しない）。"""
+        _pin_peer(settings.db_path, handle="bob")
+        client.post("/streams", json={"name": "s1"}, headers=_auth("tok-a"))
+        client.put(
+            f"/streams/{SID}/members",
+            json={"identity": "orch@bob", "access": "read_write"},
+            headers=_auth("tok-a"),
+        )
+        r = client.put(
+            f"/streams/{SID}/members",
+            json={"identity": "other@bob", "access": "read_write"},
+            headers=_auth("tok-a"),
+        )
+        assert r.status_code == 200
 
 
 class TestPostStreamMessage:
