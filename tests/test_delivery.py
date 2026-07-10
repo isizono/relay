@@ -743,6 +743,35 @@ class TestStreamDlqSweep:
             delivery.DLQ_ERROR_STREAM_READ_ACCESS_REVOKED
         ]
 
+    def test_federation_peer_member_removed_moves_to_dlq(self, settings):
+        """federation 文脈（member_identity が 'sub@handle' 形式）でも、他 member による
+        除去は既存の `_sweep_stream_permanent_errors`（無改変）が
+        `StreamReadAccessRevoked` として DLQ 化する（ローカルレーンと同一の振る舞い）。
+
+        member_identity の形式（'@' を含むかどうか）に関わらず `has_read_access` のみで
+        判定するため、federation peer member（例: 'orch@bob'）でも追加改修なしに動く
+        ことを確認する回帰テスト。
+        """
+        db.init_db(settings.db_path)
+        registry = StreamRegistry()
+        registry.create("orch:collab", "orch", None)
+        registry.put_member("orch:collab", "orch@bob", "read")
+        _insert_stream_outbox_row(settings, "orch:collab", "orch@bob", 1)
+
+        registry.delete_member("orch:collab", "orch@bob")  # peer member の involuntary な除去
+
+        conn = db.get_connection(settings.db_path)
+        try:
+            delivery._sweep_stream_permanent_errors(conn, registry)
+            conn.commit()
+        finally:
+            conn.close()
+
+        assert self._outbox_publish_ids(settings, "orch:collab", "orch@bob") == []
+        assert self._dlq_error_codes(settings, "orch:collab", "orch@bob") == [
+            delivery.DLQ_ERROR_STREAM_READ_ACCESS_REVOKED
+        ]
+
     def test_dispatch_once_wires_stream_sweep(self, settings):
         """dispatch_once の polling cycle に stream permanent-error sweep が組み込まれている。"""
         asyncio.run(self._run_dispatch_once(settings))
