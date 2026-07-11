@@ -43,6 +43,7 @@ from starlette.responses import JSONResponse
 
 from relay import federation_peers
 from relay.config import Settings
+from relay.errors import PAYLOAD_TOO_LARGE, error_response
 from relay.ratelimit import RateLimiter
 
 REQ_SIG_TYP = "relay-fed-req+jws"
@@ -82,6 +83,15 @@ class FederationAuthenticationError(Exception):
     def __init__(self, message: str, *, ts_skew_seconds: int | None = None) -> None:
         super().__init__(message)
         self.ts_skew_seconds = ts_skew_seconds
+
+
+class FederationPayloadTooLargeError(Exception):
+    """request body が `settings.max_payload_bytes` を超えている。呼び出し側は 413 を返す。
+
+    detached JWS の署名対象 payload には body 自体が含まれない（`content_sha256` のみを
+    含む）ため、署名検証だけでは body サイズを制限できない。`FederationAuthenticationError`
+    とは別の例外にして、呼び出し側が 401 ではなく 413 に変換できるようにする。
+    """
 
 
 def _b64url_encode(data: bytes) -> str:
@@ -297,8 +307,24 @@ async def verify_federation_request(
     if not nonce_cache.check_and_add(kid, nonce):
         raise FederationAuthenticationError("nonce が既に使用されています（リプレイの可能性）")
 
-    # 7. content_sha256 == 受信 body digest。
+    # 7. content_sha256 == 受信 body digest。settings.max_payload_bytes を超える body は
+    #    拒否する（relay.federation.MAX_REDEEM_BODY_BYTES と同型の Content-Length 事前
+    #    チェック + 読了後の再検証パターン。detached JWS の payload に body 自体は含まれず
+    #    署名検証だけでは body サイズを制限できないため、ここで別途上限を課す）。
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > settings.max_payload_bytes:
+                raise FederationPayloadTooLargeError(
+                    f"リクエストボディが上限（{settings.max_payload_bytes} bytes）を超えています"
+                )
+        except ValueError:
+            pass  # 不正な Content-Length は実読み込み側の検証に委ねる
     body_bytes = await request.body()
+    if len(body_bytes) > settings.max_payload_bytes:
+        raise FederationPayloadTooLargeError(
+            f"リクエストボディが上限（{settings.max_payload_bytes} bytes）を超えています"
+        )
     if payload.get("content_sha256") != _sha256_b64url(body_bytes):
         raise FederationAuthenticationError("content_sha256 が一致しません")
 
@@ -344,6 +370,8 @@ def require_federation_authn(
             peer_identity = await verify_federation_request(
                 request, settings=settings, nonce_cache=nonce_cache, rate_limiter=rate_limiter
             )
+        except FederationPayloadTooLargeError as exc:
+            return error_response(413, PAYLOAD_TOO_LARGE, str(exc))
         except FederationAuthenticationError as exc:
             from relay import observability
 

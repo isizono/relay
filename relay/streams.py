@@ -40,7 +40,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from relay import db, idempotency, observability
+from relay import db, federation_peers, idempotency, observability
 from relay.config import (
     DEFAULT_MAX_STREAMS_PER_IDENTITY,
     DEFAULT_MAX_STREAMS_TOTAL,
@@ -137,6 +137,12 @@ class StreamRecord:
     # idle-GC の猶予計算に使う。冪等な再 close では更新しない（最初の close 時刻を保つ）。
     closed_at: str | None = None
     members: dict[str, Access] = field(default_factory=dict)
+    # federation replica stream（`relay.federation_inbound` が自動生成する）でのみ設定する。
+    # origin_peer は生成元 peer の handle、origin_stream_id は生成元 peer 上での
+    # owner-relative stream_id（egress が返信の送り先 path を組み立てる際に使う）。
+    # 通常の（local が owner の）stream では両方 None。
+    origin_peer: str | None = None
+    origin_stream_id: str | None = None
 
 
 class StreamRegistry:
@@ -165,12 +171,22 @@ class StreamRegistry:
         self._per_creator_count: dict[str, int] = {}
 
     def create(
-        self, stream_id: str, creator_identity: str, default_ttl: int | None
+        self,
+        stream_id: str,
+        creator_identity: str,
+        default_ttl: int | None,
+        *,
+        origin_peer: str | None = None,
+        origin_stream_id: str | None = None,
     ) -> StreamRecord | None:
         """新規 stream を作成する。既存なら None を返す（呼び出し側で 409 にする）。
 
         作成者は bootstrap として write 権限を持つ member として自動登録される
         （wire-api.md §3.1）。
+
+        `origin_peer` / `origin_stream_id` は `relay.federation_inbound` が replica
+        stream を自動生成する際にのみ渡す（生成元 peer の handle と、生成元での
+        owner-relative stream_id）。省略時（local が owner の通常 stream）は両方 None。
 
         Raises:
             ResourceLimitExceeded: registry 総数または作成者 identity の登録数が上限に
@@ -189,6 +205,8 @@ class StreamRegistry:
                 created_at=_now_iso(),
                 default_ttl=default_ttl,
                 creator_identity=creator_identity,
+                origin_peer=origin_peer,
+                origin_stream_id=origin_stream_id,
             )
             record.members[creator_identity] = "write"
             self._streams[stream_id] = record
@@ -313,6 +331,23 @@ class StreamRegistry:
             if record is None:
                 return False
             return record.members.get(identity) in ("read", "read_write")
+
+    def has_peer_write_member(self, stream_id: str, handle: str) -> bool:
+        """`stream_id` に `@{handle}` suffix を持つ write 権限 member が存在するかを返す。
+
+        federation 受信（`relay.federation_inbound`）が「owner stream への返信」を受け入れる際、
+        送信元 peer の namespace（`*@{handle}`、sub 部分は問わない）が write 権限を持つ member
+        として当該 stream に居ることを確認するのに使う（居なければ 404）。
+        """
+        suffix = f"@{handle}"
+        with self._lock:
+            record = self._streams.get(stream_id)
+            if record is None:
+                return False
+            return any(
+                identity.endswith(suffix) and access in ("write", "read_write")
+                for identity, access in record.members.items()
+            )
 
     def is_member(self, stream_id: str, identity: str) -> bool:
         """`identity` が当該 stream の member かを access 種別を問わず返す。
@@ -695,6 +730,49 @@ async def post_stream_message(request: Request) -> Response:
 # ---------------------------------------------------------------------------
 
 
+def _validate_peer_member_identity(
+    db_path: str, registry: "StreamRegistry", stream_id: str, target_identity: str
+) -> Response | None:
+    """`@` を含む member identity（peer namespace）に federation 命名規約の検証を課す。
+
+    v1 で 2 検証（federation v1 設計確定版「命名規約」節）:
+    (1) suffix（最後の `@` より後）が active な（未 revoke の）peer handle であること。
+    (2) 1 stream に同居できる peer namespace は 1 つまで（複数 peer 同居は構造禁止、
+        group 会話は v2 送り）。
+
+    `target_identity` に `@` が含まれない場合は検証対象外（None を返す）。既存 member 一覧は
+    `registry.list_members`（lock 保護下のスナップショット）経由で読み、`StreamRecord.members`
+    を lock 外から直接反復しない。
+    """
+    if "@" not in target_identity:
+        return None
+    sub_part, _, handle_part = target_identity.rpartition("@")
+    if not sub_part or not handle_part:
+        return error_response(
+            400, INVALID_REQUEST, f"identity '{target_identity}' の '@' 形式が不正です"
+        )
+    peer = federation_peers.get_peer_by_handle(db_path, handle_part)
+    if peer is None or peer["revoked_at"] is not None:
+        return error_response(
+            400,
+            INVALID_REQUEST,
+            f"'{handle_part}' は有効な（active な）peer handle ではありません",
+        )
+    for member in registry.list_members(stream_id) or []:
+        member_identity = member["identity"]
+        if member_identity == target_identity or "@" not in member_identity:
+            continue
+        _, _, existing_handle = member_identity.rpartition("@")
+        if existing_handle != handle_part:
+            return error_response(
+                400,
+                INVALID_REQUEST,
+                "1 つの stream に同居できる peer namespace は 1 つまでです"
+                f"（既に '{existing_handle}' の member が存在します）",
+            )
+    return None
+
+
 @require_authn
 async def put_member(request: Request) -> Response:
     identity: Identity = request.state.identity
@@ -723,6 +801,11 @@ async def put_member(request: Request) -> Response:
         return error_response(
             400, INVALID_REQUEST, "access は read / write / read_write のいずれかです"
         )
+
+    settings: Settings = request.app.state.settings
+    err = _validate_peer_member_identity(settings.db_path, registry, stream_id, target_identity)
+    if err is not None:
+        return err
 
     result = registry.put_member_checked(stream_id, target_identity, access)
     if result == "not_found":
