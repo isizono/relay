@@ -55,7 +55,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route
 
-from relay import db, observability, streams, subscriptions
+from relay import db, federation_egress, observability, streams, subscriptions
 from relay.config import Settings
 from relay.errors import SUBSCRIPTION_GONE, SUBSCRIPTION_NOT_FOUND, error_response
 from relay.identity import require_authn
@@ -680,6 +680,9 @@ async def dispatch_once(app) -> None:
         _sweep_retain_exceeded(db_conn, app_state=app.state)
         _sweep_permanent_errors(db_conn, sub_registry, app_state=app.state)
         _sweep_stream_permanent_errors(db_conn, stream_registry, app_state=app.state)
+        await federation_egress.dispatch_federation_egress(
+            app.state, db_conn, settings, stream_registry
+        )
         _sweep_dlq_physical_delete(db_conn, settings)
         _sweep_idle_streams(db_conn, stream_registry, settings, app_state=app.state)
         db_conn.commit()

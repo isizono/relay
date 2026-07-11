@@ -81,6 +81,15 @@ def build_client(*, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> httpx.Client:
     return httpx.Client(follow_redirects=False, timeout=timeout)
 
 
+def build_async_client(*, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> httpx.AsyncClient:
+    """outbound dial 用の `httpx.AsyncClient` を構築する（redirect 無効固定）。
+
+    egress（`relay.federation_egress`）は asyncio dispatcher ループ上で動くため、
+    `build_client`（同期・CLI 用）と異なりノンブロッキングな `AsyncClient` を使う。
+    """
+    return httpx.AsyncClient(follow_redirects=False, timeout=timeout)
+
+
 def read_body_capped(
     response: httpx.Response, *, max_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
 ) -> bytes:
