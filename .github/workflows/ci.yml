@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+            **/pyproject.toml
+
+      - name: Install Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      # pyproject.toml を更新して uv.lock を再生成し忘れた PR を落とす。
+      - name: Verify uv.lock is in sync with pyproject.toml
+        run: uv lock --locked
+
+      # build-system 未定義の現状に耐えるため --no-install-project。
+      # pythonpath="." が設定済みなので relay/ relay_sdk/ は source から import 可能。
+      - name: Install dependencies
+        run: uv sync --frozen --no-install-project --python ${{ matrix.python-version }}
+
+      # 依存 install 後、両パッケージが実際に import できることを確認する。
+      # 片方の import 副作用がもう片方を壊す事故と、pytest 起動前の環境不整合を早期検出する。
+      - name: Import smoke test
+        run: |
+          uv run --no-sync python -c "import relay; print('relay OK')"
+          uv run --no-sync python -c "import relay_sdk; print('relay_sdk OK')"
+
+      - name: Run pytest
+        run: uv run --no-sync pytest -v --tb=short
+
+  # ------------------------------------------------------------------
+  # パッケージング検証ジョブ。
+  # pyproject.toml に [build-system] が現れた瞬間から自動で有効になる。
+  # 現状は build-system が未整備なので probe で notice を出して skip する
+  # (赤くはしない)。整備完了と同時にビルド + 空 venv install が回り始める。
+  # ------------------------------------------------------------------
+  package:
+    name: package (build & install verify)
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe packaging state
+        id: probe
+        shell: bash
+        run: |
+          if grep -qE '^\[build-system\]' pyproject.toml; then
+            echo "build_system=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::pyproject.toml has no [build-system] table; skipping build/install verification. Add [build-system] to enable this job."
+            echo "build_system=0" >> "$GITHUB_OUTPUT"
+          fi
+          if grep -qE '^\[tool\.uv\.workspace\]' pyproject.toml; then
+            echo "layout=workspace" >> "$GITHUB_OUTPUT"
+          else
+            echo "layout=single" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install uv
+        if: steps.probe.outputs.build_system == '1'
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+            **/pyproject.toml
+
+      - name: Install Python 3.11
+        if: steps.probe.outputs.build_system == '1'
+        run: uv python install 3.11
+
+      - name: Build distributions
+        if: steps.probe.outputs.build_system == '1'
+        run: |
+          rm -rf dist
+          if [ "${{ steps.probe.outputs.layout }}" = "workspace" ]; then
+            uv build --all-packages --out-dir dist
+          else
+            uv build --out-dir dist
+          fi
+          ls -la dist/
+
+      # 空 venv に wheel だけ入れて import が通ることを確認する。
+      # 1 パッケージ構成で relay_sdk が wheel に同梱漏れ、workspace 構成で
+      # relay_sdk の wheel がビルドされ忘れ、といったパッケージング事故を
+      # レイアウト非依存に検出する。
+      - name: Verify wheels install cleanly in a fresh venv
+        if: steps.probe.outputs.build_system == '1'
+        run: |
+          python -m venv /tmp/verify-env
+          /tmp/verify-env/bin/pip install --upgrade pip
+          /tmp/verify-env/bin/pip install dist/*.whl
+          /tmp/verify-env/bin/python -c "import relay; print('relay OK ->', relay.__file__)"
+          /tmp/verify-env/bin/python -c "import relay_sdk; print('relay_sdk OK ->', relay_sdk.__file__)"
+
+      - name: Upload distributions
+        if: steps.probe.outputs.build_system == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
