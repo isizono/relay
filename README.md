@@ -64,7 +64,7 @@ relay v2 サーバー側（HTTP wire API）の実装完了後も、以下の 2 �
    HTTP API（`/send` `/stream` `/create` `/history` `/presence`）に対する薄いクライアントで、
    relay v2 の wire API（Bearer token authN、`/streams` `/subscriptions` `/publish`
    `/events`）を話せなかった。relay v2 向けの MCP ツール（`relay_post` / `relay_publish` /
-   `relay_subscribe` / `relay_receive`）は別リポジトリ（isizono/cc-memory）側に実装済みのため、
+   `relay_subscribe` / `relay_receive`）は別リポジトリ（cc-memory）側に実装済みのため、
    旧クライアント一式は不要になった。
 2. **`GetHistory` / `GetPresence` に相当する機能は relay v2 に存在しない**。これは実装漏れではなく
    意図的な仕様変更である。

@@ -1,21 +1,21 @@
 # relay v2 ワイヤ / API 仕様
 
 > **位置づけ**: relay v2 を「実装者が semantics の食い違いなく 1 つの relay を書ける」粒度まで落とした
-> インターフェース仕様。上位要件は機能要件 v2（cc-memory M#507）+ R1 改訂（論点#3 決着、
-> D#3081-3083）。本書は **R1 を本文に優先**して書かれている。
+> インターフェース仕様。上位要件は機能要件 v2 + R1 改訂（論点#3 決着）。
+> 本書は **R1 を本文に優先**して書かれている。
 >
 > **スコープ**: HTTP ワイヤプロトコル（endpoint / payload / status code / seq / 配達セマンティクス）。
 > 以下は本書のスコープ外:
 > - **identity / authZ**（AgentCard・JWS・scope・認証ミドルウェア）→ `relay-v2-identity-authz.md`（A2A 1.0 準拠で重いため独立）
-> - **永続層の物理 schema**（table 定義・engine）→ substrate engine 確定（A#1193）待ち。本書は論理モデルまで
+> - **永続層の物理 schema**（table 定義・engine）→ substrate engine 確定待ち。本書は論理モデルまで
 > - **Python SDK の API**（`relay_outbox` / `relay-client`）→ `relay-v2-sdk.md`
-> - **cc-memory 連携プロトコル** → cc-memory 側にのみ存在（協調プロトコル v1 / M#522）
+> - **cc-memory 連携プロトコル** → cc-memory 側にのみ存在
 
 ---
 
 ## 0. R1 前提（本書が立脚する確定事項）
 
-論点#3 決着（2026-06-27, D#3081-3083）により、要件 v2 本文から以下が変わっている。本書はこの
+論点#3 決着（2026-06-27）により、要件 v2 本文から以下が変わっている。本書はこの
 改訂後の姿で書かれている。
 
 | 項目 | R1 での扱い |
@@ -391,7 +391,7 @@ Body: { up_to_publish_id: <int> }
 
 ## 6. 配達基盤（outbox）
 
-> 物理 schema（table 定義 / engine）は substrate 確定（A#1193）待ち。本節は論理的振る舞いを規定する。
+> 物理 schema（table 定義 / engine）は substrate 確定待ち。本節は論理的振る舞いを規定する。
 > R1: relay が disk で守るのは **outbox のみ**。
 
 ### 6.1 transactional outbox
@@ -612,7 +612,7 @@ publisher → POST /publish { ref, labels, title?, idempotency_key? }
 
 - **マッチング性能**: subset 判定を 10,000 subscriptions × 100 labels で p99 200ms に収める（inverted index 等）。
 - **場メンバーの SSE 受信開始**: `GET /events` に member の場を自動含めるか、明示 `stream_ids=` も受けるか（本書は「認証 identity の member 場を自動含む」前提。明示指定オプションは実装段階で要否判断）。
-- **物理 schema / engine**: outbox table 定義・SQLite vs LMDB（A#1193 確定待ち）。
+- **物理 schema / engine**: outbox table 定義・SQLite vs LMDB（確定待ち）。
 
 ---
 
@@ -653,9 +653,6 @@ Request:
 
 ## 12. 関連
 
-- 機能要件 v2: cc-memory M#507（+ R1 改訂）
-- 論点#3 決着メモ: `docs/design/topic474-論点3-場history-substrate-決着.md`（別 PR）
-- identity / authZ 仕様: `relay-v2-identity-authz.md`（A#1201）
-- シーケンス図集: `relay-v2-sequences.md`（A#1199）
-- Python SDK 仕様: `relay-v2-sdk.md`（A#1203）
-- substrate engine 確定: A#1193（relay 本体実装のゲート）
+- identity / authZ 仕様: `relay-v2-identity-authz.md`
+- シーケンス図集: `relay-v2-sequences.md`
+- Python SDK 仕様: `relay-v2-sdk.md`

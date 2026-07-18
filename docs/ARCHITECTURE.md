@@ -49,38 +49,35 @@ tests/
 （cc-memory MCP handler）の責務であり、relay 側には実装しない
 （`relay-v2-identity-authz.md` §2.5）。
 
-## DB schema — decision 3133 との差分
+## DB schema — 初期設計との差分
 
-DB 物理 schema は cc-memory decision「relay v2 DB schema 物理構造を確定」（id 3133,
-2026-06-30）で一度確定しているが、その後 2026-06-27 の R1 決着
-（`relay-v2-wire-api.md` §0 の前提表、根拠 decision「場 history 完全廃止 / relay
-デバッグ用サーバーログ...」id 3082）および 2026-07-03 の凍結整合パッチ（wire-api.md /
-identity-authz.md の最新版）で、decision 3133 の一部と矛盾する確定事項が生じていた。
+DB 物理 schema は一度確定しているが、その後の R1 決着
+（`relay-v2-wire-api.md` §0 の前提表、根拠は「場 history 完全廃止 / relay
+デバッグ用サーバーログ...」という決定）および凍結整合パッチ（wire-api.md /
+identity-authz.md の最新版）で、初期設計の一部と矛盾する確定事項が生じていた。
 本実装は「一次情報源は `docs/design/` の最新版」というタスク方針に従い、以下の点で
-decision 3133 の記述から逸脱している。矛盾を残したまま実装すると後続の担当が古い方の
+初期設計の記述から逸脱している。矛盾を残したまま実装すると後続の担当が古い方の
 記述を正としてしまう恐れがあるため、判断根拠を明記する。
 
 ### 1. streams / memberships / subscriptions は SQLite に table を作らない
 
-decision 3133 は 7+1 table 構成（`streams` / `memberships` / `subscriptions` を含む）を
+初期設計は 7+1 table 構成（`streams` / `memberships` / `subscriptions` を含む）を
 定義しているが、`relay-v2-wire-api.md` §0 の前提表は次のように明記している。
 
 > substrate は disk（SQLite）で守るのは outbox のみ。presence / subscription registry /
 > lease / stream membership は in-memory（liveness クラス）。relay 再起動は
 > re-subscribe + heartbeat で自己修復
 
-この R1 原則の根拠は decision 3082（2026-06-27、decision 3133 より前）で、「relay の
-永続性は outbox 1本に畳む」ことを明示的に決定している。`relay-v2-identity-authz.md` §4
-（relay 再起動と identity）も「relay 再起動で subscription registry は消失する」
-「subscriber は新たに `POST /subscriptions` を呼ぶ」ことを前提に、`404`/`410` の
-使い分けなど wire レベルの挙動まで確定させている。
+この R1 原則は「relay の永続性は outbox 1本に畳む」ことを明示的に定めたものである。
+`relay-v2-identity-authz.md` §4（relay 再起動と identity）も「relay 再起動で
+subscription registry は消失する」「subscriber は新たに `POST /subscriptions` を呼ぶ」
+ことを前提に、`404`/`410` の使い分けなど wire レベルの挙動まで確定させている。
 
-decision 3133 が streams / memberships / subscriptions を SQLite table として記述したのは
-R1 原則確定後の詳細設計セッション（`log: 詳細設計補強 軸 1 (DB schema) 議論クローズ`,
-id 3168）だが、そのログにも in-memory 化との整合を再検討した形跡はなく、R1 原則との
-矛盾が解消されないまま残っていたと判断した。`relay-v2-wire-api.md` /
-`relay-v2-identity-authz.md` は 2026-07-03 の凍結整合パッチで更新された最新版であり、
-本タスクの指示でも「必ず読むべき一次情報源」と明記されているため、本実装では
+初期設計が streams / memberships / subscriptions を SQLite table として記述したのは
+R1 原則確定後の詳細設計セッションだが、そのログにも in-memory 化との整合を再検討した
+形跡はなく、R1 原則との矛盾が解消されないまま残っていたと判断した。`relay-v2-wire-api.md`
+/ `relay-v2-identity-authz.md` は凍結整合パッチで更新された最新版であり、本タスクの
+指示でも「必ず読むべき一次情報源」と明記されているため、本実装では
 **disk 永続化するのは outbox / dlq / publish_log / agent_cards の 4 table のみ**とし、
 streams / memberships / subscriptions は in-memory 実装とする。
 
@@ -91,8 +88,8 @@ disk 永続化 DB（outbox 等）とは別の接続にすること（同一 SQLi
 
 ### 2. outbox は subscription レーン / stream レーンの両方の delivery target を扱う
 
-decision 3133 は outbox の PK を `(subscription_id, publish_id)` のみで定義しているが、
-これは 2026-07-03 の凍結整合パッチで新設された stream 用 ack endpoint
+初期設計は outbox の PK を `(subscription_id, publish_id)` のみで定義していたが、
+これは凍結整合パッチで新設された stream 用 ack endpoint
 （`POST /streams/{stream_id}/ack`）に対応していない。`relay-v2-wire-api.md` §5.6 /
 §5.7 は次のように規定する。
 
@@ -109,18 +106,18 @@ decision 3133 は outbox の PK を `(subscription_id, publish_id)` のみで定
 
 の 2 本の部分インデックスで一意性を分離した（`migrations/0001-initial-schema.sql`）。
 
-### 3. `streams.default_ttl` は仕様上必要（decision 3133 には無いカラム）
+### 3. `streams.default_ttl` は仕様上必要（初期設計には無いカラム）
 
 `relay-v2-wire-api.md` §3.1 は `POST /streams` の body に `default_ttl?` を持ち、
-§6.4 は「場 outbox の retain default = 場の `default_ttl`」と規定している。decision
-3133 の streams カラムリストにはこのカラムが無い。streams 自体を in-memory にした
+§6.4 は「場 outbox の retain default = 場の `default_ttl`」と規定している。初期設計の
+streams カラムリストにはこのカラムが無い。streams 自体を in-memory にした
 （§1 の変更）ため SQLite schema には影響しないが、後続の stream API 実装で
 in-memory streams レコードに `default_ttl` を持たせること。
 
 ### 4. カラム名 `agent_did` / `publisher_did` → `identity` 系に変更
 
-decision 3133 は `memberships.agent_did` / `publish_log.publisher_did` という
-カラム名を使っているが、`relay-v2-identity-authz.md` §1.4 は DID を明示的にスコープ外
+初期設計は `memberships.agent_did` / `publish_log.publisher_did` という
+カラム名を使っていたが、`relay-v2-identity-authz.md` §1.4 は DID を明示的にスコープ外
 としている（「relay v2 は DID を扱わない」）。`did` を含むカラム名は DID 概念の使用を
 暗示してしまうため、`relay-glossary.md` の語彙（identity）に合わせて
 `publish_log.publisher_identity` のように改名した。stream membership 自体は
@@ -129,7 +126,7 @@ in-memory になったため `memberships.agent_did` 相当のカラムは無く
 
 ### 5. `subscriptions.stream_ids` カラムは採用しない
 
-decision 3133 の `subscriptions` テーブルには `stream_ids JSON` カラムがあるが、
+初期設計の `subscriptions` テーブルには `stream_ids JSON` カラムがあるが、
 `relay-v2-wire-api.md` の `POST /subscriptions` body（§5.1）にはこのフィールドが無く、
 `relay-glossary.md` の membership / subscription エントリも「stream の membership と
 subscription は独立（stream のメンバーは自動 subscribe されない。逆も同様）」と
@@ -705,7 +702,7 @@ label には `subscription_id` / `delivery_target` を使わない（wire-api.md
 
 ## Verify タスク: outbox 障害時に `503` を返す共通 exception handler を追加
 
-T6 退化モード検証（material id 550 T6 Acceptance「outbox 障害 (disk full / DB corrupt 擬似)
+T6 退化モード検証（受け入れ基準「outbox 障害 (disk full / DB corrupt 擬似)
 で `POST /publish` が `503`」）を実機で検証したところ、DB ファイルの権限を落として
 SQLite の read/write を失敗させると、各 endpoint 実装（`streams.py` / `subscriptions.py`）
 は `sqlite3.Error` を未処理のまま送出し、Starlette デフォルトの `500 Internal Server Error`
