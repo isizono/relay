@@ -5,6 +5,18 @@ publisher 側は `relay_sdk.outbox`、subscriber 側は `relay_sdk.client`、pro
 """
 from __future__ import annotations
 
-from relay_sdk.errors import PermanentError, RelayProtocolError, TransientError
+from relay_sdk.errors import (
+    PermanentError,
+    RelayProtocolError,
+    StreamAlreadyExistsError,
+    StreamNotFoundError,
+    TransientError,
+)
 
-__all__ = ["RelayProtocolError", "TransientError", "PermanentError"]
+__all__ = [
+    "RelayProtocolError",
+    "TransientError",
+    "PermanentError",
+    "StreamNotFoundError",
+    "StreamAlreadyExistsError",
+]
