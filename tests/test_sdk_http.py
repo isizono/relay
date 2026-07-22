@@ -7,13 +7,22 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from relay_sdk.errors import PermanentError, RelayProtocolError, TransientError
+from relay_sdk.errors import (
+    PermanentError,
+    RelayProtocolError,
+    StreamAlreadyExistsError,
+    StreamNotFoundError,
+    TransientError,
+)
 from relay_sdk.http import (
     delete_subscription,
     post_ack,
     post_publish,
+    post_stream,
+    post_stream_message,
     post_subscription,
     put_lease,
+    put_stream_member,
     raise_for_relay_status,
 )
 from relay_sdk.http.request import _request
@@ -83,6 +92,104 @@ class TestRequestBodies:
         assert ("PUT", "/subscriptions/s1/lease") in seen
         assert ("POST", "/subscriptions/s1/ack") in seen
         assert ("DELETE", "/subscriptions/s1") in seen
+
+    def test_post_stream_body_shape(self):
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            import json as _json
+
+            captured["body"] = _json.loads(request.content)
+            return httpx.Response(201, json={"stream_id": "me:room", "created_at": "t"})
+
+        with _client(handler) as c:
+            result = post_stream(c, name="room", default_ttl=3600)
+        assert captured["url"].endswith("/streams")
+        assert captured["body"] == {"name": "room", "default_ttl": 3600}
+        assert result == {"stream_id": "me:room", "created_at": "t"}
+
+    def test_post_stream_without_default_ttl_omits_field(self):
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            import json as _json
+
+            captured["body"] = _json.loads(request.content)
+            return httpx.Response(201, json={"stream_id": "me:room", "created_at": "t"})
+
+        with _client(handler) as c:
+            post_stream(c, name="room")
+        assert captured["body"] == {"name": "room"}
+
+    def test_post_stream_409_raises_stream_already_exists(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                409, json={"code": "StreamAlreadyExistsError", "message": "x"}
+            )
+
+        with _client(handler) as c:
+            with pytest.raises(StreamAlreadyExistsError) as exc:
+                post_stream(c, name="room")
+        assert exc.value.status_code == 409
+        assert isinstance(exc.value, RelayProtocolError)
+
+    def test_post_stream_message_body_shape_with_ttl(self):
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            import json as _json
+
+            captured["body"] = _json.loads(request.content)
+            return httpx.Response(202, json={"publish_id": 7, "matched_members": 2})
+
+        with _client(handler) as c:
+            result = post_stream_message(c, stream_id="me:room", body="hello", ttl=600)
+        assert captured["url"].endswith("/streams/me:room/messages")
+        assert captured["body"] == {"body": "hello", "ttl": 600}
+        assert result == {"publish_id": 7, "matched_members": 2}
+
+    def test_post_stream_message_body_shape_without_ttl(self):
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            import json as _json
+
+            captured["body"] = _json.loads(request.content)
+            return httpx.Response(202, json={"publish_id": 1, "matched_members": 0})
+
+        with _client(handler) as c:
+            post_stream_message(c, stream_id="me:room", body="hi")
+        assert captured["body"] == {"body": "hi"}
+
+    def test_post_stream_message_404_raises_stream_not_found(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"code": "StreamNotFoundError", "message": "x"})
+
+        with _client(handler) as c:
+            with pytest.raises(StreamNotFoundError) as exc:
+                post_stream_message(c, stream_id="me:room", body="hi")
+        assert exc.value.status_code == 404
+        assert isinstance(exc.value, RelayProtocolError)
+
+    def test_put_stream_member_body_shape(self):
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            import json as _json
+
+            captured["body"] = _json.loads(request.content)
+            return httpx.Response(200, json={})
+
+        with _client(handler) as c:
+            result = put_stream_member(
+                c, stream_id="me:room", identity="you", access="read_write"
+            )
+        assert captured["url"].endswith("/streams/me:room/members")
+        assert captured["body"] == {"identity": "you", "access": "read_write"}
+        assert result == {}
 
 
 class TestErrorClassification:

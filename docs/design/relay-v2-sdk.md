@@ -52,9 +52,10 @@ relay_sdk/                     # 配布パッケージ名（暫定）
 │   └── reconcile.py           # retain 切れ時の publisher 直接 pull
 ├── http/                      # protocol 層
 │   ├── __init__.py
-│   ├── request.py             # POST /publish, /subscriptions, /ack の組み立て
+│   ├── request.py             # POST /publish, /subscriptions, /ack, streams 系の組み立て
 │   └── auth.py                # AgentCard + JWS 署名 / 検証
 └── errors.py                  # PermanentError / TransientError / RelayProtocolError
+                                # / StreamNotFoundError / StreamAlreadyExistsError
 ```
 
 publisher だけ使うアプリは `from relay_sdk.outbox import publish, run_dispatcher` を、subscriber だけ使うアプリは `from relay_sdk.client import subscribe` を呼べばよい。protocol 層は両者共通で内部から利用される。
@@ -461,6 +462,9 @@ reconciliation の本筋ロジック（labels → 内部 tool 呼び出しの翻
 | `delete_subscription(client, *, subscription_id)` | `Subscription.close()` | `DELETE /subscriptions/{id}` |
 | `post_ack(client, *, subscription_id, up_to_publish_id)` | `Subscription.ack()` | `POST /subscriptions/{id}/ack` |
 | `open_sse(client, *, subscription_ids)` | `Subscription.receive()` | `GET /events?subscription_ids=...` を SSE で開く |
+| `post_stream(client, *, name, default_ttl)` | stream 作成側 | `POST /streams` |
+| `post_stream_message(client, *, stream_id, body, ttl)` | stream 投函側 | `POST /streams/{stream_id}/messages` |
+| `put_stream_member(client, *, stream_id, identity, access)` | stream membership 管理側 | `PUT /streams/{stream_id}/members` |
 
 `client` は `httpx.Client`（同期） / `httpx.AsyncClient`（非同期）どちらか。SDK の v1 は同期 API のみ提供する。AsyncClient 対応は後段でアプリ需要が出てから追加する。
 
@@ -492,6 +496,16 @@ class TransientError(Exception):
 
 class PermanentError(Exception):
     """subscription が失効・不明になった状態（subscription 操作への 404 / 410）。caller 側で再 subscribe が必要。"""
+```
+
+streams 系 endpoint の 404 / 409 は `RelayProtocolError` のサブクラスとして分類する（既存 3 分類は変えず、streams を扱う呼び出し側だけ狭く捕捉できるようにする）。
+
+```python
+class StreamNotFoundError(RelayProtocolError):
+    """stream が未作成（`POST /streams/{id}/messages` への 404）。caller は `post_stream` で作成してから再試行できる。"""
+
+class StreamAlreadyExistsError(RelayProtocolError):
+    """同名 stream が既に存在する（`POST /streams` への 409）。caller は作成済みとして扱ってよい。"""
 ```
 
 dispatcher 側のリトライ判定:

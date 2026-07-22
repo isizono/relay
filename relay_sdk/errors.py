@@ -10,6 +10,11 @@ subscriber）の復帰戦略がこの分類で決まる。
 - ``PermanentError``: subscription が失効・不明になった（subscription 操作への 404 / 410）。
   caller 側で再 subscribe が必要。dispatcher 側では発生しない（publish は subscription_id を
   持たないため）。subscriber 側で受領したら新規 subscribe に切り替える。
+
+``StreamNotFoundError`` / ``StreamAlreadyExistsError`` は streams 系 endpoint 固有の
+404 / 409 を表す ``RelayProtocolError`` のサブクラス。既存 3 分類の互換性（広く
+``except RelayProtocolError`` で捕捉できること）を保ちつつ、streams を扱う呼び出し側
+だけが狭く捕捉できるようにする。
 """
 from __future__ import annotations
 
@@ -55,3 +60,17 @@ class PermanentError(Exception):
     def __init__(self, message: str, *, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+class StreamNotFoundError(RelayProtocolError):
+    """stream が未作成（`POST /streams/{id}/messages` への 404）。
+
+    caller は `post_stream` で作成してから再試行できる。
+    """
+
+
+class StreamAlreadyExistsError(RelayProtocolError):
+    """同名 stream が既に存在する（`POST /streams` への 409）。
+
+    caller は作成済みとして扱ってよい（同時作成競合の正常系）。
+    """

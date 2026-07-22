@@ -14,8 +14,11 @@ from relay_sdk.http.request import (
     open_sse,
     post_ack,
     post_publish,
+    post_stream,
+    post_stream_message,
     post_subscription,
     put_lease,
+    put_stream_member,
     raise_for_relay_status,
     raise_for_sse_status,
 )
@@ -31,8 +34,11 @@ __all__ = [
     "open_sse",
     "post_ack",
     "post_publish",
+    "post_stream",
+    "post_stream_message",
     "post_subscription",
     "put_lease",
+    "put_stream_member",
     "raise_for_relay_status",
     "raise_for_sse_status",
 ]

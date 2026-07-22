@@ -12,6 +12,9 @@ status code を §4.4 の 3 例外へ翻訳する。
 | `delete_subscription` | `DELETE /subscriptions/{id}`           | Subscription.close() |
 | `post_ack`            | `POST /subscriptions/{id}/ack`         | Subscription.ack() |
 | `open_sse`            | `GET /events?subscription_ids=...`     | Subscription.receive() |
+| `post_stream`         | `POST /streams`                        | stream 作成側 |
+| `post_stream_message` | `POST /streams/{stream_id}/messages`   | stream 投函側 |
+| `put_stream_member`   | `PUT /streams/{stream_id}/members`     | stream membership 管理側 |
 """
 from __future__ import annotations
 
@@ -19,7 +22,13 @@ from typing import Any, Sequence
 
 import httpx
 
-from relay_sdk.errors import PermanentError, RelayProtocolError, TransientError
+from relay_sdk.errors import (
+    PermanentError,
+    RelayProtocolError,
+    StreamAlreadyExistsError,
+    StreamNotFoundError,
+    TransientError,
+)
 
 
 def _error_code(response: httpx.Response) -> tuple[str | None, str]:
@@ -194,3 +203,54 @@ def raise_for_sse_status(response: httpx.Response) -> None:
     if response.status_code >= 400:
         response.read()
     raise_for_relay_status(response, subscription_scoped=True)
+
+
+# ---------------------------------------------------------------------------
+# streams（membership ベースの場）用の request 関数
+# ---------------------------------------------------------------------------
+
+
+def post_stream(
+    client: httpx.Client, *, name: str, default_ttl: int | None = None
+) -> dict[str, Any]:
+    """`POST /streams`（stream 作成）。既に同名 stream があれば `StreamAlreadyExistsError`。"""
+    body: dict[str, Any] = {"name": name}
+    if default_ttl is not None:
+        body["default_ttl"] = default_ttl
+    response = _request(client, "POST", "/streams", json=body)
+    if response.status_code == 409:
+        raise StreamAlreadyExistsError(f"stream already exists: {name}", status_code=409)
+    raise_for_relay_status(response)
+    return response.json()
+
+
+def post_stream_message(
+    client: httpx.Client, *, stream_id: str, body: Any, ttl: int | None = None
+) -> dict[str, Any]:
+    """`POST /streams/{stream_id}/messages`（stream への投函）。
+
+    stream が未作成の場合は `StreamNotFoundError`（caller は `post_stream` で
+    作成してから再試行する）。
+    """
+    payload: dict[str, Any] = {"body": body}
+    if ttl is not None:
+        payload["ttl"] = ttl
+    response = _request(client, "POST", f"/streams/{stream_id}/messages", json=payload)
+    if response.status_code == 404:
+        raise StreamNotFoundError(f"stream not found: {stream_id}", status_code=404)
+    raise_for_relay_status(response)
+    return response.json()
+
+
+def put_stream_member(
+    client: httpx.Client, *, stream_id: str, identity: str, access: str
+) -> dict[str, Any]:
+    """`PUT /streams/{stream_id}/members`（member の access 権限設定）。"""
+    response = _request(
+        client,
+        "PUT",
+        f"/streams/{stream_id}/members",
+        json={"identity": identity, "access": access},
+    )
+    raise_for_relay_status(response)
+    return response.json()
