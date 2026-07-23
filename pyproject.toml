@@ -3,9 +3,6 @@ name = "relay"
 version = "0.1.0"
 description = "Claude Code間のメッセージング中継システム（履歴を持つ軽量サービス・窓口モデル）"
 requires-python = ">=3.11"
-# relay v2 (relay/ パッケージ) は authlib + Starlette + sse-starlette + rfc8785(JCS) を用いる。
-# 旧 server.py（SSH forced command 認証ベース）は標準ライブラリのみで依存ゼロだったが、
-# v2 移行に伴いこの制約は relay v2 には適用しない。
 # httpx は relay_sdk（クライアント側 SDK）が import 時に必須とする runtime dependency
 # （publisher/subscriber の HTTP・SSE 通信の実体）であり、dev-only ではない。
 dependencies = [
