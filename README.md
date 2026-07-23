@@ -1,28 +1,65 @@
 # relay
 
-別々の人間が使う Claude Code 同士に「認識合わせ」を代行させるための、履歴を持つ軽量メッセージング中継サービス。
+別々の人間が使う Claude Code 同士に「認識合わせ」を代行させるための、履歴を持つ軽量メッセージング中継サービス。A2A (Agent2Agent) 準拠の HTTP サーバーと Python SDK からなる。
 
-> relay v2 への移行が完了し、SSH forced command 認証ベースの旧実装（クライアント側一式）は
-> 撤去済み。実運用の唯一の経路は `relay/` パッケージ配下の relay v2（A2A(Agent2Agent) 準拠、
-> Bearer token 認証の Starlette 製 HTTP サーバー）である。撤去の経緯は
-> [旧実装の撤去経緯](#旧実装の撤去経緯) を参照。
-> 仕様は `docs/design/` 配下（`relay-concept.md` / `relay-glossary.md` /
-> `relay-v2-wire-api.md` / `relay-v2-identity-authz.md` / `relay-v2-sdk.md` /
-> `relay-sequences.md`）、実装のモジュール構成・設計判断は `docs/ARCHITECTURE.md` を参照。
+> relay is a lightweight, history-keeping message relay that lets Claude Code agents used by different people stay aligned with each other — an A2A-compliant HTTP server plus a Python SDK.
 
-## relay v2（新実装）
+- **場 (stream) モデル** — 作成者の identity でスコープ化された「場」に member を招待し、メッセージを投函する。配達は member への push（SSE）+ cumulative ack
+- **labels 購読** — subscription を作って labels にマッチする publish を受け取る、pub/sub レーン
+- **at-least-once 配達** — 永続化するのは outbox のみ。retry / DLQ / 冪等 key を備え、relay 再起動は re-subscribe で自己修復する
+- **A2A 準拠** — Bearer token 認証、AgentCard 公開（ES256 署名は任意）、招待ベースの federation peer 登録
 
-`relay/` パッケージが Starlette 製の HTTP サーバーを実装する。認証は SSH ではなく
-`Authorization: Bearer <token>`（`RELAY_AUTH_TOKENS` 環境変数で token → identity の対応表を
-指定）。詳しい endpoint 仕様は `docs/design/relay-v2-wire-api.md`、identity / authZ は
-`docs/design/relay-v2-identity-authz.md` を参照。
+## クイックスタート
 
-### 起動
+Python 3.11+ と [uv](https://docs.astral.sh/uv/) が必要。
 
 ```bash
-export RELAY_AUTH_TOKENS='{"tok-abc": "agent-a"}'
+git clone https://github.com/isizono/relay.git && cd relay
+uv sync
+
+# token → identity の対応表を渡してサーバーを起動(migration は起動時に自動適用)
+export RELAY_AUTH_TOKENS='{"tok-a": "agent-a", "tok-b": "agent-b"}'
 uv run uvicorn relay.app:app --host 127.0.0.1 --port 8000
 ```
+
+別ターミナルで 2 つのエージェント役を演じてみる。
+
+```bash
+# agent-a が場を作る
+curl -sX POST http://127.0.0.1:8000/streams \
+  -H 'Authorization: Bearer tok-a' -H 'Content-Type: application/json' \
+  -d '{"name": "standup"}'
+
+# agent-b を member に加える（stream_id は上のレスポンスに含まれる値を使う）
+curl -sX PUT http://127.0.0.1:8000/streams/<stream_id>/members \
+  -H 'Authorization: Bearer tok-a' -H 'Content-Type: application/json' \
+  -d '{"identity": "agent-b", "access": "read_write"}'
+
+# agent-b が SSE で受信待ち（identity 単位の多重化接続）
+curl -N http://127.0.0.1:8000/events -H 'Authorization: Bearer tok-b'
+
+# agent-a が投函 → agent-b の SSE に届く（body は UTF-8 文字列。JSON を送りたい場合は文字列化してから渡す）
+curl -sX POST http://127.0.0.1:8000/streams/<stream_id>/messages \
+  -H 'Authorization: Bearer tok-a' -H 'Content-Type: application/json' \
+  -d '{"body": "hello from agent-a"}'
+```
+
+## 構成
+
+```
+relay/          # A2A 準拠 HTTP サーバー本体（Starlette）
+migrations/     # SQLite スキーマ（yoyo-migrations、サーバー起動時に自動適用）
+relay_sdk/      # Python SDK
+  client/       #   subscriber 側（subscribe / SSE 受信 / ack / 再同期）
+  http/         #   Bearer 認証付き HTTP / SSE の共通層
+  outbox/       #   publisher 側（ローカル outbox への publish + 配送 dispatcher）
+docs/
+  design/           # プロトコル・SDK の仕様書（一次情報源）
+  ARCHITECTURE.md   # 実装のモジュール構成と設計判断の記録
+tests/          # サーバー・SDK のテスト（integration/ に E2E roundtrip）
+```
+
+## 設定
 
 主な環境変数（すべて省略可、既定値は `relay/config.py` 参照）:
 
@@ -35,7 +72,7 @@ uv run uvicorn relay.app:app --host 127.0.0.1 --port 8000
 | `RELAY_BASE_URL` | 自 relay の公開 base URL（federation 招待 URL 生成・redeem 応答の locator に使う） |
 | `RELAY_FEDERATION_ALLOW_PRIVATE_LOCATORS` | 既定 `false`。`true` で federation の outbound dial 先に localhost / private IP を許可（同一ホスト検証・開発用） |
 
-### 実装状況
+## 機能とエンドポイント
 
 | 機能 | endpoint | 状態 |
 |---|---|---|
@@ -46,49 +83,38 @@ uv run uvicorn relay.app:app --host 127.0.0.1 --port 8000
 | 運用スナップショット | `GET /status` | 実装済み |
 | Prometheus 互換 metrics | `GET /metrics` | 実装済み |
 | AgentCard 公開 | `GET /.well-known/agent-card.json` | 実装済み |
-| Python SDK（クライアント側） | — | 未実装（`docs/design/relay-v2-sdk.md` は仕様のみ） |
-| federation peer レジストリ（招待ベース鍵ピン留め） | `POST /federation/peers/redeem`、`python -m relay.invite peer new/redeem/list/revoke` | 実装済み（relay 間メッセージ配達自体は未実装） |
+| Python SDK（クライアント側） | `relay_sdk/` パッケージ | 実装済み |
+| federation peer レジストリ（招待ベース鍵ピン留め） | `POST /federation/peers/redeem`、`python -m relay.invite peer new/redeem/list/revoke` | peer 登録まで実装済み（relay 間のメッセージ配達は未実装） |
 
-テストは旧 `server.py` 分と合わせて [開発](#開発) のコマンド 1 本で実行できる（`tests/` 配下に
-両方のテストファイルが同居している）。
+wire レベルの仕様は [docs/design/relay-v2-wire-api.md](docs/design/relay-v2-wire-api.md)、identity / 認可モデルは [docs/design/relay-v2-identity-authz.md](docs/design/relay-v2-identity-authz.md) を参照。
 
-## 旧実装の撤去経緯
+## Python SDK
 
-relay v2 サーバー側（HTTP wire API）の実装完了後も、以下の 2 点により旧実装
-（`server.py` に対する SSH forced command 認証ベースのクライアント一式:
-`bridge_connect.py` / `gen_authorized_keys.py` / `mcp_server.py` / `recv_monitor.sh`）を
-削除できていなかったが、理由 1 の解消を受けて撤去した。
+`relay_sdk` は publisher 側と subscriber 側で入口が分かれている。
 
-1. **クライアント側の実装が relay v2 に存在しなかった**。`mcp_server.py`（Claude Code 向け
-   MCP ツール）と `recv_monitor.sh`（`Monitor` 向け受信スクリプト）は、どちらも旧 `server.py` の
-   HTTP API（`/send` `/stream` `/create` `/history` `/presence`）に対する薄いクライアントで、
-   relay v2 の wire API（Bearer token authN、`/streams` `/subscriptions` `/publish`
-   `/events`）を話せなかった。relay v2 向けの MCP ツール（`relay_post` / `relay_publish` /
-   `relay_subscribe` / `relay_receive`）は別リポジトリ（cc-memory）側に実装済みのため、
-   旧クライアント一式は不要になった。
-2. **`GetHistory` / `GetPresence` に相当する機能は relay v2 に存在しない**。これは実装漏れではなく
-   意図的な仕様変更である。
-   - `GetHistory`（`bridge history` / `GET /history`）: `relay-v2-wire-api.md` の設計判断で
-     「場 history の永続蓄積」自体が廃止されており、取りこぼしは「未 ack outbox の再送」+
-     「retain 切れ時は publisher へ直接 pull」で回収する設計に変わっている。
-   - `GetPresence`（`bridge presence` / `GET /presence`）: `GET /streams/{id}/members` は
-     構造的な membership（読み書き権限の付与状態）を返すもので、「今 SSE 接続中かどうか」という
-     liveness 情報とは別概念。`GET /status` の `active_sse_connections` は総数のみで、
-     identity 別の一覧は持たない。relay v2 に liveness の個別一覧取得手段は用意されていない。
+- **publisher 側** (`relay_sdk.outbox`) — アプリはローカル SQLite の outbox に publish で書くだけ。配送は別プロセスの dispatcher（`python -m relay_sdk.outbox`）が担い、retry / backoff を吸収する
+- **subscriber 側** (`relay_sdk.client`) — subscribe で subscription を作り、SSE 受信・ack・再接続時の再同期を SDK が面倒を見る
 
-**フォローアップ**: 旧実装の本体である `server.py` は、上記クライアント一式の撤去に伴い
-呼び出し元を失い孤児化した状態にある（本撤去では削除していない）。`server.py` 自体の削除可否は
-別途判断が必要。
+API の詳細仕様は [docs/design/relay-v2-sdk.md](docs/design/relay-v2-sdk.md)、動く実例は `tests/integration/test_sdk_roundtrip.py` を参照。
+
+## ドキュメント
+
+- [docs/design/relay-concept.md](docs/design/relay-concept.md) — なぜ relay が必要か、というコンセプト
+- [docs/design/relay-glossary.md](docs/design/relay-glossary.md) — 用語集（場 / subscription / outbox など）
+- [docs/design/relay-v2-wire-api.md](docs/design/relay-v2-wire-api.md) — HTTP wire API 仕様
+- [docs/design/relay-v2-identity-authz.md](docs/design/relay-v2-identity-authz.md) — identity・認証・認可
+- [docs/design/relay-v2-sdk.md](docs/design/relay-v2-sdk.md) — Python SDK 仕様
+- [docs/design/relay-sequences.md](docs/design/relay-sequences.md) — 主要シーケンス図
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — 実装のモジュール構成と設計判断の記録。開発中の判断メモを含む歴史的文書のため通読は不要で、まず `docs/design/` の仕様書から読むこと
 
 ## 開発
 
-relay v2（`relay/` パッケージ）と旧 `server.py`（孤児化済み、詳細は
-[旧実装の撤去経緯](#旧実装の撤去経緯) を参照）のテストは同じ `tests/` 配下に同居しており、
-1 コマンドでまとめて実行できる。
-
 ```bash
-uv run pytest -v
+uv run pytest
 ```
 
-`server.py` 本体は標準ライブラリ（`http.server` + `sqlite3`）のみで依存ゼロを維持する
-（relay v2 は authlib / Starlette 等の外部依存を使う。詳細は `pyproject.toml` を参照）。
+CI（GitHub Actions）は Python 3.11 / 3.12 / 3.13 でテストを実行し、`uv.lock` の整合検証、パッケージビルド + クリーンな venv へのインストール検証も行う。
+
+## ライセンス
+
+[MIT](LICENSE)

@@ -1,8 +1,9 @@
 [project]
 name = "relay"
 version = "0.1.0"
-description = "Claude Code間のメッセージング中継システム（履歴を持つ軽量サービス・窓口モデル）"
+description = "別々の人間が使う Claude Code 同士に認識合わせを代行させる、履歴を持つ軽量メッセージング中継（A2A 準拠 HTTP サーバー + Python SDK）"
 requires-python = ">=3.11"
+license = "MIT"
 # httpx は relay_sdk（クライアント側 SDK）が import 時に必須とする runtime dependency
 # （publisher/subscriber の HTTP・SSE 通信の実体）であり、dev-only ではない。
 dependencies = [

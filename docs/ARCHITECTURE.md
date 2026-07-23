@@ -4,6 +4,7 @@
 > （`docs/design/` 配下）と物理 DB schema decision の間で見つかった不整合点の解消方針を
 > 記録する。実装着手時の一次情報源は `docs/design/relay-v2-wire-api.md` /
 > `relay-v2-identity-authz.md` / `relay-glossary.md` とする。
+> 本書は実装時の判断記録を含む歴史的文書であり、モジュール構成・実装状況の現在の正はリポジトリ実体と README を参照のこと。
 
 ## パッケージ構成
 
