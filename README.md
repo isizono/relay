@@ -69,6 +69,7 @@ tests/          # サーバー・SDK のテスト（integration/ に E2E roundtr
 | `RELAY_AUTH_TOKENS` | Bearer token → identity の対応表（JSON object） |
 | `RELAY_SERVER_LOG_PATH` | 構造化ログ + サーバーログ sink（JSON Lines、TTL 90 日） |
 | `RELAY_JWS_PRIVATE_KEY_PEM` / `RELAY_JWS_KID` / `RELAY_JWS_JKU` | AgentCard の ES256 署名（未設定なら署名なし最小セット）。federation マシン鍵も兼ねる |
+| `RELAY_JWE_PRIVATE_KEY_PEM` | federation envelope body の暗号化鍵（ECDH-ES + A256GCM）。署名鍵とは別鍵。未設定なら envelope は互換のため平文で送る |
 | `RELAY_BASE_URL` | 自 relay の公開 base URL（federation 招待 URL 生成・redeem 応答の locator に使う） |
 | `RELAY_FEDERATION_ALLOW_PRIVATE_LOCATORS` | 既定 `false`。`true` で federation の outbound dial 先に localhost / private IP を許可（同一ホスト検証・開発用） |
 
@@ -85,6 +86,7 @@ tests/          # サーバー・SDK のテスト（integration/ に E2E roundtr
 | AgentCard 公開 | `GET /.well-known/agent-card.json` | 実装済み |
 | Python SDK（クライアント側） | `relay_sdk/` パッケージ | 実装済み |
 | federation peer レジストリ（招待ベース鍵ピン留め） | `POST /federation/peers/redeem`、`python -m relay.invite peer new/redeem/list/revoke` | peer 登録まで実装済み（relay 間のメッセージ配達は未実装） |
+| federation envelope 暗号化鍵の追加登録（招待をやり直さない再 pin） | `POST /federation/peers/enc-key`、`python -m relay.invite peer enc-key` | 実装済み |
 
 wire レベルの仕様は [docs/design/relay-v2-wire-api.md](docs/design/relay-v2-wire-api.md)、identity / 認可モデルは [docs/design/relay-v2-identity-authz.md](docs/design/relay-v2-identity-authz.md) を参照。
 

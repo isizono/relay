@@ -49,6 +49,16 @@ reply 方向（replica stream からの投函）で送る envelope の `origin_s
 生成時に設定される）から読む。本モジュールはこれらの属性が未設定でも動作するよう
 `getattr` で defensive に参照する（属性が無ければ owner 側送信とみなしローカル stream_id を
 そのまま使う）。
+
+## body の暗号化（JWE）
+
+envelope の `body`（メッセージ本文）は、自分に `Settings.jwe_private_key_pem` が設定され
+かつ宛先 peer に暗号化用公開鍵（`peers.enc_key_jwk`）が pin 済みの場合、ECDH-ES + A256GCM
+の compact JWE（`federation_peers.encrypt_envelope_body`）にして `body_jwe` フィールドで
+送る。どちらか一方でも欠けている場合は互換のため平文 `body` を送る（新規ロールアウト・
+片側未対応 peer との共存を壊さないフォールバック）。`origin_stream_id` / `origin_publish_id`
+/ `from_sub` / `to_members` はいずれの場合も平文のまま送る（配達ルーティングに必要な
+メタデータであり、暗号化するとルーティング自体が機能しなくなるため対象外）。
 """
 from __future__ import annotations
 
@@ -112,7 +122,13 @@ def _parse_retry_after(response: httpx.Response) -> float | None:
         return None
 
 
-def _lookup_publisher_identity(db_conn: sqlite3.Connection, publish_id: int) -> str | None:
+def lookup_publisher_identity(db_conn: sqlite3.Connection, publish_id: int) -> str | None:
+    """`publish_log.publisher_identity` を `publish_id` で引く。
+
+    local 由来（`identity.id` のみ、`@` を含まない）と federation 由来
+    （`{from_sub}@{peer.handle}` 形式）の両方をそのまま返す。`relay.delivery` の
+    `_build_event_data` からも共有で使う。
+    """
     row = db_conn.execute(
         "SELECT publisher_identity FROM publish_log WHERE publish_id = ?", (publish_id,)
     ).fetchone()
@@ -302,16 +318,25 @@ async def _process_lane(
         if next_attempt_at is not None and next_attempt_at > now_iso:
             break  # まだ backoff 中。レーン停止（後続 publish_id も送らない）。
 
-        from_sub = _lookup_publisher_identity(db_conn, publish_id)
+        from_sub = lookup_publisher_identity(db_conn, publish_id)
         to_members = [row["member_identity"].partition("@")[0] for row in group_rows]
         body_text = bytes(head["payload"]).decode("utf-8")
-        envelope = {
+        envelope: dict[str, Any] = {
             "origin_stream_id": path_stream_id,
             "origin_publish_id": publish_id,
             "from_sub": from_sub,
             "to_members": to_members,
-            "body": body_text,
         }
+        # body のみ暗号化対象（メタデータはルーティングに要るため常に平文、モジュール
+        # docstring「body の暗号化（JWE）」参照）。自分の暗号化鍵と宛先の pin 済み
+        # 暗号化鍵の両方が揃っているときだけ暗号化し、揃わなければ平文にフォールバックする。
+        peer_enc_key_jwk = peer["enc_key_jwk"]
+        if settings.jwe_private_key_pem and peer_enc_key_jwk is not None:
+            envelope["body_jwe"] = federation_peers.encrypt_envelope_body(
+                body_text, public_key_jwk=peer_enc_key_jwk
+            )
+        else:
+            envelope["body"] = body_text
 
         outcome, dlq_error_code, retry_after = await _send_envelope(
             client,

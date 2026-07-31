@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, urlparse, urlunparse
 
 import httpx
 
-from relay import config, credentials, db, federation_net, federation_peers
+from relay import config, credentials, db, federation_auth, federation_net, federation_peers
 
 CANONICAL_DB_PATH = str(Path.home() / ".local" / "state" / "relay" / "relay.db")
 
@@ -52,6 +52,11 @@ def _resolve_db_path(explicit: str | None) -> str:
 def _resolve_federation_private_key_pem() -> str | None:
     """federation マシン鍵（`RELAY_JWS_PRIVATE_KEY_PEM`、AgentCard 署名鍵と共用）を読む。"""
     return os.environ.get("RELAY_JWS_PRIVATE_KEY_PEM")
+
+
+def _resolve_federation_enc_private_key_pem() -> str | None:
+    """envelope 暗号化鍵（`RELAY_JWE_PRIVATE_KEY_PEM`）を読む。署名鍵とは別物、未設定でも可。"""
+    return os.environ.get("RELAY_JWE_PRIVATE_KEY_PEM")
 
 
 def _resolve_federation_base_url(explicit: str | None) -> str:
@@ -280,11 +285,17 @@ def _cmd_peer_redeem(args: argparse.Namespace) -> int:
     }
     sig = federation_peers.sign_detached(sig_payload, private_key_pem=private_key_pem)
     own_base_url = _resolve_federation_base_url(args.base_url)
+    own_card: dict[str, object] = {"key": own_jwk, "locator": own_base_url}
+    enc_private_key_pem = _resolve_federation_enc_private_key_pem()
+    if enc_private_key_pem:
+        # 暗号化鍵が設定済みならこの 1 往復で pin まで済ませる（未設定でも redeem 自体は
+        # 成立し、後から `peer enc-key` で追加できる）。
+        own_card["enc_key"] = federation_peers.public_enc_jwk_from_pem(enc_private_key_pem)
     body = {
         "invite_token": token,
         "ts": ts,
         "a_fp": a_fingerprint,
-        "card": {"key": own_jwk, "locator": own_base_url},
+        "card": own_card,
         "sig": sig,
     }
 
@@ -352,6 +363,17 @@ def _cmd_peer_redeem(args: argparse.Namespace) -> int:
         print(f"応答の locator が拒否されました: {exc}", file=sys.stderr)
         return 1
 
+    # card.enc_key（envelope 暗号化用公開鍵）は任意項目。応答側が暗号化鍵を設定していれば
+    # ここで一緒に pin する（署名検証済みの resp_card 全体に含まれるため改めた検証は要らない、
+    # 構造だけ確認する）。
+    resp_enc_key = resp_card.get("enc_key")
+    if resp_enc_key is not None:
+        try:
+            federation_peers.validate_enc_key_jwk(resp_enc_key)
+        except ValueError as exc:
+            print(f"応答の enc_key が不正です。enc_key は pin しません: {exc}", file=sys.stderr)
+            resp_enc_key = None
+
     try:
         federation_peers.add_peer(
             db_path,
@@ -359,12 +381,126 @@ def _cmd_peer_redeem(args: argparse.Namespace) -> int:
             fingerprint=resp_fingerprint,
             key_jwk=resp_key,
             locator=resp_locator,
+            enc_key_jwk=resp_enc_key,
         )
     except federation_peers.PeerAlreadyRegisteredError as exc:
         print(f"pin に失敗しました: {exc}", file=sys.stderr)
         return 1
 
     print(f"peer '{args.handle}' を pin しました（fingerprint={resp_fingerprint}）")
+    return 0
+
+
+def _cmd_peer_enc_key(args: argparse.Namespace) -> int:
+    """既に pin 済みの peer へ envelope 暗号化用公開鍵を追加/更新する（招待をやり直さない）。
+
+    `POST /federation/peers/enc-key` を 1 回呼ぶだけで双方向に鍵が揃う: 自分の enc_key を
+    リクエスト body で相手に渡し、相手の enc_key を応答から受け取ってその場で pin する。
+    """
+    db_path = _resolve_db_path(args.db)
+    db.init_db(db_path)
+
+    private_key_pem = _resolve_federation_private_key_pem()
+    if not private_key_pem:
+        print(
+            "federation マシン鍵が未設定です（RELAY_JWS_PRIVATE_KEY_PEM）",
+            file=sys.stderr,
+        )
+        return 2
+
+    enc_private_key_pem = _resolve_federation_enc_private_key_pem()
+    if not enc_private_key_pem:
+        print(
+            "envelope 暗号化鍵が未設定です（RELAY_JWE_PRIVATE_KEY_PEM）",
+            file=sys.stderr,
+        )
+        return 2
+
+    peer = federation_peers.get_peer_by_handle(db_path, args.handle)
+    if peer is None:
+        print(f"peer '{args.handle}' は pin されていません", file=sys.stderr)
+        return 1
+    if peer["revoked_at"] is not None:
+        print(f"peer '{args.handle}' は revoke 済みです", file=sys.stderr)
+        return 1
+
+    # pin 時点で検証済みの locator でも、dial 直前に再検証する（DNS rebinding 対策、
+    # relay.federation_net.validate_locator docstring / relay.federation_egress._send_envelope
+    # と同じ「検証直後に同じホスト名へ dial する」パターン）。
+    allow_private = _resolve_allow_private_locators()
+    try:
+        federation_net.validate_locator(peer["locator"], allow_private=allow_private)
+    except federation_net.LocatorRejected as exc:
+        print(f"peer の locator が拒否されました: {exc}", file=sys.stderr)
+        return 1
+
+    own_fingerprint = federation_peers.compute_fingerprint(
+        federation_peers.public_jwk_from_pem(private_key_pem)
+    )
+    own_enc_jwk = federation_peers.public_enc_jwk_from_pem(enc_private_key_pem)
+    path = "/federation/peers/enc-key"
+    body_bytes = json.dumps({"enc_key": own_enc_jwk}, ensure_ascii=False).encode("utf-8")
+    headers = federation_auth.sign_federation_request(
+        method="POST",
+        path=path,
+        body=body_bytes,
+        origin_fp=own_fingerprint,
+        destination_fp=peer["fingerprint"],
+        private_key_pem=private_key_pem,
+    )
+    headers["Content-Type"] = "application/json"
+    url = f"{peer['locator'].rstrip('/')}{path}"
+
+    try:
+        with federation_net.build_client() as client:
+            response = client.post(url, content=body_bytes, headers=headers)
+    except httpx.HTTPError as exc:
+        print(f"enc-key リクエストに失敗しました: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        resp_bytes = federation_net.read_body_capped(response)
+    except federation_net.LocatorRejected as exc:
+        print(f"応答が拒否されました: {exc}", file=sys.stderr)
+        return 1
+
+    if response.status_code != 200:
+        print(
+            f"enc-key 登録に失敗しました（status={response.status_code}）:"
+            f" {resp_bytes.decode('utf-8', errors='replace')}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        resp_body = json.loads(resp_bytes)
+    except json.JSONDecodeError:
+        print("応答が不正な JSON です。相手の enc_key は pin しません。", file=sys.stderr)
+        return 1
+    if not isinstance(resp_body, dict):
+        print("応答が JSON object ではありません。相手の enc_key は pin しません。", file=sys.stderr)
+        return 1
+
+    print(f"自分の enc_key を peer '{args.handle}' へ登録しました")
+
+    resp_enc_key = resp_body.get("enc_key")
+    if resp_enc_key is None:
+        print(
+            f"peer '{args.handle}' はまだ暗号化鍵を設定していません"
+            "（相手側で `peer enc-key` を実行するまで body は平文のままです）"
+        )
+        return 0
+
+    try:
+        federation_peers.validate_enc_key_jwk(resp_enc_key)
+    except ValueError as exc:
+        print(f"応答の enc_key が不正です。pin しません: {exc}", file=sys.stderr)
+        return 1
+
+    federation_peers.set_peer_enc_key(
+        db_path, fingerprint=peer["fingerprint"], enc_key_jwk=resp_enc_key
+    )
+    print(f"peer '{args.handle}' の enc_key を pin しました")
     return 0
 
 
@@ -375,9 +511,10 @@ def _cmd_peer_list(args: argparse.Namespace) -> int:
     print("peers:")
     for p in peers:
         state = "revoked" if p["revoked_at"] is not None else "active"
+        enc = "yes" if p.get("enc_key_jwk") is not None else "no"
         print(
             f"  handle={p['handle']} fingerprint={p['fingerprint']}"
-            f" locator={p['locator']} created_at={p['created_at']} state={state}"
+            f" locator={p['locator']} created_at={p['created_at']} state={state} enc_key={enc}"
         )
     return 0
 
@@ -432,6 +569,13 @@ def build_parser() -> argparse.ArgumentParser:
     peer_redeem_parser.add_argument("--base-url", default=None)
     peer_redeem_parser.add_argument("--db", default=None)
     peer_redeem_parser.set_defaults(func=_cmd_peer_redeem)
+
+    peer_enc_key_parser = peer_sub.add_parser(
+        "enc-key", help="既存 peer へ envelope 暗号化用公開鍵を追加/更新する（招待をやり直さない）"
+    )
+    peer_enc_key_parser.add_argument("--handle", required=True)
+    peer_enc_key_parser.add_argument("--db", default=None)
+    peer_enc_key_parser.set_defaults(func=_cmd_peer_enc_key)
 
     peer_list_parser = peer_sub.add_parser("list", help="peer 一覧を表示する")
     peer_list_parser.add_argument("--db", default=None)

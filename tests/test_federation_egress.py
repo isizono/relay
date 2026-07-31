@@ -50,6 +50,18 @@ def keypair_b():
 
 
 @pytest.fixture()
+def enc_keypair_a():
+    """A（自分）の envelope 暗号化鍵。署名鍵（keypair_a）とは無関係の別鍵。"""
+    return _generate_keypair()
+
+
+@pytest.fixture()
+def enc_keypair_b():
+    """B（bob）の envelope 暗号化鍵。署名鍵（keypair_b）とは無関係の別鍵。"""
+    return _generate_keypair()
+
+
+@pytest.fixture()
 def settings(tmp_path, keypair_a):
     db_path = str(tmp_path / "egress.db")
     db.init_db(db_path)
@@ -806,6 +818,113 @@ class TestEnvelopeConstruction:
 
         assert captured["envelope"]["from_sub"] is None
         assert _outbox_rows(settings, "orch:collab", "orch@bob") == []
+
+
+# ---------------------------------------------------------------------------
+# body の暗号化（JWE）
+# ---------------------------------------------------------------------------
+
+
+class TestEnvelopeBodyEncryption:
+    """自分の暗号化鍵設定 + 宛先 peer の pin 済み暗号化鍵、両方揃った場合だけ
+    envelope の body が JWE 化される（片方でも欠ければ互換のため平文フォールバック）。
+    ルーティングメタデータ（origin_stream_id/origin_publish_id/from_sub/to_members）は
+    暗号化の有無に関わらず常に平文で送る。
+    """
+
+    def test_encrypts_body_when_both_sides_have_enc_keys(
+        self, monkeypatch, settings, app_state, pinned_bob, enc_keypair_a, enc_keypair_b
+    ):
+        import dataclasses
+
+        settings = dataclasses.replace(settings, jwe_private_key_pem=enc_keypair_a["private_pem"])
+        app_state.settings = settings
+        federation_peers.set_peer_enc_key(
+            settings.db_path, fingerprint=pinned_bob, enc_key_jwk=enc_keypair_b["public_jwk"]
+        )
+
+        registry = StreamRegistry()
+        registry.create("orch:collab", "orch", None)
+        registry.put_member("orch:collab", "orch@bob", "read")
+        publish_id = _publish(settings, "orch:collab", "orch@bob", body="secret payload")
+
+        captured = {}
+
+        def handler(request):
+            captured["envelope"] = _decode_envelope(request)
+            return httpx.Response(202)
+
+        _patch_transport(monkeypatch, handler)
+        _run(_run_egress(app_state, settings, registry))
+
+        envelope = captured["envelope"]
+        # ルーティングメタデータは平文のまま。
+        assert envelope["origin_stream_id"] == "orch:collab"
+        assert envelope["origin_publish_id"] == publish_id
+        assert envelope["from_sub"] == "orch"
+        assert envelope["to_members"] == ["orch"]
+        # body は暗号化され、平文の "body" フィールドは送らない。
+        assert "body" not in envelope
+        assert "body_jwe" in envelope
+        assert envelope["body_jwe"] != "secret payload"
+
+        plaintext = federation_peers.decrypt_envelope_body(
+            envelope["body_jwe"], private_key_pem=enc_keypair_b["private_pem"]
+        )
+        assert plaintext == "secret payload"
+
+    def test_falls_back_to_plaintext_when_peer_has_no_enc_key(
+        self, monkeypatch, settings, app_state, pinned_bob, enc_keypair_a
+    ):
+        """自分は暗号化鍵を設定しているが、宛先 peer にまだ pin されていない場合は平文。"""
+        import dataclasses
+
+        settings = dataclasses.replace(settings, jwe_private_key_pem=enc_keypair_a["private_pem"])
+        app_state.settings = settings
+
+        registry = StreamRegistry()
+        registry.create("orch:collab", "orch", None)
+        registry.put_member("orch:collab", "orch@bob", "read")
+        _publish(settings, "orch:collab", "orch@bob", body="plain payload")
+
+        captured = {}
+
+        def handler(request):
+            captured["envelope"] = _decode_envelope(request)
+            return httpx.Response(202)
+
+        _patch_transport(monkeypatch, handler)
+        _run(_run_egress(app_state, settings, registry))
+
+        envelope = captured["envelope"]
+        assert envelope["body"] == "plain payload"
+        assert "body_jwe" not in envelope
+
+    def test_falls_back_to_plaintext_when_own_enc_key_unset(
+        self, monkeypatch, settings, app_state, pinned_bob, enc_keypair_b
+    ):
+        """宛先 peer には暗号化鍵が pin 済みでも、自分に暗号化鍵が未設定なら平文。"""
+        federation_peers.set_peer_enc_key(
+            settings.db_path, fingerprint=pinned_bob, enc_key_jwk=enc_keypair_b["public_jwk"]
+        )
+
+        registry = StreamRegistry()
+        registry.create("orch:collab", "orch", None)
+        registry.put_member("orch:collab", "orch@bob", "read")
+        _publish(settings, "orch:collab", "orch@bob", body="plain payload 2")
+
+        captured = {}
+
+        def handler(request):
+            captured["envelope"] = _decode_envelope(request)
+            return httpx.Response(202)
+
+        _patch_transport(monkeypatch, handler)
+        _run(_run_egress(app_state, settings, registry))
+
+        envelope = captured["envelope"]
+        assert envelope["body"] == "plain payload 2"
+        assert "body_jwe" not in envelope
 
 
 # ---------------------------------------------------------------------------

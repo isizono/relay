@@ -8,6 +8,15 @@ invitations / credentials と同一パターン（atomic 消費マーク・一�
 
 RFC 7638 JWK thumbprint 計算、redemption 署名（detached JWS, JCS canonical payload、
 identity.py の AgentCard 署名パターンと同型）もここで提供する。
+
+## envelope 暗号化（JWE）
+
+federation envelope の body（メッセージ本文）を ECDH-ES + A256GCM の compact JWE で
+暗号化・復号する（`encrypt_envelope_body` / `decrypt_envelope_body`）。署名鍵（ES256、
+peer 認証用）とは別の鍵ペアを使う（`peers.enc_key_jwk` / `Settings.jwe_private_key_pem`、
+1 つの鍵を署名と暗号化の 2 用途に流用しない）。alg/enc は常にこの組に固定し、`zip`
+圧縮は使わない（algorithm confusion・圧縮サイドチャネル対策、`decrypt_envelope_body`
+docstring 参照）。
 """
 from __future__ import annotations
 
@@ -19,10 +28,16 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import rfc8785
-from joserfc import jws
+from joserfc import jwe, jws
 from joserfc.jwk import ECKey, JWKRegistry
 
 from relay import db
+
+# envelope body 暗号化の alg/enc 固定値（鍵分離: peers.key_jwk / jws_private_key_pem
+# とは別の鍵ペアを使う。zip 圧縮ヘッダは使わない）。
+JWE_ALG = "ECDH-ES"
+JWE_ENC = "A256GCM"
+_JWE_ALLOWED_ALGORITHMS = (JWE_ALG, JWE_ENC)
 
 PEER_INVITE_TOKEN_PREFIX = "pi_"
 _PEER_INVITE_TOKEN_BYTES = 16  # 128bit（招待 token 仕様、federation 仕様 parity）
@@ -77,6 +92,88 @@ def public_jwk_from_pem(private_key_pem: str) -> dict[str, Any]:
     """PEM 鍵（秘密鍵可）から対応する公開鍵 JWK dict を取り出す。"""
     key = ECKey.import_key(private_key_pem)
     return key.as_dict(private=False)
+
+
+def public_enc_jwk_from_pem(private_key_pem: str) -> dict[str, Any]:
+    """PEM 鍵（秘密鍵可）から envelope 暗号化用の公開鍵 JWK dict を取り出す。
+
+    `public_jwk_from_pem` と同じ抽出だが、`use: "enc"` を明示する点が異なる。署名鍵の
+    JWK には `use` を付与していないため、暗号化鍵とは JWK 単体を見ても区別できる
+    （joserfc の `Key.check_use` が `use` 不一致を検出する。取り違え防止の多層目、
+    一次防御は鍵ペア自体を分離すること）。
+    """
+    key = ECKey.import_key(private_key_pem)
+    jwk = key.as_dict(private=False)
+    jwk["use"] = "enc"
+    return jwk
+
+
+def validate_enc_key_jwk(jwk: Any) -> None:
+    """peer から届いた envelope 暗号化用公開鍵 JWK の構造を検証する（fail-closed）。
+
+    ECDH-ES は仕様上複数曲線を扱えるが、federation の署名鍵（ES256/P-256）と揃えて
+    P-256 に固定する（曲線 confusion の余地を減らす）。秘密鍵成分 `d` を含む場合は
+    送信側の実装ミスで秘密鍵そのものが漏洩した可能性があるため拒否する（相手の秘密鍵を
+    自分の DB に保存してしまう事故を未然に防ぐ）。
+    """
+    if not isinstance(jwk, dict):
+        raise ValueError("enc_key は JSON object でなければなりません")
+    if jwk.get("kty") != "EC":
+        raise ValueError("enc_key.kty は 'EC' でなければなりません")
+    if jwk.get("crv") != "P-256":
+        raise ValueError("enc_key.crv は 'P-256' でなければなりません")
+    if not isinstance(jwk.get("x"), str) or not jwk["x"]:
+        raise ValueError("enc_key.x は必須の非空文字列です")
+    if not isinstance(jwk.get("y"), str) or not jwk["y"]:
+        raise ValueError("enc_key.y は必須の非空文字列です")
+    if "d" in jwk:
+        raise ValueError("enc_key に秘密鍵成分 'd' を含めることはできません")
+
+
+class EnvelopeDecryptionError(Exception):
+    """envelope body の JWE 復号に失敗した（alg/enc 不一致・鍵不一致・改竄・zip 使用等）。
+
+    理由は区別せず一様にこの例外に畳む（`federation_auth.FederationAuthenticationError`
+    と同じ fail-closed 方針）。呼び出し側で 400 相当に変換すること。
+    """
+
+
+def encrypt_envelope_body(plaintext: str, *, public_key_jwk: dict[str, Any]) -> str:
+    """envelope body を compact JWE（ECDH-ES + A256GCM、zip 圧縮なし）で暗号化する。
+
+    `algorithms` を `_JWE_ALLOWED_ALGORITHMS` に固定して渡すため、生成される JWE は
+    常にこの alg/enc の組になる（`zip` header を含む protected header を渡さない限り
+    圧縮は使われない。本関数は明示的に `zip` を指定しないため常に無効）。
+    """
+    key = ECKey.import_key(public_key_jwk)
+    protected = {"alg": JWE_ALG, "enc": JWE_ENC}
+    return jwe.encrypt_compact(
+        protected, plaintext, key, algorithms=list(_JWE_ALLOWED_ALGORITHMS)
+    )
+
+
+def decrypt_envelope_body(compact_jwe: str, *, private_key_pem: str) -> str:
+    """`encrypt_envelope_body` が生成した compact JWE を復号する。
+
+    `algorithms=_JWE_ALLOWED_ALGORITHMS` を渡すことで、joserfc は protected header の
+    `enc` を最初にこの許可集合と照合し（`_rfc7516.message._perform_decrypt`）、
+    一致しなければ実際の復号（鍵合意・ciphertext 復号）を一切試みず
+    `UnsupportedAlgorithmError` を送出する。`alg` も同様に recipient ごとの許可集合
+    照合を通る。`zip` header が付与されていても、許可集合に `zip` の値（例: `DEF`）が
+    含まれないため展開時に拒否される（受信側で JWE ヘッダの alg を信用してディスパッチ
+    しない、algorithm confusion 対策）。理由の区別はせず、いずれの失敗も
+    `EnvelopeDecryptionError` に畳んで fail-closed にする。
+    """
+    key = ECKey.import_key(private_key_pem)
+    try:
+        result = jwe.decrypt_compact(
+            compact_jwe, key, algorithms=list(_JWE_ALLOWED_ALGORITHMS)
+        )
+    except Exception as exc:
+        raise EnvelopeDecryptionError(str(exc)) from exc
+    if result.plaintext is None:
+        raise EnvelopeDecryptionError("復号結果が空です")
+    return result.plaintext.decode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +239,7 @@ def verify_detached(
 
 
 def _peer_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    enc_key_jwk = row["enc_key_jwk"]
     return {
         "id": row["id"],
         "handle": row["handle"],
@@ -151,6 +249,7 @@ def _peer_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "created_at": row["created_at"],
         "revoked_at": row["revoked_at"],
         "disclosure_level": row["disclosure_level"],
+        "enc_key_jwk": json.loads(enc_key_jwk) if enc_key_jwk is not None else None,
     }
 
 
@@ -162,6 +261,7 @@ def _insert_peer(
     key_jwk: dict[str, Any],
     locator: str,
     now: str,
+    enc_key_jwk: dict[str, Any] | None = None,
 ) -> int:
     """`peers` に1行 INSERT する（同一トランザクション内での利用を想定、commit しない）。
 
@@ -171,9 +271,16 @@ def _insert_peer(
     validate_peer_handle(handle)
     try:
         cur = conn.execute(
-            "INSERT INTO peers (handle, fingerprint, key_jwk, locator, created_at)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (handle, fingerprint, json.dumps(key_jwk), locator, now),
+            "INSERT INTO peers (handle, fingerprint, key_jwk, locator, created_at, enc_key_jwk)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                handle,
+                fingerprint,
+                json.dumps(key_jwk),
+                locator,
+                now,
+                json.dumps(enc_key_jwk) if enc_key_jwk is not None else None,
+            ),
         )
     except sqlite3.IntegrityError as exc:
         raise PeerAlreadyRegisteredError(
@@ -189,23 +296,53 @@ def add_peer(
     fingerprint: str,
     key_jwk: dict[str, Any],
     locator: str,
+    enc_key_jwk: dict[str, Any] | None = None,
 ) -> int:
     """peer を pin する（`peers` に INSERT、単独トランザクション）。
 
     B 側 CLI（`peer redeem` の応答照合成功後）と A 側 endpoint（`peer redeem` の署名検証・
-    a_fp 照合成功後）の双方から呼ぶ。
+    a_fp 照合成功後）の双方から呼ぶ。`enc_key_jwk`（envelope 暗号化用公開鍵）は招待側が
+    その時点で暗号化鍵を持っていれば同じ 1 往復で渡せる任意項目で、無くても pin 自体は
+    成立する（後から `set_peer_enc_key` / `POST /federation/peers/enc-key` で追加できる）。
     """
     now = _now_iso()
     conn = db.get_connection(db_path)
     try:
         peer_id = _insert_peer(
-            conn, handle=handle, fingerprint=fingerprint, key_jwk=key_jwk, locator=locator, now=now
+            conn,
+            handle=handle,
+            fingerprint=fingerprint,
+            key_jwk=key_jwk,
+            locator=locator,
+            now=now,
+            enc_key_jwk=enc_key_jwk,
         )
         conn.commit()
         return peer_id
     except PeerAlreadyRegisteredError:
         conn.rollback()
         raise
+    finally:
+        conn.close()
+
+
+def set_peer_enc_key(db_path: str, *, fingerprint: str, enc_key_jwk: dict[str, Any]) -> bool:
+    """既存 pin 済み peer の envelope 暗号化用公開鍵を追加/更新する。
+
+    招待・redeem フローをやり直さず、既に確立した peer 関係へ鍵だけ追加する経路
+    （`POST /federation/peers/enc-key` / `python -m relay.invite peer enc-key` から呼ぶ）。
+
+    Returns:
+        対象 fingerprint の peer が存在し更新できたかどうか。
+    """
+    conn = db.get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "UPDATE peers SET enc_key_jwk = ? WHERE fingerprint = ?",
+            (json.dumps(enc_key_jwk), fingerprint),
+        )
+        conn.commit()
+        return cur.rowcount > 0
     finally:
         conn.close()
 
