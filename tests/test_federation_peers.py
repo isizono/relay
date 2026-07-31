@@ -111,6 +111,27 @@ class TestSignAndVerifyDetached:
         other_pub = ECKey.generate_key("P-256", private=True).as_dict(private=False)
         assert not federation_peers.verify_detached(payload, sig, public_key=other_pub)
 
+    def test_verify_fails_for_tampered_nested_field(self, keypair):
+        """payload にネストした dict（card 等）が含まれる場合、その内部フィールドの
+        改竄も検出できる（redeem リクエストの card 署名対象化が前提とする性質）。"""
+        payload = {
+            "typ": "relay-fed-redeem",
+            "token": "pi_abc",
+            "ts": 1000,
+            "a_fp": "fp",
+            "card": {"key": {"kty": "EC"}, "locator": "https://relay-b.example"},
+        }
+        sig = federation_peers.sign_detached(payload, private_key_pem=keypair["private_pem"])
+        assert federation_peers.verify_detached(payload, sig, public_key=keypair["public_jwk"])
+
+        tampered = {
+            **payload,
+            "card": {**payload["card"], "locator": "https://attacker.example"},
+        }
+        assert not federation_peers.verify_detached(
+            tampered, sig, public_key=keypair["public_jwk"]
+        )
+
     def test_verify_fails_for_malformed_sig_structure(self, keypair):
         payload = {"typ": "relay-fed-redeem", "token": "pi_abc", "ts": 1000, "a_fp": "fp"}
         assert not federation_peers.verify_detached(

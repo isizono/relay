@@ -277,13 +277,6 @@ def _cmd_peer_redeem(args: argparse.Namespace) -> int:
 
     own_jwk = federation_peers.public_jwk_from_pem(private_key_pem)
     ts = int(time.time())
-    sig_payload = {
-        "typ": "relay-fed-redeem",
-        "token": token,
-        "ts": ts,
-        "a_fp": a_fingerprint,
-    }
-    sig = federation_peers.sign_detached(sig_payload, private_key_pem=private_key_pem)
     own_base_url = _resolve_federation_base_url(args.base_url)
     own_card: dict[str, object] = {"key": own_jwk, "locator": own_base_url}
     enc_private_key_pem = _resolve_federation_enc_private_key_pem()
@@ -291,6 +284,17 @@ def _cmd_peer_redeem(args: argparse.Namespace) -> int:
         # 暗号化鍵が設定済みならこの 1 往復で pin まで済ませる（未設定でも redeem 自体は
         # 成立し、後から `peer enc-key` で追加できる）。
         own_card["enc_key"] = federation_peers.public_enc_jwk_from_pem(enc_private_key_pem)
+    # card（暗号化鍵を含む）も署名対象に含める。中間者が body["card"] だけを差し替えても
+    # 検証が通ってしまわないよう、リクエスト方向の署名対象を応答方向（verify_payload）と
+    # 対称にする。
+    sig_payload = {
+        "typ": "relay-fed-redeem",
+        "token": token,
+        "ts": ts,
+        "a_fp": a_fingerprint,
+        "card": own_card,
+    }
+    sig = federation_peers.sign_detached(sig_payload, private_key_pem=private_key_pem)
     body = {
         "invite_token": token,
         "ts": ts,

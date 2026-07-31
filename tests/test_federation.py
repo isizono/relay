@@ -85,9 +85,19 @@ def _build_redeem_body(
     a_fp: str,
     locator: str = "https://8.8.8.8",
     ts: int | None = None,
+    enc_key: dict | None = None,
 ) -> dict:
     ts = ts if ts is not None else int(time.time())
-    sig_payload = {"typ": "relay-fed-redeem", "token": token, "ts": ts, "a_fp": a_fp}
+    card: dict = {"key": keypair_b["public_jwk"], "locator": locator}
+    if enc_key is not None:
+        card["enc_key"] = enc_key
+    sig_payload = {
+        "typ": "relay-fed-redeem",
+        "token": token,
+        "ts": ts,
+        "a_fp": a_fp,
+        "card": card,
+    }
     sig = federation_peers.sign_detached(
         sig_payload, private_key_pem=keypair_b["private_pem"]
     )
@@ -95,7 +105,7 @@ def _build_redeem_body(
         "invite_token": token,
         "ts": ts,
         "a_fp": a_fp,
-        "card": {"key": keypair_b["public_jwk"], "locator": locator},
+        "card": card,
         "sig": sig,
     }
 
@@ -138,8 +148,9 @@ class TestRedeemSuccess:
     ):
         token = _issue_invite(settings)
         a_fp = _own_fingerprint(settings)
-        body = _build_redeem_body(token=token, keypair_b=keypair_b, a_fp=a_fp)
-        body["card"]["enc_key"] = enc_keypair_b["public_jwk"]
+        body = _build_redeem_body(
+            token=token, keypair_b=keypair_b, a_fp=a_fp, enc_key=enc_keypair_b["public_jwk"]
+        )
 
         r = client.post("/federation/peers/redeem", json=body)
         assert r.status_code == 200
@@ -293,6 +304,37 @@ class TestRedeemSignatureVerification:
     def test_wrong_a_fp_is_rejected_and_not_pinned(self, client, settings, keypair_b):
         token = _issue_invite(settings)
         body = _build_redeem_body(token=token, keypair_b=keypair_b, a_fp="wrong-fingerprint")
+        r = client.post("/federation/peers/redeem", json=body)
+        assert r.status_code == 401
+        assert r.json()["code"] == "FederationSignatureInvalidError"
+
+        peer_fp = federation_peers.compute_fingerprint(keypair_b["public_jwk"])
+        assert federation_peers.get_peer_by_fingerprint(settings.db_path, peer_fp) is None
+
+    def test_tampered_card_enc_key_after_signing_is_rejected(
+        self, client, settings, keypair_b, enc_keypair_b
+    ):
+        """署名計算後に card.enc_key だけを差し替えても、card 自体が署名対象のため
+        検証が失敗する（中間者が暗号化鍵をすり替える攻撃を防ぐ）。"""
+        token = _issue_invite(settings)
+        a_fp = _own_fingerprint(settings)
+        body = _build_redeem_body(token=token, keypair_b=keypair_b, a_fp=a_fp)
+        body["card"]["enc_key"] = enc_keypair_b["public_jwk"]  # 署名計算後の改竄
+
+        r = client.post("/federation/peers/redeem", json=body)
+        assert r.status_code == 401
+        assert r.json()["code"] == "FederationSignatureInvalidError"
+
+        peer_fp = federation_peers.compute_fingerprint(keypair_b["public_jwk"])
+        assert federation_peers.get_peer_by_fingerprint(settings.db_path, peer_fp) is None
+
+    def test_tampered_card_locator_after_signing_is_rejected(self, client, settings, keypair_b):
+        """署名計算後に card.locator だけを差し替えても検証が失敗する。"""
+        token = _issue_invite(settings)
+        a_fp = _own_fingerprint(settings)
+        body = _build_redeem_body(token=token, keypair_b=keypair_b, a_fp=a_fp)
+        body["card"]["locator"] = "https://attacker.example"  # 署名計算後の改竄
+
         r = client.post("/federation/peers/redeem", json=body)
         assert r.status_code == 401
         assert r.json()["code"] == "FederationSignatureInvalidError"

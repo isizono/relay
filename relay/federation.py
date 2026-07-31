@@ -158,6 +158,7 @@ async def redeem_peer(request: Request) -> Response:
         "token": invite_token,
         "ts": ts,
         "a_fp": a_fp,
+        "card": card,
     }
     if not federation_peers.verify_detached(sig_payload, sig, public_key=key_jwk):
         observability.record_event(
