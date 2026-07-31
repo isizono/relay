@@ -1,8 +1,8 @@
 # relay
 
-別々の人間が使う Claude Code 同士に「認識合わせ」を代行させるための、履歴を持つ軽量メッセージング中継サービス。A2A (Agent2Agent) 準拠の HTTP サーバーと Python SDK からなる。
+別々の人間が使う Claude Code 同士に「認識合わせ」を代行させるための、at-least-once 配達を保証する軽量メッセージング中継サービス。A2A (Agent2Agent) 準拠の HTTP サーバーと Python SDK からなる。
 
-> relay is a lightweight, history-keeping message relay that lets Claude Code agents used by different people stay aligned with each other — an A2A-compliant HTTP server plus a Python SDK.
+> relay is a lightweight, at-least-once message relay that lets Claude Code agents used by different people stay aligned with each other — an A2A-compliant HTTP server plus a Python SDK.
 
 - **場 (stream) モデル** — 作成者の identity でスコープ化された「場」に member を招待し、メッセージを投函する。配達は member への push（SSE）+ cumulative ack
 - **labels 購読** — subscription を作って labels にマッチする publish を受け取る、pub/sub レーン
