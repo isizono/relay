@@ -138,15 +138,47 @@ class EnvelopeDecryptionError(Exception):
     """
 
 
+class EnvelopeTooLargeForEncryptionError(Exception):
+    """envelope body の平文が `MAX_ENVELOPE_PLAINTEXT_BYTES` を超えており、暗号化前に拒否した。
+
+    暗号化自体はできても、相手側の復号が joserfc の `max_ciphertext_length` 制限で必ず
+    失敗する（`MAX_ENVELOPE_PLAINTEXT_BYTES` docstring 参照）ため、暗号化を試みる前に
+    fail-fast する。
+    """
+
+
+# joserfc の `JWERegistry.max_ciphertext_length` は 65536 バイト固定で、compact JWE の
+# ciphertext セグメント（base64url 無パディング encode 後の文字列）の長さがこれを
+# 超えると decrypt/extract 側（受信側のみ）が拒否する。AES-256-GCM は plaintext と
+# ciphertext の長さが等しい（認証タグは別セグメント）ため、生 ciphertext 長 n バイトの
+# base64url 無パディング表現の長さは ceil(4n/3) になる。49152 は 3 の倍数で
+# 49152 * 4 / 3 = 65536（端数なくちょうど割り切れる）ため、n = 49152 なら
+# ceil(4n/3) = 65536 で上限ちょうど、n = 49153 なら 65538 になり上限を超える。
+MAX_ENVELOPE_PLAINTEXT_BYTES = 49152
+
+
 def encrypt_envelope_body(plaintext: str, *, public_key_jwk: dict[str, Any]) -> str:
     """envelope body を compact JWE（ECDH-ES + A256GCM、zip 圧縮なし）で暗号化する。
 
     `algorithms` を `_JWE_ALLOWED_ALGORITHMS` に固定して渡すため、生成される JWE は
     常にこの alg/enc の組になる（`zip` header を含む protected header を渡さない限り
     圧縮は使われない。本関数は明示的に `zip` を指定しないため常に無効）。
+
+    plaintext が `MAX_ENVELOPE_PLAINTEXT_BYTES` を超える場合は暗号化を試みず
+    `EnvelopeTooLargeForEncryptionError` を送出する（相手側の復号が必ず失敗するため）。
+
+    protected header の `kid` には暗号化に使った公開鍵の fingerprint を設定する
+    （`decrypt_envelope_body` の挙動は変えない任意の診断情報。復号失敗時に「相手が
+    鍵ローテーション後の古い鍵で暗号化していないか」を後から確認できるようにする）。
     """
+    plaintext_bytes = plaintext.encode("utf-8")
+    if len(plaintext_bytes) > MAX_ENVELOPE_PLAINTEXT_BYTES:
+        raise EnvelopeTooLargeForEncryptionError(
+            f"envelope body の平文が上限（{MAX_ENVELOPE_PLAINTEXT_BYTES} バイト）を"
+            f"超えています（実際: {len(plaintext_bytes)} バイト）"
+        )
     key = ECKey.import_key(public_key_jwk)
-    protected = {"alg": JWE_ALG, "enc": JWE_ENC}
+    protected = {"alg": JWE_ALG, "enc": JWE_ENC, "kid": compute_fingerprint(public_key_jwk)}
     return jwe.encrypt_compact(
         protected, plaintext, key, algorithms=list(_JWE_ALLOWED_ALGORITHMS)
     )

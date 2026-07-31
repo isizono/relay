@@ -212,6 +212,42 @@ def _decode_envelope(request: httpx.Request) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# _classify_response の 400 分岐（復号失敗 DLQ vs それ以外 retryable）
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyResponse400Handling:
+    """`_classify_response` を直接呼び、400 応答の DLQ / retryable 分岐を検証する。"""
+
+    def test_decrypt_failure_code_classifies_as_dlq(self):
+        response = httpx.Response(
+            400, json={"code": "FederationEnvelopeDecryptError", "message": "decrypt failed"}
+        )
+        outcome, dlq_error_code, retry_after = federation_egress._classify_response(response)
+        assert outcome == federation_egress._OUTCOME_DLQ
+        assert dlq_error_code == federation_egress.DLQ_ERROR_PEER_DECRYPT_FAILED
+        assert retry_after is None
+
+    def test_other_error_code_classifies_as_retryable(self):
+        response = httpx.Response(400, json={"code": "InvalidRequestError", "message": "nope"})
+        outcome, dlq_error_code, retry_after = federation_egress._classify_response(response)
+        assert outcome == federation_egress._OUTCOME_RETRY
+        assert dlq_error_code is None
+
+    def test_non_json_body_classifies_as_retryable(self):
+        response = httpx.Response(400, content=b"not json")
+        outcome, dlq_error_code, retry_after = federation_egress._classify_response(response)
+        assert outcome == federation_egress._OUTCOME_RETRY
+        assert dlq_error_code is None
+
+    def test_json_body_without_code_field_classifies_as_retryable(self):
+        response = httpx.Response(400, json={"message": "missing code field"})
+        outcome, dlq_error_code, retry_after = federation_egress._classify_response(response)
+        assert outcome == federation_egress._OUTCOME_RETRY
+        assert dlq_error_code is None
+
+
+# ---------------------------------------------------------------------------
 # 応答コード別処理（エッジケース #1-#9）
 # ---------------------------------------------------------------------------
 
@@ -308,6 +344,49 @@ class TestResponseCodeHandling:
         dlq = _dlq_rows(settings, "orch:collab", "orch@bob")
         assert len(dlq) == 1
         assert dlq[0]["error_code"] == federation_egress.DLQ_ERROR_PEER_REJECTED_TOO_LARGE
+
+    def test_400_decrypt_failure_moves_to_dlq_end_to_end(
+        self, monkeypatch, settings, app_state, pinned_bob
+    ):
+        """復号失敗（400 + FederationEnvelopeDecryptError）は再送しても直らないため
+        DLQ（PeerDecryptFailed）へ移動し、レーンをブロックし続けない。"""
+        registry = StreamRegistry()
+        registry.create("orch:collab", "orch", None)
+        registry.put_member("orch:collab", "orch@bob", "read")
+        _publish(settings, "orch:collab", "orch@bob")
+
+        def handler(request):
+            return httpx.Response(
+                400, json={"code": "FederationEnvelopeDecryptError", "message": "decrypt failed"}
+            )
+
+        _patch_transport(monkeypatch, handler)
+        _run(_run_egress(app_state, settings, registry))
+
+        assert _outbox_rows(settings, "orch:collab", "orch@bob") == []
+        dlq = _dlq_rows(settings, "orch:collab", "orch@bob")
+        assert len(dlq) == 1
+        assert dlq[0]["error_code"] == federation_egress.DLQ_ERROR_PEER_DECRYPT_FAILED
+
+    def test_400_other_reason_is_retryable_end_to_end(
+        self, monkeypatch, settings, app_state, pinned_bob
+    ):
+        """400 応答でも復号失敗以外（code 不一致）は従来通りリトライ対象として残す。"""
+        registry = StreamRegistry()
+        registry.create("orch:collab", "orch", None)
+        registry.put_member("orch:collab", "orch@bob", "read")
+        _publish(settings, "orch:collab", "orch@bob")
+
+        def handler(request):
+            return httpx.Response(400, json={"code": "InvalidRequestError", "message": "nope"})
+
+        _patch_transport(monkeypatch, handler)
+        _run(_run_egress(app_state, settings, registry))
+
+        rows = _outbox_rows(settings, "orch:collab", "orch@bob")
+        assert len(rows) == 1
+        assert rows[0]["attempt_count"] == 1
+        assert _dlq_rows(settings, "orch:collab", "orch@bob") == []
 
     def test_401_is_retryable_regardless_of_reason(
         self, monkeypatch, settings, app_state, pinned_bob
@@ -925,6 +1004,41 @@ class TestEnvelopeBodyEncryption:
         envelope = captured["envelope"]
         assert envelope["body"] == "plain payload 2"
         assert "body_jwe" not in envelope
+
+    def test_oversized_body_is_dlqd_without_sending(
+        self, monkeypatch, settings, app_state, pinned_bob, enc_keypair_a, enc_keypair_b
+    ):
+        """暗号化対象の平文が上限（`MAX_ENVELOPE_PLAINTEXT_BYTES`）を超える場合、暗号化しても
+        相手側の復号が必ず失敗するため、ネットワーク送信を試みず直接 DLQ
+        （PeerBodyTooLargeForEncryption）へ回す。"""
+        import dataclasses
+
+        settings = dataclasses.replace(settings, jwe_private_key_pem=enc_keypair_a["private_pem"])
+        app_state.settings = settings
+        federation_peers.set_peer_enc_key(
+            settings.db_path, fingerprint=pinned_bob, enc_key_jwk=enc_keypair_b["public_jwk"]
+        )
+
+        registry = StreamRegistry()
+        registry.create("orch:collab", "orch", None)
+        registry.put_member("orch:collab", "orch@bob", "read")
+        oversized_body = "a" * (federation_peers.MAX_ENVELOPE_PLAINTEXT_BYTES + 1)
+        _publish(settings, "orch:collab", "orch@bob", body=oversized_body)
+
+        called = {"n": 0}
+
+        def handler(request):
+            called["n"] += 1
+            return httpx.Response(202)
+
+        _patch_transport(monkeypatch, handler)
+        _run(_run_egress(app_state, settings, registry))
+
+        assert called["n"] == 0  # ネットワーク送信を試みていない
+        assert _outbox_rows(settings, "orch:collab", "orch@bob") == []
+        dlq = _dlq_rows(settings, "orch:collab", "orch@bob")
+        assert len(dlq) == 1
+        assert dlq[0]["error_code"] == federation_egress.DLQ_ERROR_BODY_TOO_LARGE_FOR_ENCRYPTION
 
 
 # ---------------------------------------------------------------------------

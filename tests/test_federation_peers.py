@@ -458,6 +458,40 @@ class TestEnvelopeEncryptionRoundTrip:
                 tampered, private_key_pem=enc_keypair["private_pem"]
             )
 
+    def test_header_kid_matches_public_key_fingerprint(self, enc_keypair):
+        import base64
+        import json
+
+        ciphertext = federation_peers.encrypt_envelope_body(
+            "hi", public_key_jwk=enc_keypair["public_jwk"]
+        )
+        header_b64 = ciphertext.split(".")[0]
+        padded = header_b64 + "=" * (-len(header_b64) % 4)
+        header = json.loads(base64.urlsafe_b64decode(padded))
+        assert header["kid"] == federation_peers.compute_fingerprint(enc_keypair["public_jwk"])
+
+
+class TestEnvelopePlaintextSizeLimit:
+    """`encrypt_envelope_body` の暗号化前サイズ上限（joserfc の max_ciphertext_length=65536
+    バイトから逆算した平文 49152 バイト上限）を検証する。"""
+
+    def test_exactly_at_limit_succeeds_and_round_trips(self, enc_keypair):
+        plaintext = "a" * federation_peers.MAX_ENVELOPE_PLAINTEXT_BYTES
+        ciphertext = federation_peers.encrypt_envelope_body(
+            plaintext, public_key_jwk=enc_keypair["public_jwk"]
+        )
+        decrypted = federation_peers.decrypt_envelope_body(
+            ciphertext, private_key_pem=enc_keypair["private_pem"]
+        )
+        assert decrypted == plaintext
+
+    def test_one_byte_over_limit_raises_without_encrypting(self, enc_keypair):
+        plaintext = "a" * (federation_peers.MAX_ENVELOPE_PLAINTEXT_BYTES + 1)
+        with pytest.raises(federation_peers.EnvelopeTooLargeForEncryptionError):
+            federation_peers.encrypt_envelope_body(
+                plaintext, public_key_jwk=enc_keypair["public_jwk"]
+            )
+
 
 class TestSetPeerEncKey:
     def test_updates_existing_peer(self, db_path, keypair, enc_keypair):

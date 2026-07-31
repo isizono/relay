@@ -32,6 +32,9 @@ cycle 内で後続の `publish_id` を送らない（順序保証）。成功が
 | 202 | outbox 行 DELETE（責任移転） |
 | 410 | 即 DLQ（`PeerStreamGone`） |
 | 413 | 即 DLQ（`PeerRejectedTooLarge`） |
+| 400（body の `code` が `FederationEnvelopeDecryptError`） | 即 DLQ（`PeerDecryptFailed`）。
+  鍵が揃うか本文サイズが縮まない限り再送しても直らないため retryable にしない |
+| 400（それ以外、JSON parse 失敗時含む） | retryable backoff |
 | 429 | `Retry-After` に従い backoff |
 | 404 / 401 / 5xx / 接続不能 / タイムアウト / その他未分類 | retryable backoff（一時的障害として扱う。
   401 は時刻ずれ・署名不正等の原因を区別せず一律この扱いとする） |
@@ -59,6 +62,11 @@ envelope の `body`（メッセージ本文）は、自分に `Settings.jwe_priv
 片側未対応 peer との共存を壊さないフォールバック）。`origin_stream_id` / `origin_publish_id`
 / `from_sub` / `to_members` はいずれの場合も平文のまま送る（配達ルーティングに必要な
 メタデータであり、暗号化するとルーティング自体が機能しなくなるため対象外）。
+
+平文が `federation_peers.MAX_ENVELOPE_PLAINTEXT_BYTES` を超える場合、`encrypt_envelope_body`
+は暗号化を試みず `EnvelopeTooLargeForEncryptionError` を送出する。この場合ネットワーク送信
+自体を行わず、当該 `publish_id` を直接 DLQ（`PeerBodyTooLargeForEncryption`）へ回す（暗号化
+しても相手側の復号が必ず失敗するサイズのため、送っても無駄になる）。
 """
 from __future__ import annotations
 
@@ -71,6 +79,7 @@ import httpx
 
 from relay import federation_auth, federation_net, federation_peers, observability
 from relay.config import Settings
+from relay.errors import FEDERATION_ENVELOPE_DECRYPT_FAILED
 from relay_sdk.backoff import full_jitter
 
 # Full Jitter backoff パラメータ（relay_sdk 側 outbox dispatcher の既定値と同一、
@@ -83,6 +92,8 @@ FEDERATION_EGRESS_BACKOFF_CAP_SECONDS = 300.0
 DLQ_ERROR_PEER_STREAM_GONE = "PeerStreamGone"
 DLQ_ERROR_PEER_REJECTED_TOO_LARGE = "PeerRejectedTooLarge"
 DLQ_ERROR_PEER_REVOKED = "PeerRevoked"
+DLQ_ERROR_PEER_DECRYPT_FAILED = "PeerDecryptFailed"
+DLQ_ERROR_BODY_TOO_LARGE_FOR_ENCRYPTION = "PeerBodyTooLargeForEncryption"
 
 _OUTCOME_SUCCESS = "success"
 _OUTCOME_RETRY = "retry"
@@ -188,6 +199,17 @@ def _classify_response(response: httpx.Response) -> tuple[str, str | None, float
         return _OUTCOME_DLQ, DLQ_ERROR_PEER_REJECTED_TOO_LARGE, None
     if status == 429:
         return _OUTCOME_RETRY, None, _parse_retry_after(response)
+    if status == 400:
+        # 復号失敗（FederationEnvelopeDecryptError）は鍵が揃うか本文サイズが縮まない限り
+        # 再送しても直らないため DLQ に回す。それ以外の 400（JSON parse 失敗・code 不一致を
+        # 含む）は fail-safe に従来通り retryable のままにする。
+        try:
+            body = response.json()
+        except Exception:
+            body = None
+        if isinstance(body, dict) and body.get("code") == FEDERATION_ENVELOPE_DECRYPT_FAILED:
+            return _OUTCOME_DLQ, DLQ_ERROR_PEER_DECRYPT_FAILED, None
+        return _OUTCOME_RETRY, None, None
     # 404 / 401 / 5xx / その他未分類は一律 retryable（一時的障害として扱う。401 は
     # ts_skew・署名不正等の原因を区別しない、plan 明記のユーザー裁定）。
     return _OUTCOME_RETRY, None, None
@@ -332,9 +354,21 @@ async def _process_lane(
         # 暗号化鍵の両方が揃っているときだけ暗号化し、揃わなければ平文にフォールバックする。
         peer_enc_key_jwk = peer["enc_key_jwk"]
         if settings.jwe_private_key_pem and peer_enc_key_jwk is not None:
-            envelope["body_jwe"] = federation_peers.encrypt_envelope_body(
-                body_text, public_key_jwk=peer_enc_key_jwk
-            )
+            try:
+                envelope["body_jwe"] = federation_peers.encrypt_envelope_body(
+                    body_text, public_key_jwk=peer_enc_key_jwk
+                )
+            except federation_peers.EnvelopeTooLargeForEncryptionError:
+                # 暗号化しても相手側の復号が必ず失敗するサイズのため、ネットワーク送信を
+                # 試みず直接 DLQ へ回す（先頭が dead 化されたのでこのレーンは打ち切る）。
+                for row in group_rows:
+                    _dlq_federation_row(
+                        db_conn,
+                        row,
+                        error_code=DLQ_ERROR_BODY_TOO_LARGE_FOR_ENCRYPTION,
+                        app_state=app_state,
+                    )
+                break
         else:
             envelope["body"] = body_text
 
