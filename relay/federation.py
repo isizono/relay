@@ -44,6 +44,7 @@ MAX_REDEEM_BODY_BYTES = 4096
 
 REDEEM_SIG_TYP = "relay-fed-redeem"
 REDEEM_RESP_SIG_TYP = "relay-fed-redeem-resp"
+REGISTER_ENC_KEY_RESP_SIG_TYP = "relay-fed-enc-key-resp"
 
 
 def _now_iso() -> str:
@@ -277,6 +278,18 @@ async def register_enc_key(request: Request) -> Response:
     resp: dict[str, Any] = {"handle": peer.handle}
     if settings.jwe_private_key_pem:
         resp["enc_key"] = federation_peers.public_enc_jwk_from_pem(settings.jwe_private_key_pem)
+
+    # 応答に detached JWS 署名を付ける。中間者が無署名の enc_key を差し替えて相手鍵を
+    # 詐称できないよう、呼び出し側は既に pin 済みの key_jwk（redeem 時に確立済み）で
+    # 検証してから pin する（redeem_peer の応答署名パターンと同型）。
+    resp_sig_payload: dict[str, Any] = {
+        "typ": REGISTER_ENC_KEY_RESP_SIG_TYP,
+        "handle": peer.handle,
+        "enc_key": resp.get("enc_key"),
+    }
+    resp["sig"] = federation_peers.sign_detached(
+        resp_sig_payload, private_key_pem=settings.jws_private_key_pem
+    )
     return JSONResponse(resp, status_code=200)
 
 

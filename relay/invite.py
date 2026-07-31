@@ -485,6 +485,18 @@ def _cmd_peer_enc_key(args: argparse.Namespace) -> int:
         print("応答が JSON object ではありません。相手の enc_key は pin しません。", file=sys.stderr)
         return 1
 
+    # 応答の署名検証: 既に pin 済みの相手の署名鍵（peer["key_jwk"]、redeem 時に確立済み）で
+    # 検証する。無署名の応答をそのまま信頼すると、中間者が enc_key を差し替えても検知できない。
+    resp_sig = resp_body.get("sig")
+    verify_payload = {
+        "typ": "relay-fed-enc-key-resp",
+        "handle": resp_body.get("handle"),
+        "enc_key": resp_body.get("enc_key"),
+    }
+    if not federation_peers.verify_detached(verify_payload, resp_sig, public_key=peer["key_jwk"]):
+        print("応答の署名検証に失敗しました。相手の enc_key は pin しません。", file=sys.stderr)
+        return 1
+
     print(f"自分の enc_key を peer '{args.handle}' へ登録しました")
 
     resp_enc_key = resp_body.get("enc_key")

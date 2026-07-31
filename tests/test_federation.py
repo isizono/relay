@@ -495,6 +495,27 @@ class TestEncKeyEndpoint:
         )
         return fp
 
+    def test_response_signature_verifies_with_own_public_key(
+        self, client, settings, keypair_b, enc_keypair_b, pinned_bob
+    ):
+        """応答に含まれる detached JWS 署名が A 自身の公開鍵で検証できること
+        （呼び出し側 CLI がこの鍵で相手の enc_key を検証してから pin する前提）。"""
+        r = _post_enc_key(
+            client,
+            settings=settings,
+            sender_keypair=keypair_b,
+            body={"enc_key": enc_keypair_b["public_jwk"]},
+        )
+        assert r.status_code == 200
+        resp = r.json()
+        verify_payload = {
+            "typ": "relay-fed-enc-key-resp",
+            "handle": resp["handle"],
+            "enc_key": resp.get("enc_key"),
+        }
+        own_jwk = federation_peers.public_jwk_from_pem(settings.jws_private_key_pem)
+        assert federation_peers.verify_detached(verify_payload, resp["sig"], public_key=own_jwk)
+
     def test_registers_callers_enc_key_without_redoing_invite(
         self, client, settings, keypair_b, enc_keypair_b, pinned_bob
     ):
