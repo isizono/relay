@@ -1,7 +1,7 @@
 """relay.federation_peers テストスイート。
 
 peer pin CRUD・招待 token の発行/一回性消費（並行 redeem 競合含む）・
-RFC 7638 JWK thumbprint 計算・detached JWS の署名/検証を検証する。
+RFC 7638 JWK thumbprint 計算・detached JWS の署名/検証・envelope 暗号化（JWE）を検証する。
 並行性テストは tests/test_credentials.py の並行 redeem パターンを踏襲する。
 """
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import threading
 
 import pytest
+from joserfc import jwe
 from joserfc.jwk import ECKey
 
 from relay import db, federation_peers
@@ -27,6 +28,17 @@ def keypair():
     return {
         "private_pem": private.as_pem(private=True).decode("ascii"),
         "public_jwk": private.as_dict(private=False),
+    }
+
+
+@pytest.fixture()
+def enc_keypair():
+    """envelope 暗号化用（ECDH-ES, P-256）の鍵ペア。署名鍵とは無関係の別鍵。"""
+    private = ECKey.generate_key("P-256", private=True)
+    return {
+        "private_pem": private.as_pem(private=True).decode("ascii"),
+        "public_jwk": private.as_dict(private=False),
+        "key": private,
     }
 
 
@@ -98,6 +110,27 @@ class TestSignAndVerifyDetached:
         sig = federation_peers.sign_detached(payload, private_key_pem=keypair["private_pem"])
         other_pub = ECKey.generate_key("P-256", private=True).as_dict(private=False)
         assert not federation_peers.verify_detached(payload, sig, public_key=other_pub)
+
+    def test_verify_fails_for_tampered_nested_field(self, keypair):
+        """payload にネストした dict（card 等）が含まれる場合、その内部フィールドの
+        改竄も検出できる（redeem リクエストの card 署名対象化が前提とする性質）。"""
+        payload = {
+            "typ": "relay-fed-redeem",
+            "token": "pi_abc",
+            "ts": 1000,
+            "a_fp": "fp",
+            "card": {"key": {"kty": "EC"}, "locator": "https://relay-b.example"},
+        }
+        sig = federation_peers.sign_detached(payload, private_key_pem=keypair["private_pem"])
+        assert federation_peers.verify_detached(payload, sig, public_key=keypair["public_jwk"])
+
+        tampered = {
+            **payload,
+            "card": {**payload["card"], "locator": "https://attacker.example"},
+        }
+        assert not federation_peers.verify_detached(
+            tampered, sig, public_key=keypair["public_jwk"]
+        )
 
     def test_verify_fails_for_malformed_sig_structure(self, keypair):
         payload = {"typ": "relay-fed-redeem", "token": "pi_abc", "ts": 1000, "a_fp": "fp"}
@@ -282,3 +315,216 @@ class TestPeerInviteLifecycle:
         losers = [r for r in results if r is None]
         assert len(winners) == 1
         assert len(losers) == n_threads - 1
+
+
+class TestPublicEncJwkFromPem:
+    def test_returns_public_jwk_with_enc_use_and_no_private_component(self, enc_keypair):
+        jwk = federation_peers.public_enc_jwk_from_pem(enc_keypair["private_pem"])
+        assert "d" not in jwk
+        assert jwk["kty"] == "EC"
+        assert jwk["use"] == "enc"
+
+    def test_differs_from_signing_jwk_only_by_use(self, enc_keypair):
+        """`public_jwk_from_pem`（署名鍵用）は `use` を付与しない。取り違え検出の前提。"""
+        signing_view = federation_peers.public_jwk_from_pem(enc_keypair["private_pem"])
+        assert "use" not in signing_view
+
+
+class TestValidateEncKeyJwk:
+    def test_accepts_valid_p256_public_jwk(self, enc_keypair):
+        federation_peers.validate_enc_key_jwk(enc_keypair["public_jwk"])
+
+    def test_rejects_non_dict(self):
+        with pytest.raises(ValueError):
+            federation_peers.validate_enc_key_jwk("not-a-dict")
+
+    def test_rejects_wrong_kty(self, enc_keypair):
+        bad = dict(enc_keypair["public_jwk"], kty="oct")
+        with pytest.raises(ValueError):
+            federation_peers.validate_enc_key_jwk(bad)
+
+    def test_rejects_wrong_curve(self, enc_keypair):
+        bad = dict(enc_keypair["public_jwk"], crv="P-384")
+        with pytest.raises(ValueError):
+            federation_peers.validate_enc_key_jwk(bad)
+
+    def test_rejects_missing_coordinates(self, enc_keypair):
+        bad = {k: v for k, v in enc_keypair["public_jwk"].items() if k != "x"}
+        with pytest.raises(ValueError):
+            federation_peers.validate_enc_key_jwk(bad)
+
+    def test_rejects_private_component_leak(self, enc_keypair):
+        """秘密鍵成分 'd' が紛れ込んだ JWK は、事故での秘密鍵漏洩とみなして拒否する。"""
+        leaked = dict(enc_keypair["public_jwk"], d="super-secret")
+        with pytest.raises(ValueError):
+            federation_peers.validate_enc_key_jwk(leaked)
+
+
+class TestEnvelopeEncryptionRoundTrip:
+    """envelope body の暗号化/復号（ECDH-ES + A256GCM 固定）を検証する。"""
+
+    def test_round_trip_recovers_plaintext(self, enc_keypair):
+        ciphertext = federation_peers.encrypt_envelope_body(
+            "hello federation", public_key_jwk=enc_keypair["public_jwk"]
+        )
+        assert ciphertext != "hello federation"
+        plaintext = federation_peers.decrypt_envelope_body(
+            ciphertext, private_key_pem=enc_keypair["private_pem"]
+        )
+        assert plaintext == "hello federation"
+
+    def test_header_alg_and_enc_are_fixed(self, enc_keypair):
+        import base64
+        import json
+
+        ciphertext = federation_peers.encrypt_envelope_body(
+            "hi", public_key_jwk=enc_keypair["public_jwk"]
+        )
+        header_b64 = ciphertext.split(".")[0]
+        padded = header_b64 + "=" * (-len(header_b64) % 4)
+        header = json.loads(base64.urlsafe_b64decode(padded))
+        assert header["alg"] == federation_peers.JWE_ALG == "ECDH-ES"
+        assert header["enc"] == federation_peers.JWE_ENC == "A256GCM"
+        assert "zip" not in header
+
+    def test_round_trip_handles_non_ascii_body(self, enc_keypair):
+        plaintext = "こんにちは、これはテストです 🚀"
+        ciphertext = federation_peers.encrypt_envelope_body(
+            plaintext, public_key_jwk=enc_keypair["public_jwk"]
+        )
+        assert federation_peers.decrypt_envelope_body(
+            ciphertext, private_key_pem=enc_keypair["private_pem"]
+        ) == plaintext
+
+    def test_decrypt_with_wrong_key_fails(self, enc_keypair):
+        ciphertext = federation_peers.encrypt_envelope_body(
+            "hi", public_key_jwk=enc_keypair["public_jwk"]
+        )
+        other = ECKey.generate_key("P-256", private=True)
+        with pytest.raises(federation_peers.EnvelopeDecryptionError):
+            federation_peers.decrypt_envelope_body(
+                ciphertext, private_key_pem=other.as_pem(private=True).decode("ascii")
+            )
+
+    def test_decrypt_rejects_unexpected_enc(self, enc_keypair):
+        """enc が A256GCM 以外なら、鍵合意・復号を試みず拒否する（algorithm confusion 対策）。"""
+        crafted = jwe.encrypt_compact(
+            {"alg": "ECDH-ES", "enc": "A128GCM"},
+            "hi",
+            enc_keypair["key"],
+            algorithms=["ECDH-ES", "A128GCM"],
+        )
+        with pytest.raises(federation_peers.EnvelopeDecryptionError):
+            federation_peers.decrypt_envelope_body(
+                crafted, private_key_pem=enc_keypair["private_pem"]
+            )
+
+    def test_decrypt_rejects_unexpected_alg(self, enc_keypair):
+        """alg が ECDH-ES 以外（鍵ラップ亜種含む）なら拒否する。"""
+        crafted = jwe.encrypt_compact(
+            {"alg": "ECDH-ES+A256KW", "enc": "A256GCM"},
+            "hi",
+            enc_keypair["key"],
+            algorithms=["ECDH-ES+A256KW", "A256GCM"],
+        )
+        with pytest.raises(federation_peers.EnvelopeDecryptionError):
+            federation_peers.decrypt_envelope_body(
+                crafted, private_key_pem=enc_keypair["private_pem"]
+            )
+
+    def test_decrypt_rejects_zip_header(self, enc_keypair):
+        """zip 圧縮ヘッダが付与された JWE は許可リストに zip 名が無いため拒否される
+        （圧縮+暗号化の既知サイドチャネル対策、CRIME 型攻撃を作らない）。"""
+        crafted = jwe.encrypt_compact(
+            {"alg": "ECDH-ES", "enc": "A256GCM", "zip": "DEF"},
+            "hi" * 50,
+            enc_keypair["key"],
+            algorithms=["ECDH-ES", "A256GCM", "DEF"],
+        )
+        with pytest.raises(federation_peers.EnvelopeDecryptionError):
+            federation_peers.decrypt_envelope_body(
+                crafted, private_key_pem=enc_keypair["private_pem"]
+            )
+
+    def test_decrypt_rejects_tampered_ciphertext(self, enc_keypair):
+        ciphertext = federation_peers.encrypt_envelope_body(
+            "hi", public_key_jwk=enc_keypair["public_jwk"]
+        )
+        parts = ciphertext.split(".")
+        parts[3] = parts[3][:-1] + ("A" if parts[3][-1] != "A" else "B")
+        tampered = ".".join(parts)
+        with pytest.raises(federation_peers.EnvelopeDecryptionError):
+            federation_peers.decrypt_envelope_body(
+                tampered, private_key_pem=enc_keypair["private_pem"]
+            )
+
+    def test_header_kid_matches_public_key_fingerprint(self, enc_keypair):
+        import base64
+        import json
+
+        ciphertext = federation_peers.encrypt_envelope_body(
+            "hi", public_key_jwk=enc_keypair["public_jwk"]
+        )
+        header_b64 = ciphertext.split(".")[0]
+        padded = header_b64 + "=" * (-len(header_b64) % 4)
+        header = json.loads(base64.urlsafe_b64decode(padded))
+        assert header["kid"] == federation_peers.compute_fingerprint(enc_keypair["public_jwk"])
+
+
+class TestEnvelopePlaintextSizeLimit:
+    """`encrypt_envelope_body` の暗号化前サイズ上限（joserfc の max_ciphertext_length=65536
+    バイトから逆算した平文 49152 バイト上限）を検証する。"""
+
+    def test_exactly_at_limit_succeeds_and_round_trips(self, enc_keypair):
+        plaintext = "a" * federation_peers.MAX_ENVELOPE_PLAINTEXT_BYTES
+        ciphertext = federation_peers.encrypt_envelope_body(
+            plaintext, public_key_jwk=enc_keypair["public_jwk"]
+        )
+        decrypted = federation_peers.decrypt_envelope_body(
+            ciphertext, private_key_pem=enc_keypair["private_pem"]
+        )
+        assert decrypted == plaintext
+
+    def test_one_byte_over_limit_raises_without_encrypting(self, enc_keypair):
+        plaintext = "a" * (federation_peers.MAX_ENVELOPE_PLAINTEXT_BYTES + 1)
+        with pytest.raises(federation_peers.EnvelopeTooLargeForEncryptionError):
+            federation_peers.encrypt_envelope_body(
+                plaintext, public_key_jwk=enc_keypair["public_jwk"]
+            )
+
+
+class TestSetPeerEncKey:
+    def test_updates_existing_peer(self, db_path, keypair, enc_keypair):
+        fp = federation_peers.compute_fingerprint(keypair["public_jwk"])
+        federation_peers.add_peer(
+            db_path, handle="bob", fingerprint=fp, key_jwk=keypair["public_jwk"], locator="https://x"
+        )
+        peer = federation_peers.get_peer_by_fingerprint(db_path, fp)
+        assert peer["enc_key_jwk"] is None
+
+        updated = federation_peers.set_peer_enc_key(
+            db_path, fingerprint=fp, enc_key_jwk=enc_keypair["public_jwk"]
+        )
+        assert updated is True
+
+        peer = federation_peers.get_peer_by_fingerprint(db_path, fp)
+        assert peer["enc_key_jwk"] == enc_keypair["public_jwk"]
+
+    def test_unknown_fingerprint_returns_false(self, db_path, enc_keypair):
+        updated = federation_peers.set_peer_enc_key(
+            db_path, fingerprint="does-not-exist", enc_key_jwk=enc_keypair["public_jwk"]
+        )
+        assert updated is False
+
+    def test_add_peer_accepts_enc_key_jwk_at_pin_time(self, db_path, keypair, enc_keypair):
+        fp = federation_peers.compute_fingerprint(keypair["public_jwk"])
+        federation_peers.add_peer(
+            db_path,
+            handle="bob",
+            fingerprint=fp,
+            key_jwk=keypair["public_jwk"],
+            locator="https://x",
+            enc_key_jwk=enc_keypair["public_jwk"],
+        )
+        peer = federation_peers.get_peer_by_fingerprint(db_path, fp)
+        assert peer["enc_key_jwk"] == enc_keypair["public_jwk"]

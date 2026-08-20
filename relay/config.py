@@ -108,6 +108,12 @@ class Settings:
     jws_kid: str | None = None
     jws_jku: str | None = None
 
+    # JWE 暗号化鍵（federation envelope body の E2E 暗号化用、ECDH-ES + A256GCM 固定）。
+    # jws_private_key_pem（署名・peer 認証用）とは意図的に別鍵にする（1 鍵 2 用途の流用を
+    # 避ける、federation-design-exploration.md の鍵分離方針）。未設定なら envelope 暗号化
+    # は行わず互換のため平文 body を送る（relay.federation_egress 参照）。
+    jwe_private_key_pem: str | None = None
+
     # 配達基盤（relay-v2-wire-api.md §6）
     dispatcher_poll_interval_seconds: float = DEFAULT_DISPATCHER_POLL_INTERVAL_SECONDS
     dispatcher_lock_path: str = DEFAULT_DISPATCHER_LOCK_PATH
@@ -197,6 +203,7 @@ def load_settings_from_env() -> Settings:
         jws_private_key_pem=os.environ.get("RELAY_JWS_PRIVATE_KEY_PEM"),
         jws_kid=os.environ.get("RELAY_JWS_KID"),
         jws_jku=os.environ.get("RELAY_JWS_JKU"),
+        jwe_private_key_pem=os.environ.get("RELAY_JWE_PRIVATE_KEY_PEM"),
         dispatcher_poll_interval_seconds=float(
             os.environ.get(
                 "RELAY_DISPATCHER_POLL_INTERVAL_SECONDS",

@@ -314,8 +314,17 @@ def _select_new_entries(
     ).fetchall()
 
 
-def _build_event_data(target_type: str, params: dict, row: sqlite3.Row) -> dict:
+def _build_event_data(
+    target_type: str, params: dict, row: sqlite3.Row, db_conn: sqlite3.Connection
+) -> dict:
+    """`GET /events` の SSE payload を組み立てる。
+
+    `publisher_identity` は `publish_log`（`row["publish_id"]` で引く）由来で、local 由来
+    （`@` を含まない）と federation 由来（`sub@handle` 形式）をそのまま配達先へ伝える
+    （relay-v2-wire-api.md §5.5）。publish_log 行が見当たらない場合は `None`。
+    """
     delivered_at = _now_iso()
+    publisher_identity = federation_egress.lookup_publisher_identity(db_conn, row["publish_id"])
     if target_type == "subscription":
         decoded = json.loads(bytes(row["payload"]).decode("utf-8"))
         labels = json.loads(row["labels"]) if row["labels"] else []
@@ -325,12 +334,14 @@ def _build_event_data(target_type: str, params: dict, row: sqlite3.Row) -> dict:
             "ref": decoded.get("ref"),
             "labels": labels,
             "title": decoded.get("title"),
+            "publisher_identity": publisher_identity,
             "delivered_at": delivered_at,
         }
     return {
         "delivery_target": f"stream:{params['stream_id']}",
         "publish_id": row["publish_id"],
         "body": bytes(row["payload"]).decode("utf-8"),
+        "publisher_identity": publisher_identity,
         "delivered_at": delivered_at,
     }
 
@@ -388,7 +399,7 @@ async def _dispatch_to_connections(app_state, db_conn: sqlite3.Connection) -> No
                 for row in rows:
                     event_dict = {
                         "publish_id": row["publish_id"],
-                        "data": _build_event_data(target_type, params, row),
+                        "data": _build_event_data(target_type, params, row, db_conn),
                     }
                     ok = await _push_with_retry(conn, event_dict, app_state)
                     if ok:

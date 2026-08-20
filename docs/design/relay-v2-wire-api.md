@@ -322,6 +322,9 @@ data: {
   labels?,                // subscription レーンのとき
   body?,                  // 場レーンのとき（不透明 body）
   title?,
+  publisher_identity,     // string。送信者識別子。local 由来は "@" を含まない
+                          // （例: "cc-memory"）、federation 由来は "sub@handle" 形式
+                          // （例: "orch@alice"）。両レーン共通
   delivered_at
 }
 ```

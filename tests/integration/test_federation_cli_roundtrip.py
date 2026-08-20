@@ -166,3 +166,172 @@ class TestPeerNewRedeemRoundTrip:
 
         assert rc != 0
         assert federation_peers.get_peer_by_handle(db_b, "alice") is None
+
+
+class TestPeerEncKeyRoundTrip:
+    """`peer enc-key` の E2E テスト（実 2 relay 間、既存 pin をやり直さない鍵追加登録）。
+
+    `peer redeem` と異なり `peer enc-key` は既存 peer の locator へ実際に POST するため、
+    呼び出し先（B）も実サーバーとして起動する必要がある（redeem テストは B が CLI クライアント
+    としてのみ動けば足りたが、こちらは双方向）。
+    """
+
+    def _mutual_pin_via_redeem(
+        self, *, monkeypatch, capsys, app_a, app_b, base_url_a, base_url_b, db_a, db_b, key_a_pem, key_b_pem
+    ) -> None:
+        monkeypatch.setenv("RELAY_JWS_PRIVATE_KEY_PEM", key_a_pem)
+        rc = invite.main(
+            ["peer", "new", "--handle", "bob", "--db", db_a, "--base-url", base_url_a]
+        )
+        assert rc == 0
+        invite_url = capsys.readouterr().out.strip()
+
+        monkeypatch.setenv("RELAY_JWS_PRIVATE_KEY_PEM", key_b_pem)
+        rc = invite.main(
+            [
+                "peer",
+                "redeem",
+                invite_url,
+                "--handle",
+                "alice",
+                "--db",
+                db_b,
+                "--base-url",
+                base_url_b,
+            ]
+        )
+        capsys.readouterr()
+        assert rc == 0
+
+    def test_single_call_pins_both_sides_when_both_configured(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """B が既に暗号化鍵を持っていれば、A → B の 1 回の `peer enc-key` 呼び出しだけで
+        双方向に鍵が揃う（応答で B の鍵を返すため、A 側の CLI がその場で pin する）。
+        """
+        key_a_pem = _generate_private_pem()
+        key_b_pem = _generate_private_pem()
+        enc_key_a_pem = _generate_private_pem()
+        enc_key_b_pem = _generate_private_pem()
+        db_a = str(tmp_path / "enc_a.db")
+        db_b = str(tmp_path / "enc_b.db")
+
+        settings_a = Settings(
+            db_path=db_a,
+            server_log_path=str(tmp_path / "enc_a.jsonl"),
+            dispatcher_lock_path=str(tmp_path / "enc_a.lock"),
+            jws_private_key_pem=key_a_pem,
+            federation_allow_private_locators=True,
+        )
+        settings_b = Settings(
+            db_path=db_b,
+            server_log_path=str(tmp_path / "enc_b.jsonl"),
+            dispatcher_lock_path=str(tmp_path / "enc_b.lock"),
+            jws_private_key_pem=key_b_pem,
+            federation_allow_private_locators=True,
+        )
+        app_a = create_app(settings_a)
+        app_b = create_app(settings_b)
+
+        with LiveServer(app_a) as base_url_a, LiveServer(app_b) as base_url_b:
+            # 動的ポート確定後に base_url / 暗号化鍵を反映する（peer redeem テストの
+            # base_url 反映パターンと同型）。
+            app_a.state.settings = dataclasses.replace(
+                settings_a, federation_base_url=base_url_a, jwe_private_key_pem=enc_key_a_pem
+            )
+            app_b.state.settings = dataclasses.replace(
+                settings_b, federation_base_url=base_url_b, jwe_private_key_pem=enc_key_b_pem
+            )
+
+            self._mutual_pin_via_redeem(
+                monkeypatch=monkeypatch,
+                capsys=capsys,
+                app_a=app_a,
+                app_b=app_b,
+                base_url_a=base_url_a,
+                base_url_b=base_url_b,
+                db_a=db_a,
+                db_b=db_b,
+                key_a_pem=key_a_pem,
+                key_b_pem=key_b_pem,
+            )
+
+            # A: peer enc-key --handle bob（A 自身の署名鍵・暗号化鍵を使う）。
+            monkeypatch.setenv("RELAY_JWS_PRIVATE_KEY_PEM", key_a_pem)
+            monkeypatch.setenv("RELAY_JWE_PRIVATE_KEY_PEM", enc_key_a_pem)
+            rc = invite.main(["peer", "enc-key", "--handle", "bob", "--db", db_a])
+            captured = capsys.readouterr()
+            assert rc == 0, f"out={captured.out!r} err={captured.err!r}"
+
+        # A 側: bob（B）の enc_key が 1 回の呼び出しで pin されている（応答経由）。
+        peer_on_a = federation_peers.get_peer_by_handle(db_a, "bob")
+        assert peer_on_a["enc_key_jwk"] == federation_peers.public_enc_jwk_from_pem(enc_key_b_pem)
+
+        # B 側: alice（A）の enc_key も同じ呼び出しで pin されている（request body 経由）。
+        peer_on_b = federation_peers.get_peer_by_handle(db_b, "alice")
+        assert peer_on_b["enc_key_jwk"] == federation_peers.public_enc_jwk_from_pem(enc_key_a_pem)
+
+        # 署名鍵・locator 等の既存 pin は無傷（招待をやり直していない）。
+        assert peer_on_a["locator"] == base_url_b
+        assert peer_on_b["locator"] == base_url_a
+
+    def test_pins_only_caller_side_when_peer_not_yet_configured(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """B がまだ暗号化鍵を設定していない場合（片側だけロールアウト済みの過渡状態）、
+        B 側には A の鍵が登録されるが、A 側は pin すべき enc_key を貰えないため未設定のまま。
+        """
+        key_a_pem = _generate_private_pem()
+        key_b_pem = _generate_private_pem()
+        enc_key_a_pem = _generate_private_pem()
+        db_a = str(tmp_path / "enc_a2.db")
+        db_b = str(tmp_path / "enc_b2.db")
+
+        settings_a = Settings(
+            db_path=db_a,
+            server_log_path=str(tmp_path / "enc_a2.jsonl"),
+            dispatcher_lock_path=str(tmp_path / "enc_a2.lock"),
+            jws_private_key_pem=key_a_pem,
+            federation_allow_private_locators=True,
+        )
+        settings_b = Settings(
+            db_path=db_b,
+            server_log_path=str(tmp_path / "enc_b2.jsonl"),
+            dispatcher_lock_path=str(tmp_path / "enc_b2.lock"),
+            jws_private_key_pem=key_b_pem,
+            federation_allow_private_locators=True,
+        )
+        app_a = create_app(settings_a)
+        app_b = create_app(settings_b)
+
+        with LiveServer(app_a) as base_url_a, LiveServer(app_b) as base_url_b:
+            app_a.state.settings = dataclasses.replace(
+                settings_a, federation_base_url=base_url_a, jwe_private_key_pem=enc_key_a_pem
+            )
+            # B は暗号化鍵未設定のまま（federation_base_url だけ反映する）。
+            app_b.state.settings = dataclasses.replace(settings_b, federation_base_url=base_url_b)
+
+            self._mutual_pin_via_redeem(
+                monkeypatch=monkeypatch,
+                capsys=capsys,
+                app_a=app_a,
+                app_b=app_b,
+                base_url_a=base_url_a,
+                base_url_b=base_url_b,
+                db_a=db_a,
+                db_b=db_b,
+                key_a_pem=key_a_pem,
+                key_b_pem=key_b_pem,
+            )
+
+            monkeypatch.setenv("RELAY_JWS_PRIVATE_KEY_PEM", key_a_pem)
+            monkeypatch.setenv("RELAY_JWE_PRIVATE_KEY_PEM", enc_key_a_pem)
+            rc = invite.main(["peer", "enc-key", "--handle", "bob", "--db", db_a])
+            captured = capsys.readouterr()
+            assert rc == 0, f"out={captured.out!r} err={captured.err!r}"
+
+        peer_on_a = federation_peers.get_peer_by_handle(db_a, "bob")
+        assert peer_on_a["enc_key_jwk"] is None  # B が未設定なので貰いようがない。
+
+        peer_on_b = federation_peers.get_peer_by_handle(db_b, "alice")
+        assert peer_on_b["enc_key_jwk"] == federation_peers.public_enc_jwk_from_pem(enc_key_a_pem)

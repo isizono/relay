@@ -224,6 +224,70 @@ def _future_iso(seconds: int = 3600) -> str:
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _insert_correlated_subscription_outbox_row(
+    settings: Settings, subscription_id: str, *, publisher_identity: str, labels=("x",)
+) -> int:
+    """publish_log の AUTOINCREMENT publish_id と outbox.publish_id を実際に対応させて 1 件挿入する。
+
+    `_insert_subscription_outbox_row` は outbox.publish_id を呼び出し側が明示指定するため
+    publish_log の実際の publish_id とは独立（cursor 前進検証等、意図的な単純化）。
+    `publisher_identity` の lookup（publish_id 経由の JOIN 相当）を検証するテストは実際の対応が
+    必要なため、この helper を使う。
+    """
+    conn = db.get_connection(settings.db_path)
+    try:
+        cur = conn.execute(
+            "INSERT INTO publish_log (lane, stream_id, publisher_identity, enqueued_at)"
+            " VALUES ('subscription', NULL, ?, ?)",
+            (publisher_identity, delivery._now_iso()),
+        )
+        publish_id = cur.lastrowid
+        payload = json.dumps(
+            {"ref": {"type": "decision", "id": publish_id}, "title": None}
+        ).encode()
+        conn.execute(
+            "INSERT INTO outbox"
+            " (target_type, subscription_id, publish_id, payload, labels, enqueued_at, expires_at)"
+            " VALUES ('subscription', ?, ?, ?, ?, ?, ?)",
+            (
+                subscription_id,
+                publish_id,
+                payload,
+                json.dumps(list(labels)),
+                delivery._now_iso(),
+                _future_iso(),
+            ),
+        )
+        conn.commit()
+        return publish_id
+    finally:
+        conn.close()
+
+
+def _insert_correlated_stream_outbox_row(
+    settings: Settings, stream_id: str, member_identity: str, *, publisher_identity: str, body: bytes = b"hello"
+) -> int:
+    """`_insert_correlated_subscription_outbox_row` の stream レーン版。"""
+    conn = db.get_connection(settings.db_path)
+    try:
+        cur = conn.execute(
+            "INSERT INTO publish_log (lane, stream_id, publisher_identity, enqueued_at)"
+            " VALUES ('stream', ?, ?, ?)",
+            (stream_id, publisher_identity, delivery._now_iso()),
+        )
+        publish_id = cur.lastrowid
+        conn.execute(
+            "INSERT INTO outbox"
+            " (target_type, stream_id, member_identity, publish_id, payload, enqueued_at, expires_at)"
+            " VALUES ('stream', ?, ?, ?, ?, ?, ?)",
+            (stream_id, member_identity, publish_id, body, delivery._now_iso(), _future_iso()),
+        )
+        conn.commit()
+        return publish_id
+    finally:
+        conn.close()
+
+
 class TestDispatchOnce:
     def test_push_advances_cursor_and_fills_queue(self, settings):
         asyncio.run(self._run(settings))
@@ -299,6 +363,101 @@ class TestDispatchOnce:
         assert item["publish_id"] == 1
         assert item["data"]["body"] == "hello"
         assert item["data"]["delivery_target"] == "stream:s1"
+
+
+class TestPublisherIdentityInDeliveryPayload:
+    """配達ペイロード（`GET /events` の SSE data）に `publisher_identity` が乗ることを検証する。
+
+    local 由来（`@` を含まない識別子）と federation 由来（`sub@handle` 形式）を、subscription /
+    stream 両レーンで区別なく配達先へ伝える（relay-v2-wire-api.md §5.5）。
+    """
+
+    def test_subscription_lane_local_publisher_identity(self, settings):
+        asyncio.run(self._run_subscription(settings, publisher_identity="cc-memory"))
+
+    def test_subscription_lane_federation_publisher_identity(self, settings):
+        asyncio.run(self._run_subscription(settings, publisher_identity="orch@alice"))
+
+    async def _run_subscription(self, settings, *, publisher_identity):
+        db.init_db(settings.db_path)
+        app = create_app(settings)
+
+        sub_registry = subscriptions.get_registry_from_state(app.state)
+        record = sub_registry.create("agent-b", frozenset({"x"}), 300, 86400)
+
+        _insert_correlated_subscription_outbox_row(
+            settings, record.subscription_id, publisher_identity=publisher_identity
+        )
+
+        manager = delivery._get_connection_manager(app.state)
+        conn = delivery.Connection(
+            identity="agent-b",
+            subscription_ids=frozenset({record.subscription_id}),
+            queue=asyncio.Queue(),
+        )
+        manager.register(conn)
+
+        await delivery.dispatch_once(app)
+
+        item = conn.queue.get_nowait()
+        assert item["data"]["publisher_identity"] == publisher_identity
+
+    def test_stream_lane_local_publisher_identity(self, settings):
+        asyncio.run(self._run_stream(settings, publisher_identity="agent-a"))
+
+    def test_stream_lane_federation_publisher_identity(self, settings):
+        asyncio.run(self._run_stream(settings, publisher_identity="orch@alice"))
+
+    async def _run_stream(self, settings, *, publisher_identity):
+        db.init_db(settings.db_path)
+        app = create_app(settings)
+
+        stream_registry = StreamRegistry()
+        app.state.stream_registry = stream_registry
+        stream_registry.create("s1", "agent-a", None)
+        stream_registry.put_member("s1", "agent-b", "read")
+
+        _insert_correlated_stream_outbox_row(
+            settings, "s1", "agent-b", publisher_identity=publisher_identity
+        )
+
+        manager = delivery._get_connection_manager(app.state)
+        conn = delivery.Connection(
+            identity="agent-b", subscription_ids=frozenset(), queue=asyncio.Queue()
+        )
+        manager.register(conn)
+
+        await delivery.dispatch_once(app)
+
+        item = conn.queue.get_nowait()
+        assert item["data"]["publisher_identity"] == publisher_identity
+
+    def test_missing_publish_log_row_yields_none(self, settings):
+        """publish_log 行が存在しない publish_id（想定外の不整合）でも例外にせず `None` を返す。"""
+        db.init_db(settings.db_path)
+        conn = db.get_connection(settings.db_path)
+        try:
+            conn.execute(
+                "INSERT INTO outbox"
+                " (target_type, subscription_id, publish_id, payload, labels, enqueued_at, expires_at)"
+                " VALUES ('subscription', 'sub-1', 999, ?, ?, ?, ?)",
+                (
+                    json.dumps({"ref": {"type": "decision", "id": 1}, "title": None}).encode(),
+                    json.dumps(["x"]),
+                    delivery._now_iso(),
+                    _future_iso(),
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT id, publish_id, payload, labels FROM outbox WHERE publish_id = 999"
+            ).fetchone()
+            data = delivery._build_event_data(
+                "subscription", {"subscription_id": "sub-1"}, row, conn
+            )
+        finally:
+            conn.close()
+        assert data["publisher_identity"] is None
 
 
 class TestPushRetryAndSlowConsumer:

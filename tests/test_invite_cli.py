@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
 import pytest
 from joserfc.jwk import ECKey
 
@@ -335,6 +336,144 @@ class TestCmdPeerRedeemInputValidation:
             ]
         )
         assert rc != 0
+
+
+def _generate_keypair() -> dict:
+    key = ECKey.generate_key("P-256", private=True)
+    return {
+        "private_pem": key.as_pem(private=True).decode("ascii"),
+        "public_jwk": key.as_dict(private=False),
+    }
+
+
+class TestCmdPeerEncKeySignatureVerification:
+    """`peer enc-key` の応答署名検証（既に pin 済みの相手鍵で検証してから pin する）。
+
+    実 HTTP は伴わず `federation_net.build_client` を `httpx.MockTransport` に差し替えて
+    応答を模す（`tests/test_federation_egress.py` の `_patch_transport` と同型）。
+    正常系・応答が改竄された場合の E2E は `tests/integration/test_federation_cli_roundtrip.py`
+    の `TestPeerEncKeyRoundTrip` でも別途カバーする。
+    """
+
+    def _setup_pinned_peer(self, tmp_path, monkeypatch) -> tuple[str, dict]:
+        own_keypair = _generate_keypair()
+        own_enc_keypair = _generate_keypair()
+        peer_keypair = _generate_keypair()
+
+        db_path = str(tmp_path / "enc_key_sig.db")
+        db.init_db(db_path)
+        federation_peers.add_peer(
+            db_path,
+            handle="bob",
+            fingerprint=federation_peers.compute_fingerprint(peer_keypair["public_jwk"]),
+            key_jwk=peer_keypair["public_jwk"],
+            locator="https://8.8.8.8",
+        )
+
+        monkeypatch.setenv("RELAY_JWS_PRIVATE_KEY_PEM", own_keypair["private_pem"])
+        monkeypatch.setenv("RELAY_JWE_PRIVATE_KEY_PEM", own_enc_keypair["private_pem"])
+        return db_path, peer_keypair
+
+    def _patch_client(self, monkeypatch, handler) -> None:
+        def _build(**kwargs):
+            return httpx.Client(transport=httpx.MockTransport(handler))
+
+        monkeypatch.setattr(invite.federation_net, "build_client", _build)
+
+    def test_valid_signed_response_pins_peer_enc_key(self, tmp_path, monkeypatch, capsys):
+        db_path, peer_keypair = self._setup_pinned_peer(tmp_path, monkeypatch)
+        peer_enc_keypair = _generate_keypair()
+
+        resp_body = {"handle": "alice", "enc_key": peer_enc_keypair["public_jwk"]}
+        sig_payload = {
+            "typ": "relay-fed-enc-key-resp",
+            "handle": resp_body["handle"],
+            "enc_key": resp_body["enc_key"],
+        }
+        resp_body["sig"] = federation_peers.sign_detached(
+            sig_payload, private_key_pem=peer_keypair["private_pem"]
+        )
+
+        self._patch_client(monkeypatch, lambda request: httpx.Response(200, json=resp_body))
+
+        rc = invite.main(["peer", "enc-key", "--handle", "bob", "--db", db_path])
+        captured = capsys.readouterr()
+        assert rc == 0, f"out={captured.out!r} err={captured.err!r}"
+
+        peer = federation_peers.get_peer_by_handle(db_path, "bob")
+        assert peer["enc_key_jwk"] == peer_enc_keypair["public_jwk"]
+
+    def test_tampered_enc_key_is_rejected_and_not_pinned(self, tmp_path, monkeypatch, capsys):
+        """署名計算後に enc_key だけを差し替えた応答は署名検証に失敗し pin されない。"""
+        db_path, peer_keypair = self._setup_pinned_peer(tmp_path, monkeypatch)
+        peer_enc_keypair = _generate_keypair()
+        attacker_enc_keypair = _generate_keypair()
+
+        sig_payload = {
+            "typ": "relay-fed-enc-key-resp",
+            "handle": "alice",
+            "enc_key": peer_enc_keypair["public_jwk"],
+        }
+        sig = federation_peers.sign_detached(sig_payload, private_key_pem=peer_keypair["private_pem"])
+        resp_body = {
+            "handle": "alice",
+            "enc_key": attacker_enc_keypair["public_jwk"],  # 署名計算後の改竄
+            "sig": sig,
+        }
+
+        self._patch_client(monkeypatch, lambda request: httpx.Response(200, json=resp_body))
+
+        rc = invite.main(["peer", "enc-key", "--handle", "bob", "--db", db_path])
+        capsys.readouterr()
+        assert rc != 0
+
+        peer = federation_peers.get_peer_by_handle(db_path, "bob")
+        assert peer["enc_key_jwk"] is None
+
+    def test_tampered_sig_is_rejected_and_not_pinned(self, tmp_path, monkeypatch, capsys):
+        """無関係の鍵で署名された応答（署名者詐称）は pin されない。"""
+        db_path, peer_keypair = self._setup_pinned_peer(tmp_path, monkeypatch)
+        peer_enc_keypair = _generate_keypair()
+        unrelated_keypair = _generate_keypair()
+
+        sig_payload = {
+            "typ": "relay-fed-enc-key-resp",
+            "handle": "alice",
+            "enc_key": peer_enc_keypair["public_jwk"],
+        }
+        bad_sig = federation_peers.sign_detached(
+            sig_payload, private_key_pem=unrelated_keypair["private_pem"]
+        )
+        resp_body = {
+            "handle": "alice",
+            "enc_key": peer_enc_keypair["public_jwk"],
+            "sig": bad_sig,
+        }
+
+        self._patch_client(monkeypatch, lambda request: httpx.Response(200, json=resp_body))
+
+        rc = invite.main(["peer", "enc-key", "--handle", "bob", "--db", db_path])
+        capsys.readouterr()
+        assert rc != 0
+
+        peer = federation_peers.get_peer_by_handle(db_path, "bob")
+        assert peer["enc_key_jwk"] is None
+
+    def test_missing_sig_is_rejected_and_not_pinned(self, tmp_path, monkeypatch, capsys):
+        """署名フィールド自体が無い無署名応答は pin されない（旧仕様への回帰防止）。"""
+        db_path, peer_keypair = self._setup_pinned_peer(tmp_path, monkeypatch)
+        peer_enc_keypair = _generate_keypair()
+
+        resp_body = {"handle": "alice", "enc_key": peer_enc_keypair["public_jwk"]}
+
+        self._patch_client(monkeypatch, lambda request: httpx.Response(200, json=resp_body))
+
+        rc = invite.main(["peer", "enc-key", "--handle", "bob", "--db", db_path])
+        capsys.readouterr()
+        assert rc != 0
+
+        peer = federation_peers.get_peer_by_handle(db_path, "bob")
+        assert peer["enc_key_jwk"] is None
 
 
 class TestCmdPeerList:

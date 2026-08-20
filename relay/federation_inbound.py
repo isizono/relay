@@ -33,6 +33,14 @@ membership（to_members の read_write upsert、`@{handle}` の read_write 再�
 `relay.federation_auth` の設計上の意図的な単純化）。rate limit 超過を 429 として区別するには
 この endpoint 専用の別 `RateLimiter` インスタンスが要るため、`get_federation_inbound_rate_limiter`
 で別途持つ（`relay.streams.post_stream_message` の publish rate limit と同型パターン）。
+
+## body の復号（JWE）
+
+envelope に `body_jwe`（`relay.federation_egress` 参照）が来た場合、`Settings.jwe_private_key_pem`
+で復号してから publish_log/outbox に平文で書き込む（local member への配達は既存の
+Bearer token 認証済み SSE 経路であり、federation の HTTP 越しの区間だけを暗号化対象と
+みなす）。`body`（平文）が来た場合はそのまま使う。復号鍵未設定・alg/enc 不一致・改竄等の
+失敗は理由を区別せず 400 で拒否する（`federation_peers.EnvelopeDecryptionError` 参照）。
 """
 from __future__ import annotations
 
@@ -45,9 +53,10 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from relay import db, observability, streams
+from relay import db, federation_peers, observability, streams
 from relay.config import DEFAULT_RETAIN_SECONDS, Settings
 from relay.errors import (
+    FEDERATION_ENVELOPE_DECRYPT_FAILED,
     INVALID_REQUEST,
     RATE_LIMIT_EXCEEDED,
     STREAM_GONE,
@@ -97,14 +106,19 @@ def _project_replica_id(owner_relative_id: str, handle: str) -> str | None:
 
 
 def _validate_envelope(body: Any, owner_relative_id: str) -> tuple[dict, Response | None]:
-    """envelope 必須フィールド（origin_stream_id/origin_publish_id/from_sub/to_members/body）を
-    検証する。
+    """envelope 必須フィールド（origin_stream_id/origin_publish_id/from_sub/to_members、
+    および body か body_jwe のいずれか）を検証する。
 
     federation v1 設計確定版に明記の無い項目（欠落・型不正の扱い）。既存 `post_stream_message`
     の入力検証パターンを踏襲した agent 判断で、欠落・型不正はすべて 400 とする。
     `origin_stream_id` は URL の `{id}`（`owner_relative_id`）と一致することも要求する
     （egress は同じ owner-relative id を path と envelope の両方に使う設計であり、不一致は
     リクエストの構造不正とみなす）。
+
+    `body`（平文）と `body_jwe`（JWE compact、モジュール docstring「body の復号」参照）は
+    どちらか一方だけが必須（`relay.federation_egress` は暗号化可否に応じて排他的に送る）。
+    復号自体はここでは行わず、戻り値にどちらが来たかをそのまま残す（呼び出し側が dedup 判定
+    後にだけ復号コストを払えるようにするため）。
     """
     if not isinstance(body, dict):
         return {}, error_response(
@@ -140,7 +154,15 @@ def _validate_envelope(body: Any, owner_relative_id: str) -> tuple[dict, Respons
         )
 
     message_body = body.get("body")
-    if not isinstance(message_body, str) or message_body == "":
+    message_body_jwe = body.get("body_jwe")
+    if message_body_jwe is not None:
+        if not isinstance(message_body_jwe, str) or message_body_jwe == "":
+            return {}, error_response(400, INVALID_REQUEST, "body_jwe は非空文字列です")
+        if message_body is not None:
+            return {}, error_response(
+                400, INVALID_REQUEST, "body と body_jwe は同時に指定できません"
+            )
+    elif not isinstance(message_body, str) or message_body == "":
         return {}, error_response(400, INVALID_REQUEST, "body は必須の非空文字列です")
 
     return {
@@ -149,6 +171,7 @@ def _validate_envelope(body: Any, owner_relative_id: str) -> tuple[dict, Respons
         "from_sub": from_sub,
         "to_members": to_members,
         "body": message_body,
+        "body_jwe": message_body_jwe,
     }, None
 
 
@@ -230,7 +253,6 @@ async def receive_message(request: Request) -> Response:
     origin_publish_id = envelope["origin_publish_id"]
     from_sub = envelope["from_sub"]
     to_members = envelope["to_members"]
-    message_body = envelope["body"]
 
     conn = db.get_connection(settings.db_path)
     try:
@@ -242,6 +264,39 @@ async def receive_message(request: Request) -> Response:
         ).fetchone()
         if existing is not None:
             return JSONResponse({"publish_id": existing["local_publish_id"]}, status_code=202)
+
+        # (1.5) body 復号: body_jwe が来ていれば ECDH-ES + A256GCM 固定で復号する
+        #       （モジュール docstring「body の復号」参照）。dedup 判定の後に置き、
+        #       既受理な再送に復号コストを払わない。
+        if envelope["body_jwe"] is not None:
+            if not settings.jwe_private_key_pem:
+                observability.record_event(
+                    request.app.state,
+                    "federation_envelope_decrypt_unavailable",
+                    level="warning",
+                    origin_peer=peer.handle,
+                )
+                return error_response(
+                    400,
+                    FEDERATION_ENVELOPE_DECRYPT_FAILED,
+                    "envelope が暗号化されていますが、復号鍵が未設定です",
+                )
+            try:
+                message_body = federation_peers.decrypt_envelope_body(
+                    envelope["body_jwe"], private_key_pem=settings.jwe_private_key_pem
+                )
+            except federation_peers.EnvelopeDecryptionError:
+                observability.record_event(
+                    request.app.state,
+                    "federation_envelope_decrypt_failed",
+                    level="warning",
+                    origin_peer=peer.handle,
+                )
+                return error_response(
+                    400, FEDERATION_ENVELOPE_DECRYPT_FAILED, "envelope の復号に失敗しました"
+                )
+        else:
+            message_body = envelope["body"]
 
         # (2) stream 解決。
         target_stream_id, err = _resolve_target_stream(registry, owner_relative_id, peer)

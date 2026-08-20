@@ -50,6 +50,18 @@ def keypair_b():
 
 
 @pytest.fixture()
+def enc_keypair_a():
+    """A（自分）の envelope 暗号化鍵。署名鍵（keypair_a）とは無関係の別鍵。"""
+    return _generate_keypair()
+
+
+@pytest.fixture()
+def enc_keypair_b():
+    """B（bob）の envelope 暗号化鍵。署名鍵（keypair_b）とは無関係の別鍵。"""
+    return _generate_keypair()
+
+
+@pytest.fixture()
 def settings(tmp_path, keypair_a):
     db_path = str(tmp_path / "egress.db")
     db.init_db(db_path)
@@ -200,6 +212,42 @@ def _decode_envelope(request: httpx.Request) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# _classify_response の 400 分岐（復号失敗 DLQ vs それ以外 retryable）
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyResponse400Handling:
+    """`_classify_response` を直接呼び、400 応答の DLQ / retryable 分岐を検証する。"""
+
+    def test_decrypt_failure_code_classifies_as_dlq(self):
+        response = httpx.Response(
+            400, json={"code": "FederationEnvelopeDecryptError", "message": "decrypt failed"}
+        )
+        outcome, dlq_error_code, retry_after = federation_egress._classify_response(response)
+        assert outcome == federation_egress._OUTCOME_DLQ
+        assert dlq_error_code == federation_egress.DLQ_ERROR_PEER_DECRYPT_FAILED
+        assert retry_after is None
+
+    def test_other_error_code_classifies_as_retryable(self):
+        response = httpx.Response(400, json={"code": "InvalidRequestError", "message": "nope"})
+        outcome, dlq_error_code, retry_after = federation_egress._classify_response(response)
+        assert outcome == federation_egress._OUTCOME_RETRY
+        assert dlq_error_code is None
+
+    def test_non_json_body_classifies_as_retryable(self):
+        response = httpx.Response(400, content=b"not json")
+        outcome, dlq_error_code, retry_after = federation_egress._classify_response(response)
+        assert outcome == federation_egress._OUTCOME_RETRY
+        assert dlq_error_code is None
+
+    def test_json_body_without_code_field_classifies_as_retryable(self):
+        response = httpx.Response(400, json={"message": "missing code field"})
+        outcome, dlq_error_code, retry_after = federation_egress._classify_response(response)
+        assert outcome == federation_egress._OUTCOME_RETRY
+        assert dlq_error_code is None
+
+
+# ---------------------------------------------------------------------------
 # 応答コード別処理（エッジケース #1-#9）
 # ---------------------------------------------------------------------------
 
@@ -296,6 +344,49 @@ class TestResponseCodeHandling:
         dlq = _dlq_rows(settings, "orch:collab", "orch@bob")
         assert len(dlq) == 1
         assert dlq[0]["error_code"] == federation_egress.DLQ_ERROR_PEER_REJECTED_TOO_LARGE
+
+    def test_400_decrypt_failure_moves_to_dlq_end_to_end(
+        self, monkeypatch, settings, app_state, pinned_bob
+    ):
+        """復号失敗（400 + FederationEnvelopeDecryptError）は再送しても直らないため
+        DLQ（PeerDecryptFailed）へ移動し、レーンをブロックし続けない。"""
+        registry = StreamRegistry()
+        registry.create("orch:collab", "orch", None)
+        registry.put_member("orch:collab", "orch@bob", "read")
+        _publish(settings, "orch:collab", "orch@bob")
+
+        def handler(request):
+            return httpx.Response(
+                400, json={"code": "FederationEnvelopeDecryptError", "message": "decrypt failed"}
+            )
+
+        _patch_transport(monkeypatch, handler)
+        _run(_run_egress(app_state, settings, registry))
+
+        assert _outbox_rows(settings, "orch:collab", "orch@bob") == []
+        dlq = _dlq_rows(settings, "orch:collab", "orch@bob")
+        assert len(dlq) == 1
+        assert dlq[0]["error_code"] == federation_egress.DLQ_ERROR_PEER_DECRYPT_FAILED
+
+    def test_400_other_reason_is_retryable_end_to_end(
+        self, monkeypatch, settings, app_state, pinned_bob
+    ):
+        """400 応答でも復号失敗以外（code 不一致）は従来通りリトライ対象として残す。"""
+        registry = StreamRegistry()
+        registry.create("orch:collab", "orch", None)
+        registry.put_member("orch:collab", "orch@bob", "read")
+        _publish(settings, "orch:collab", "orch@bob")
+
+        def handler(request):
+            return httpx.Response(400, json={"code": "InvalidRequestError", "message": "nope"})
+
+        _patch_transport(monkeypatch, handler)
+        _run(_run_egress(app_state, settings, registry))
+
+        rows = _outbox_rows(settings, "orch:collab", "orch@bob")
+        assert len(rows) == 1
+        assert rows[0]["attempt_count"] == 1
+        assert _dlq_rows(settings, "orch:collab", "orch@bob") == []
 
     def test_401_is_retryable_regardless_of_reason(
         self, monkeypatch, settings, app_state, pinned_bob
@@ -806,6 +897,148 @@ class TestEnvelopeConstruction:
 
         assert captured["envelope"]["from_sub"] is None
         assert _outbox_rows(settings, "orch:collab", "orch@bob") == []
+
+
+# ---------------------------------------------------------------------------
+# body の暗号化（JWE）
+# ---------------------------------------------------------------------------
+
+
+class TestEnvelopeBodyEncryption:
+    """自分の暗号化鍵設定 + 宛先 peer の pin 済み暗号化鍵、両方揃った場合だけ
+    envelope の body が JWE 化される（片方でも欠ければ互換のため平文フォールバック）。
+    ルーティングメタデータ（origin_stream_id/origin_publish_id/from_sub/to_members）は
+    暗号化の有無に関わらず常に平文で送る。
+    """
+
+    def test_encrypts_body_when_both_sides_have_enc_keys(
+        self, monkeypatch, settings, app_state, pinned_bob, enc_keypair_a, enc_keypair_b
+    ):
+        import dataclasses
+
+        settings = dataclasses.replace(settings, jwe_private_key_pem=enc_keypair_a["private_pem"])
+        app_state.settings = settings
+        federation_peers.set_peer_enc_key(
+            settings.db_path, fingerprint=pinned_bob, enc_key_jwk=enc_keypair_b["public_jwk"]
+        )
+
+        registry = StreamRegistry()
+        registry.create("orch:collab", "orch", None)
+        registry.put_member("orch:collab", "orch@bob", "read")
+        publish_id = _publish(settings, "orch:collab", "orch@bob", body="secret payload")
+
+        captured = {}
+
+        def handler(request):
+            captured["envelope"] = _decode_envelope(request)
+            return httpx.Response(202)
+
+        _patch_transport(monkeypatch, handler)
+        _run(_run_egress(app_state, settings, registry))
+
+        envelope = captured["envelope"]
+        # ルーティングメタデータは平文のまま。
+        assert envelope["origin_stream_id"] == "orch:collab"
+        assert envelope["origin_publish_id"] == publish_id
+        assert envelope["from_sub"] == "orch"
+        assert envelope["to_members"] == ["orch"]
+        # body は暗号化され、平文の "body" フィールドは送らない。
+        assert "body" not in envelope
+        assert "body_jwe" in envelope
+        assert envelope["body_jwe"] != "secret payload"
+
+        plaintext = federation_peers.decrypt_envelope_body(
+            envelope["body_jwe"], private_key_pem=enc_keypair_b["private_pem"]
+        )
+        assert plaintext == "secret payload"
+
+    def test_falls_back_to_plaintext_when_peer_has_no_enc_key(
+        self, monkeypatch, settings, app_state, pinned_bob, enc_keypair_a
+    ):
+        """自分は暗号化鍵を設定しているが、宛先 peer にまだ pin されていない場合は平文。"""
+        import dataclasses
+
+        settings = dataclasses.replace(settings, jwe_private_key_pem=enc_keypair_a["private_pem"])
+        app_state.settings = settings
+
+        registry = StreamRegistry()
+        registry.create("orch:collab", "orch", None)
+        registry.put_member("orch:collab", "orch@bob", "read")
+        _publish(settings, "orch:collab", "orch@bob", body="plain payload")
+
+        captured = {}
+
+        def handler(request):
+            captured["envelope"] = _decode_envelope(request)
+            return httpx.Response(202)
+
+        _patch_transport(monkeypatch, handler)
+        _run(_run_egress(app_state, settings, registry))
+
+        envelope = captured["envelope"]
+        assert envelope["body"] == "plain payload"
+        assert "body_jwe" not in envelope
+
+    def test_falls_back_to_plaintext_when_own_enc_key_unset(
+        self, monkeypatch, settings, app_state, pinned_bob, enc_keypair_b
+    ):
+        """宛先 peer には暗号化鍵が pin 済みでも、自分に暗号化鍵が未設定なら平文。"""
+        federation_peers.set_peer_enc_key(
+            settings.db_path, fingerprint=pinned_bob, enc_key_jwk=enc_keypair_b["public_jwk"]
+        )
+
+        registry = StreamRegistry()
+        registry.create("orch:collab", "orch", None)
+        registry.put_member("orch:collab", "orch@bob", "read")
+        _publish(settings, "orch:collab", "orch@bob", body="plain payload 2")
+
+        captured = {}
+
+        def handler(request):
+            captured["envelope"] = _decode_envelope(request)
+            return httpx.Response(202)
+
+        _patch_transport(monkeypatch, handler)
+        _run(_run_egress(app_state, settings, registry))
+
+        envelope = captured["envelope"]
+        assert envelope["body"] == "plain payload 2"
+        assert "body_jwe" not in envelope
+
+    def test_oversized_body_is_dlqd_without_sending(
+        self, monkeypatch, settings, app_state, pinned_bob, enc_keypair_a, enc_keypair_b
+    ):
+        """暗号化対象の平文が上限（`MAX_ENVELOPE_PLAINTEXT_BYTES`）を超える場合、暗号化しても
+        相手側の復号が必ず失敗するため、ネットワーク送信を試みず直接 DLQ
+        （PeerBodyTooLargeForEncryption）へ回す。"""
+        import dataclasses
+
+        settings = dataclasses.replace(settings, jwe_private_key_pem=enc_keypair_a["private_pem"])
+        app_state.settings = settings
+        federation_peers.set_peer_enc_key(
+            settings.db_path, fingerprint=pinned_bob, enc_key_jwk=enc_keypair_b["public_jwk"]
+        )
+
+        registry = StreamRegistry()
+        registry.create("orch:collab", "orch", None)
+        registry.put_member("orch:collab", "orch@bob", "read")
+        oversized_body = "a" * (federation_peers.MAX_ENVELOPE_PLAINTEXT_BYTES + 1)
+        _publish(settings, "orch:collab", "orch@bob", body=oversized_body)
+
+        called = {"n": 0}
+
+        def handler(request):
+            called["n"] += 1
+            return httpx.Response(202)
+
+        _patch_transport(monkeypatch, handler)
+        _run(_run_egress(app_state, settings, registry))
+
+        assert called["n"] == 0  # ネットワーク送信を試みていない
+        assert _outbox_rows(settings, "orch:collab", "orch@bob") == []
+        dlq = _dlq_rows(settings, "orch:collab", "orch@bob")
+        assert len(dlq) == 1
+        assert dlq[0]["error_code"] == federation_egress.DLQ_ERROR_BODY_TOO_LARGE_FOR_ENCRYPTION
 
 
 # ---------------------------------------------------------------------------

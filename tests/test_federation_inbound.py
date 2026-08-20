@@ -116,6 +116,16 @@ def keypair_b():
 
 
 @pytest.fixture()
+def enc_keypair_b():
+    """B（受信側）の envelope 復号鍵。署名鍵（keypair_b）とは無関係の別鍵。"""
+    key = ECKey.generate_key("P-256", private=True)
+    return {
+        "private_pem": key.as_pem(private=True).decode("ascii"),
+        "public_jwk": key.as_dict(private=False),
+    }
+
+
+@pytest.fixture()
 def settings_b(tmp_path, keypair_b):
     """受信側 B の Settings。`pinned_peer_a` 等が app 起動前に db を触るため、ここで
     migration を適用しておく（`test_federation_auth.py` の settings fixture と同型）。"""
@@ -425,6 +435,172 @@ class TestEnvelopeValidation:
             client_b, settings_b, keypair_a, path=MESSAGES_PATH, raw_body=b"not json"
         )
         assert r.status_code == 400
+
+    def test_body_and_body_jwe_both_present_returns_400(
+        self, client_b, settings_b, keypair_a, pinned_peer_a
+    ):
+        envelope = _envelope(origin_stream_id="orch:collab", origin_publish_id=1)
+        envelope["body_jwe"] = "irrelevant-for-this-check"
+        r = _post_message(client_b, settings_b, keypair_a, path=MESSAGES_PATH, envelope=envelope)
+        assert r.status_code == 400
+
+    def test_empty_body_jwe_returns_400(self, client_b, settings_b, keypair_a, pinned_peer_a):
+        envelope = _envelope(origin_stream_id="orch:collab", origin_publish_id=1)
+        del envelope["body"]
+        envelope["body_jwe"] = ""
+        r = _post_message(client_b, settings_b, keypair_a, path=MESSAGES_PATH, envelope=envelope)
+        assert r.status_code == 400
+
+
+class TestBodyDecryption:
+    """`body_jwe` の復号（ECDH-ES + A256GCM 固定）。alg/enc 不一致・zip 使用は復号を
+    試みず拒否する（algorithm confusion 対策、relay.federation_peers 参照）。
+    """
+
+    def _envelope_with_body_jwe(self, *, origin_publish_id: int, body_jwe: str, **kwargs) -> dict:
+        envelope = _envelope(
+            origin_stream_id="orch:collab", origin_publish_id=origin_publish_id, **kwargs
+        )
+        del envelope["body"]
+        envelope["body_jwe"] = body_jwe
+        return envelope
+
+    def test_decrypts_and_stores_plaintext_in_outbox(
+        self, client_b, settings_b, keypair_a, enc_keypair_b
+    ):
+        import dataclasses
+
+        settings_b_enc = dataclasses.replace(
+            settings_b, jwe_private_key_pem=enc_keypair_b["private_pem"]
+        )
+        app = create_app(settings_b_enc)
+        with TestClient(app) as c:
+            federation_peers.add_peer(
+                settings_b_enc.db_path,
+                handle="alice",
+                fingerprint=_fp(keypair_a),
+                key_jwk=keypair_a["public_jwk"],
+                locator="https://relay-a.example",
+            )
+            body_jwe = federation_peers.encrypt_envelope_body(
+                "top secret payload", public_key_jwk=enc_keypair_b["public_jwk"]
+            )
+            envelope = self._envelope_with_body_jwe(origin_publish_id=1, body_jwe=body_jwe)
+            r = _post_message(c, settings_b_enc, keypair_a, path=MESSAGES_PATH, envelope=envelope)
+            assert r.status_code == 202
+
+            conn = sqlite3.connect(settings_b_enc.db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute(
+                    "SELECT payload FROM outbox WHERE stream_id = 'orch@alice:collab'"
+                ).fetchone()
+            finally:
+                conn.close()
+            assert bytes(row["payload"]).decode("utf-8") == "top secret payload"
+
+    def test_missing_decryption_key_returns_400(
+        self, client_b, settings_b, keypair_a, pinned_peer_a, enc_keypair_b
+    ):
+        """`body_jwe` が来ているのに自分の復号鍵（jwe_private_key_pem）が未設定。"""
+        body_jwe = federation_peers.encrypt_envelope_body(
+            "secret", public_key_jwk=enc_keypair_b["public_jwk"]
+        )
+        envelope = self._envelope_with_body_jwe(origin_publish_id=1, body_jwe=body_jwe)
+        r = _post_message(client_b, settings_b, keypair_a, path=MESSAGES_PATH, envelope=envelope)
+        assert r.status_code == 400
+        assert r.json()["code"] == "FederationEnvelopeDecryptError"
+
+    def test_unexpected_enc_is_rejected(
+        self, client_b, settings_b, keypair_a, enc_keypair_b
+    ):
+        import dataclasses
+
+        from joserfc import jwe as jwe_module
+        from joserfc.jwk import ECKey
+
+        settings_b_enc = dataclasses.replace(
+            settings_b, jwe_private_key_pem=enc_keypair_b["private_pem"]
+        )
+        app = create_app(settings_b_enc)
+        with TestClient(app) as c:
+            federation_peers.add_peer(
+                settings_b_enc.db_path,
+                handle="alice",
+                fingerprint=_fp(keypair_a),
+                key_jwk=keypair_a["public_jwk"],
+                locator="https://relay-a.example",
+            )
+            crafted = jwe_module.encrypt_compact(
+                {"alg": "ECDH-ES", "enc": "A128GCM"},
+                "secret",
+                ECKey.import_key(enc_keypair_b["public_jwk"]),
+                algorithms=["ECDH-ES", "A128GCM"],
+            )
+            envelope = self._envelope_with_body_jwe(origin_publish_id=1, body_jwe=crafted)
+            r = _post_message(c, settings_b_enc, keypair_a, path=MESSAGES_PATH, envelope=envelope)
+            assert r.status_code == 400
+            assert r.json()["code"] == "FederationEnvelopeDecryptError"
+
+    def test_zip_header_is_rejected(
+        self, client_b, settings_b, keypair_a, enc_keypair_b
+    ):
+        """圧縮(zip)付き JWE は復号を試みず拒否する（サイドチャネル対策）。"""
+        import dataclasses
+
+        from joserfc import jwe as jwe_module
+        from joserfc.jwk import ECKey
+
+        settings_b_enc = dataclasses.replace(
+            settings_b, jwe_private_key_pem=enc_keypair_b["private_pem"]
+        )
+        app = create_app(settings_b_enc)
+        with TestClient(app) as c:
+            federation_peers.add_peer(
+                settings_b_enc.db_path,
+                handle="alice",
+                fingerprint=_fp(keypair_a),
+                key_jwk=keypair_a["public_jwk"],
+                locator="https://relay-a.example",
+            )
+            crafted = jwe_module.encrypt_compact(
+                {"alg": "ECDH-ES", "enc": "A256GCM", "zip": "DEF"},
+                "secret " * 20,
+                ECKey.import_key(enc_keypair_b["public_jwk"]),
+                algorithms=["ECDH-ES", "A256GCM", "DEF"],
+            )
+            envelope = self._envelope_with_body_jwe(origin_publish_id=1, body_jwe=crafted)
+            r = _post_message(c, settings_b_enc, keypair_a, path=MESSAGES_PATH, envelope=envelope)
+            assert r.status_code == 400
+            assert r.json()["code"] == "FederationEnvelopeDecryptError"
+
+    def test_tampered_ciphertext_is_rejected(
+        self, client_b, settings_b, keypair_a, enc_keypair_b
+    ):
+        import dataclasses
+
+        settings_b_enc = dataclasses.replace(
+            settings_b, jwe_private_key_pem=enc_keypair_b["private_pem"]
+        )
+        app = create_app(settings_b_enc)
+        with TestClient(app) as c:
+            federation_peers.add_peer(
+                settings_b_enc.db_path,
+                handle="alice",
+                fingerprint=_fp(keypair_a),
+                key_jwk=keypair_a["public_jwk"],
+                locator="https://relay-a.example",
+            )
+            body_jwe = federation_peers.encrypt_envelope_body(
+                "secret", public_key_jwk=enc_keypair_b["public_jwk"]
+            )
+            parts = body_jwe.split(".")
+            parts[3] = parts[3][:-1] + ("A" if parts[3][-1] != "A" else "B")
+            tampered = ".".join(parts)
+            envelope = self._envelope_with_body_jwe(origin_publish_id=1, body_jwe=tampered)
+            r = _post_message(c, settings_b_enc, keypair_a, path=MESSAGES_PATH, envelope=envelope)
+            assert r.status_code == 400
+            assert r.json()["code"] == "FederationEnvelopeDecryptError"
 
 
 class TestBodySizeCap:
