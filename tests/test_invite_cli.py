@@ -65,7 +65,8 @@ class TestParseTtl:
 
 
 class TestCmdNew:
-    def test_prints_fragment_url_and_inserts_row(self, tmp_path, capsys):
+    def test_prints_fragment_url_and_inserts_row(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.delenv("RELAY_BASE_URL", raising=False)
         db_path = str(tmp_path / "cli.db")
         rc = invite.main(["new", "--identity", "cc-memory", "--db", db_path])
         assert rc == 0
@@ -95,6 +96,50 @@ class TestCmdNew:
         )
         out = capsys.readouterr().out.strip()
         assert out.startswith("http://127.0.0.1:9999/invitations/redeem#v=1&t=it_")
+
+    def test_env_base_url_used_when_no_explicit_flag(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setenv("RELAY_BASE_URL", "https://relay.example.org")
+        db_path = str(tmp_path / "cli.db")
+        rc = invite.main(["new", "--identity", "cc-memory", "--db", db_path])
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert captured.out.strip().startswith(
+            "https://relay.example.org/invitations/redeem#v=1&t=it_"
+        )
+        assert captured.err == ""  # env で解決できているので警告は出ない
+
+    def test_explicit_flag_wins_over_env(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setenv("RELAY_BASE_URL", "https://relay.example.org")
+        db_path = str(tmp_path / "cli.db")
+        rc = invite.main(
+            [
+                "new",
+                "--identity",
+                "cc-memory",
+                "--db",
+                db_path,
+                "--base-url",
+                "https://cli-wins.example.com",
+            ]
+        )
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert captured.out.strip().startswith(
+            "https://cli-wins.example.com/invitations/redeem#v=1&t=it_"
+        )
+        assert captured.err == ""
+
+    def test_neither_given_falls_back_to_default_and_warns(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.delenv("RELAY_BASE_URL", raising=False)
+        db_path = str(tmp_path / "cli.db")
+        rc = invite.main(["new", "--identity", "cc-memory", "--db", db_path])
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert captured.out.strip().startswith(
+            "http://127.0.0.1:8770/invitations/redeem#v=1&t=it_"
+        )
+        assert "RELAY_BASE_URL" in captured.err
+        assert "--base-url" in captured.err
 
     def test_rejects_none_ttl_for_invite(self, tmp_path, capsys):
         db_path = str(tmp_path / "cli.db")
@@ -265,6 +310,33 @@ class TestCmdPeerNew:
             conn.close()
         assert len(rows) == 1
         assert rows[0]["handle"] == "bob"
+
+    def test_env_base_url_used_when_no_explicit_flag(
+        self, tmp_path, federation_key, capsys, monkeypatch
+    ):
+        monkeypatch.setenv("RELAY_BASE_URL", "https://relay.example.org")
+        db_path = str(tmp_path / "peer.db")
+        rc = invite.main(["peer", "new", "--handle", "bob", "--db", db_path])
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert captured.out.strip().startswith(
+            "https://relay.example.org/federation/peers/redeem#v=1&t=pi_"
+        )
+        assert captured.err == ""
+
+    def test_neither_given_falls_back_to_default_and_warns(
+        self, tmp_path, federation_key, capsys, monkeypatch
+    ):
+        monkeypatch.delenv("RELAY_BASE_URL", raising=False)
+        db_path = str(tmp_path / "peer.db")
+        rc = invite.main(["peer", "new", "--handle", "bob", "--db", db_path])
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert captured.out.strip().startswith(
+            "http://127.0.0.1:8770/federation/peers/redeem#v=1&t=pi_"
+        )
+        assert "RELAY_BASE_URL" in captured.err
+        assert "--base-url" in captured.err
 
     def test_rejects_none_ttl(self, tmp_path, federation_key):
         db_path = str(tmp_path / "peer.db")

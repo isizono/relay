@@ -28,7 +28,7 @@ CANONICAL_DB_PATH = str(Path.home() / ".local" / "state" / "relay" / "relay.db")
 
 _TTL_UNITS: dict[str, int] = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
-DEFAULT_FEDERATION_BASE_URL = "http://127.0.0.1:8770"
+DEFAULT_BASE_URL = "http://127.0.0.1:8770"
 
 
 def _now_iso() -> str:
@@ -59,10 +59,23 @@ def _resolve_federation_enc_private_key_pem() -> str | None:
     return os.environ.get("RELAY_JWE_PRIVATE_KEY_PEM")
 
 
-def _resolve_federation_base_url(explicit: str | None) -> str:
+def _resolve_base_url(explicit: str | None) -> str:
+    """`--base-url` → env `RELAY_BASE_URL` → 既定値の順で招待 URL の base を解決する。
+
+    既定値へフォールバックした場合、別マシンから redeem する運用で気づけるよう
+    stderr に警告を1行出す（招待 URL 自体の stdout 出力は変えない）。
+    """
     if explicit:
         return explicit
-    return os.environ.get("RELAY_BASE_URL", DEFAULT_FEDERATION_BASE_URL)
+    env = os.environ.get("RELAY_BASE_URL")
+    if env:
+        return env
+    print(
+        "RELAY_BASE_URL も --base-url も未指定のため 127.0.0.1 の既定URLを使う。"
+        "別マシンから redeem するなら公開URLを指定すること",
+        file=sys.stderr,
+    )
+    return DEFAULT_BASE_URL
 
 
 def _resolve_allow_private_locators() -> bool:
@@ -128,7 +141,8 @@ def _cmd_new(args: argparse.Namespace) -> int:
         invite_ttl_seconds=invite_ttl_seconds,
         credential_ttl_seconds=credential_ttl_seconds,
     )
-    print(f"{args.base_url}/invitations/redeem#v=1&t={token}")
+    base_url = _resolve_base_url(args.base_url)
+    print(f"{base_url}/invitations/redeem#v=1&t={token}")
     return 0
 
 
@@ -234,7 +248,7 @@ def _cmd_peer_new(args: argparse.Namespace) -> int:
     token = federation_peers.issue_peer_invite(
         db_path, handle=args.handle, invite_ttl_seconds=invite_ttl_seconds
     )
-    base_url = _resolve_federation_base_url(args.base_url)
+    base_url = _resolve_base_url(args.base_url)
     print(f"{base_url}/federation/peers/redeem#v=1&t={token}&fp={own_fingerprint}")
     return 0
 
@@ -277,7 +291,7 @@ def _cmd_peer_redeem(args: argparse.Namespace) -> int:
 
     own_jwk = federation_peers.public_jwk_from_pem(private_key_pem)
     ts = int(time.time())
-    own_base_url = _resolve_federation_base_url(args.base_url)
+    own_base_url = _resolve_base_url(args.base_url)
     own_card: dict[str, object] = {"key": own_jwk, "locator": own_base_url}
     enc_private_key_pem = _resolve_federation_enc_private_key_pem()
     if enc_private_key_pem:
@@ -554,7 +568,7 @@ def build_parser() -> argparse.ArgumentParser:
     new_parser.add_argument("--identity", required=True)
     new_parser.add_argument("--ttl", default="15m")
     new_parser.add_argument("--credential-ttl", default="none")
-    new_parser.add_argument("--base-url", default="http://127.0.0.1:8770")
+    new_parser.add_argument("--base-url", default=None)
     new_parser.add_argument("--db", default=None)
     new_parser.set_defaults(func=_cmd_new)
 
