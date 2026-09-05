@@ -19,8 +19,13 @@ uv sync
 
 # token → identity の対応表を渡してサーバーを起動(migration は起動時に自動適用)
 export RELAY_AUTH_TOKENS='{"tok-a": "agent-a", "tok-b": "agent-b"}'
-uv run uvicorn relay.app:app --host 127.0.0.1 --port 8000
+uv run python -m relay.serve --host 127.0.0.1 --port 8000
 ```
+
+`python -m relay.serve` は TCP keepalive（`SO_KEEPALIVE` + idle/interval/probe 回数）を
+設定した socket で起動する。`uv run uvicorn relay.app:app --host 127.0.0.1 --port 8000`
+で直接起動することもできるが、その場合 keepalive は OS 既定のままになる。運用上の注意点は
+[docs/ops/running.md](docs/ops/running.md) を参照。
 
 別ターミナルで 2 つのエージェント役を演じてみる。
 
@@ -70,14 +75,15 @@ tests/          # サーバー・SDK のテスト（integration/ に E2E roundtr
 | `RELAY_SERVER_LOG_PATH` | 構造化ログ + サーバーログ sink（JSON Lines、TTL 90 日） |
 | `RELAY_JWS_PRIVATE_KEY_PEM` / `RELAY_JWS_KID` / `RELAY_JWS_JKU` | AgentCard の ES256 署名（未設定なら署名なし最小セット）。federation マシン鍵も兼ねる |
 | `RELAY_JWE_PRIVATE_KEY_PEM` | federation envelope body の暗号化鍵（ECDH-ES + A256GCM）。署名鍵とは別鍵。未設定なら envelope は互換のため平文で送る |
-| `RELAY_BASE_URL` | 自 relay の公開 base URL（federation 招待 URL 生成・redeem 応答の locator に使う） |
+| `RELAY_BASE_URL` | 自 relay の公開 base URL（招待 URL 生成・federation redeem 応答の locator に使う）。`python -m relay.invite` 系コマンドの `--base-url` 省略時にも参照する |
 | `RELAY_FEDERATION_ALLOW_PRIVATE_LOCATORS` | 既定 `false`。`true` で federation の outbound dial 先に localhost / private IP を許可（同一ホスト検証・開発用） |
+| `RELAY_TCP_KEEPIDLE` / `RELAY_TCP_KEEPINTVL` / `RELAY_TCP_KEEPCNT` | `python -m relay.serve` の TCP keepalive 設定（既定 60 秒 / 10 秒 / 3 回）。`uvicorn relay.app:app` 直接起動には効かない |
 
 ## 機能とエンドポイント
 
 | 機能 | endpoint | 状態 |
 |---|---|---|
-| 場 (stream) CRUD + membership | `POST/GET/DELETE /streams`, `PUT/DELETE/GET /streams/{id}/members` | 実装済み |
+| 場 (stream) CRUD + membership | `POST /streams`, `GET/DELETE /streams/{id}`, `PUT/DELETE/GET /streams/{id}/members` | 実装済み |
 | 場 publish + cumulative ack | `POST /streams/{id}/messages`, `POST /streams/{id}/ack` | 実装済み |
 | subscription（subscribe / lease / unsubscribe / ack / publish） | `POST /subscriptions` 他 | 実装済み |
 | SSE 多重化購読（outbox dispatcher / retry / DLQ） | `GET /events` | 実装済み |
@@ -85,7 +91,7 @@ tests/          # サーバー・SDK のテスト（integration/ に E2E roundtr
 | Prometheus 互換 metrics | `GET /metrics` | 実装済み |
 | AgentCard 公開 | `GET /.well-known/agent-card.json` | 実装済み |
 | Python SDK（クライアント側） | `relay_sdk/` パッケージ | 実装済み |
-| federation peer レジストリ（招待ベース鍵ピン留め） | `POST /federation/peers/redeem`、`python -m relay.invite peer new/redeem/list/revoke` | peer 登録まで実装済み（relay 間のメッセージ配達は未実装） |
+| federation peer レジストリ（招待ベース鍵ピン留め） + relay 間メッセージ配達 | `POST /federation/peers/redeem`、`POST /federation/streams/{id}/messages`（受信側 inbound endpoint）、`python -m relay.invite peer new/redeem/list/revoke` | 実装済み（送信側は既存 outbox dispatcher の egress ステップ、受信側は上記 inbound endpoint） |
 | federation envelope 暗号化鍵の追加登録（招待をやり直さない再 pin） | `POST /federation/peers/enc-key`、`python -m relay.invite peer enc-key` | 実装済み |
 
 wire レベルの仕様は [docs/design/relay-v2-wire-api.md](docs/design/relay-v2-wire-api.md)、identity / 認可モデルは [docs/design/relay-v2-identity-authz.md](docs/design/relay-v2-identity-authz.md) を参照。
@@ -107,6 +113,7 @@ API の詳細仕様は [docs/design/relay-v2-sdk.md](docs/design/relay-v2-sdk.md
 - [docs/design/relay-v2-identity-authz.md](docs/design/relay-v2-identity-authz.md) — identity・認証・認可
 - [docs/design/relay-v2-sdk.md](docs/design/relay-v2-sdk.md) — Python SDK 仕様
 - [docs/design/relay-sequences.md](docs/design/relay-sequences.md) — 主要シーケンス図
+- [docs/ops/running.md](docs/ops/running.md) — 運用手順（`--host` の選び方、TCP keepalive、`RELAY_BASE_URL` の役割）
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — 実装のモジュール構成と設計判断の記録。開発中の判断メモを含む歴史的文書のため通読は不要で、まず `docs/design/` の仕様書から読むこと
 
 ## 開発

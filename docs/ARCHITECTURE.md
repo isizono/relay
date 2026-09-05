@@ -542,12 +542,14 @@ TTL（既定 90 日）を過ぎた行は `purge_expired_server_log` で間引く
    上記「stream lane の permanent error 検出」の節と `_sweep_stream_permanent_errors` を参照。
    自己離脱の即時削除（`relay.streams.delete_member`）と合わせて対応した。実装にあたり
    解釈の余地があった点・残るトレードオフを下記「stream lane DLQ 実装で判断した点」に記録する。
-3. **TCP keepalive（`TCP_KEEPIDLE` / `TCP_KEEPINTVL` / `TCP_KEEPCNT`）は未設定**。
-   cc-memory 側の関連 decision は具体値（60 秒 / 10 秒 / 3 回）を確定しているが、これは
-   ASGI アプリケーションコードの層ではなく uvicorn の起動オプション
-   （`--limit-max-requests` 等とは別の socket オプション）で設定するものであり、
-   本実装（`relay/` パッケージ内のコード）のスコープ外と判断した。本番運用時の uvicorn
-   起動コマンド側で設定する必要がある。
+3. **（解消済み）TCP keepalive は `python -m relay.serve`（`relay/serve.py`）で設定した**。
+   listen socket を自前で作って `SO_KEEPALIVE` と `TCP_KEEPIDLE`（Linux）/ `TCP_KEEPALIVE`
+   （macOS の同義の別名定数）、`TCP_KEEPINTVL` / `TCP_KEEPCNT` を設定してから uvicorn の
+   `Server.run(sockets=...)` に渡す。既定値は idle 60 秒 / interval 10 秒 / count 3 回で、
+   環境変数 `RELAY_TCP_KEEPIDLE` / `RELAY_TCP_KEEPINTVL` / `RELAY_TCP_KEEPCNT` で上書き
+   できる。プラットフォームに該当定数が無い場合はその項目だけ設定をスキップし警告ログを
+   出す（起動は落とさない）。`uvicorn relay.app:app` を直接起動した場合はこの keepalive
+   設定は適用されず OS 既定のままになる。運用上の注意点は `docs/ops/running.md` を参照。
 4. **（解消済み、Observability タスクで対応）** `GET /status` / `GET /metrics` は
    wire-api.md §7.1, §7.2 に従い実装した。詳細は後続の Observability 実装セクションを参照。
 5. **1 SSE 接続で複数 target を多重化する際の ack バッチ境界・部分 ack の最適化は
