@@ -359,6 +359,25 @@ class TestValidateEncKeyJwk:
         with pytest.raises(ValueError):
             federation_peers.validate_enc_key_jwk(leaked)
 
+    def test_rejects_point_not_on_curve(self, enc_keypair):
+        """x/y が構造上は正しい base64url でも、P-256 曲線上の点でなければ拒否する。"""
+        import base64
+
+        raw_x = bytearray(base64.urlsafe_b64decode(enc_keypair["public_jwk"]["x"] + "=="))
+        raw_x[0] ^= 0xFF  # 1 バイト反転して曲線外の座標にする
+        off_curve = dict(
+            enc_keypair["public_jwk"],
+            x=base64.urlsafe_b64encode(bytes(raw_x)).rstrip(b"=").decode("ascii"),
+        )
+        with pytest.raises(ValueError):
+            federation_peers.validate_enc_key_jwk(off_curve)
+
+    def test_rejects_malformed_base64url_coordinate(self, enc_keypair):
+        """`x`/`y` が非空文字列でも、P-256 座標として長さが不正な base64url は拒否する。"""
+        bad = dict(enc_keypair["public_jwk"], x="abc")
+        with pytest.raises(ValueError):
+            federation_peers.validate_enc_key_jwk(bad)
+
 
 class TestEnvelopeEncryptionRoundTrip:
     """envelope body の暗号化/復号（ECDH-ES + A256GCM 固定）を検証する。"""
