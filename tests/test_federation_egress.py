@@ -211,6 +211,11 @@ def _decode_envelope(request: httpx.Request) -> dict:
     return json.loads(request.content)
 
 
+def _read_server_log(settings) -> list[dict]:
+    with open(settings.server_log_path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
 # ---------------------------------------------------------------------------
 # _classify_response の 400 分岐（復号失敗 DLQ vs それ以外 retryable）
 # ---------------------------------------------------------------------------
@@ -955,7 +960,12 @@ class TestEnvelopeBodyEncryption:
     def test_falls_back_to_plaintext_when_peer_has_no_enc_key(
         self, monkeypatch, settings, app_state, pinned_bob, enc_keypair_a
     ):
-        """自分は暗号化鍵を設定しているが、宛先 peer にまだ pin されていない場合は平文。"""
+        """自分は暗号化鍵を設定しているが、宛先 peer にまだ pin されていない場合は平文。
+
+        この平文フォールバックは `federation_plaintext_fallback` 警告ログと
+        `relay_federation_plaintext_fallback_total` カウンタ（reason=peer_key_missing）を
+        必ず伴う（可視化なしの無言フォールバックへの regression を防ぐ）。
+        """
         import dataclasses
 
         settings = dataclasses.replace(settings, jwe_private_key_pem=enc_keypair_a["private_pem"])
@@ -979,10 +989,22 @@ class TestEnvelopeBodyEncryption:
         assert envelope["body"] == "plain payload"
         assert "body_jwe" not in envelope
 
+        log_entries = _read_server_log(settings)
+        fallback_entries = [e for e in log_entries if e["event"] == "federation_plaintext_fallback"]
+        assert len(fallback_entries) == 1
+        assert fallback_entries[0]["reason"] == "peer_key_missing"
+        assert fallback_entries[0]["peer"] == "bob"
+
+        counters = observability.get_metrics_registry(app_state).snapshot()
+        assert counters["relay_federation_plaintext_fallback_total"][(("reason", "peer_key_missing"),)] == 1.0
+
     def test_falls_back_to_plaintext_when_own_enc_key_unset(
         self, monkeypatch, settings, app_state, pinned_bob, enc_keypair_b
     ):
-        """宛先 peer には暗号化鍵が pin 済みでも、自分に暗号化鍵が未設定なら平文。"""
+        """宛先 peer には暗号化鍵が pin 済みでも、自分に暗号化鍵が未設定なら平文。
+
+        reason=own_key_missing で `federation_plaintext_fallback` が記録される。
+        """
         federation_peers.set_peer_enc_key(
             settings.db_path, fingerprint=pinned_bob, enc_key_jwk=enc_keypair_b["public_jwk"]
         )
@@ -1004,6 +1026,92 @@ class TestEnvelopeBodyEncryption:
         envelope = captured["envelope"]
         assert envelope["body"] == "plain payload 2"
         assert "body_jwe" not in envelope
+
+        log_entries = _read_server_log(settings)
+        fallback_entries = [e for e in log_entries if e["event"] == "federation_plaintext_fallback"]
+        assert len(fallback_entries) == 1
+        assert fallback_entries[0]["reason"] == "own_key_missing"
+
+        counters = observability.get_metrics_registry(app_state).snapshot()
+        assert counters["relay_federation_plaintext_fallback_total"][(("reason", "own_key_missing"),)] == 1.0
+
+    def test_require_encryption_global_setting_dlqs_instead_of_plaintext(
+        self, monkeypatch, settings, app_state, pinned_bob, enc_keypair_a
+    ):
+        """全体設定 `federation_require_encryption` が真なら、鍵が片方欠けても平文で送らず DLQ へ回す。"""
+        import dataclasses
+
+        settings = dataclasses.replace(
+            settings,
+            jwe_private_key_pem=enc_keypair_a["private_pem"],
+            federation_require_encryption=True,
+        )
+        app_state.settings = settings
+
+        registry = StreamRegistry()
+        registry.create("orch:collab", "orch", None)
+        registry.put_member("orch:collab", "orch@bob", "read")
+        _publish(settings, "orch:collab", "orch@bob", body="must not leak")
+
+        called = {"n": 0}
+
+        def handler(request):
+            called["n"] += 1
+            return httpx.Response(202)
+
+        _patch_transport(monkeypatch, handler)
+        _run(_run_egress(app_state, settings, registry))
+
+        assert called["n"] == 0  # ネットワーク送信を試みていない（平文で送っていない）
+        assert _outbox_rows(settings, "orch:collab", "orch@bob") == []
+        dlq = _dlq_rows(settings, "orch:collab", "orch@bob")
+        assert len(dlq) == 1
+        assert dlq[0]["error_code"] == federation_egress.DLQ_ERROR_ENCRYPTION_REQUIRED
+
+        log_entries = _read_server_log(settings)
+        assert any(
+            e["event"] == "federation_encryption_required_unavailable"
+            and e["reason"] == "peer_key_missing"
+            for e in log_entries
+        )
+        assert not any(e["event"] == "federation_plaintext_fallback" for e in log_entries)
+
+    def test_require_encryption_peer_flag_dlqs_instead_of_plaintext(
+        self, monkeypatch, settings, app_state, pinned_bob
+    ):
+        """peer 単位の `require_encryption` が真なら、全体設定が既定 false でも DLQ へ回す。
+
+        自分の暗号化鍵自体が未設定（own_key_missing）のケースで確認する。
+        """
+        assert federation_peers.set_peer_require_encryption(
+            settings.db_path, handle="bob", required=True
+        )
+
+        registry = StreamRegistry()
+        registry.create("orch:collab", "orch", None)
+        registry.put_member("orch:collab", "orch@bob", "read")
+        _publish(settings, "orch:collab", "orch@bob", body="must not leak either")
+
+        called = {"n": 0}
+
+        def handler(request):
+            called["n"] += 1
+            return httpx.Response(202)
+
+        _patch_transport(monkeypatch, handler)
+        _run(_run_egress(app_state, settings, registry))
+
+        assert called["n"] == 0
+        dlq = _dlq_rows(settings, "orch:collab", "orch@bob")
+        assert len(dlq) == 1
+        assert dlq[0]["error_code"] == federation_egress.DLQ_ERROR_ENCRYPTION_REQUIRED
+
+        log_entries = _read_server_log(settings)
+        assert any(
+            e["event"] == "federation_encryption_required_unavailable"
+            and e["reason"] == "own_key_missing"
+            for e in log_entries
+        )
 
     def test_oversized_body_is_dlqd_without_sending(
         self, monkeypatch, settings, app_state, pinned_bob, enc_keypair_a, enc_keypair_b

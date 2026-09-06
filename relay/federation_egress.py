@@ -63,6 +63,13 @@ envelope の `body`（メッセージ本文）は、自分に `Settings.jwe_priv
 / `from_sub` / `to_members` はいずれの場合も平文のまま送る（配達ルーティングに必要な
 メタデータであり、暗号化するとルーティング自体が機能しなくなるため対象外）。
 
+この平文フォールバックが発生するたびに構造化ログ（`federation_plaintext_fallback`、
+`reason` は `own_key_missing` / `peer_key_missing`）と Prometheus カウンタ
+（`relay_federation_plaintext_fallback_total`）を記録する。`Settings.federation_require_encryption`
+（全体設定）または宛先 `peers.require_encryption`（peer 単位、`python -m relay.invite peer
+require-encryption` で切替）のいずれかが真の場合はこのフォールバックを行わず、平文で送らずに
+`PeerEncryptionRequired` で DLQ へ回す（鍵が揃うまで再送しても直らないため retryable にしない）。
+
 平文が `federation_peers.MAX_ENVELOPE_PLAINTEXT_BYTES` を超える場合、`encrypt_envelope_body`
 は暗号化を試みず `EnvelopeTooLargeForEncryptionError` を送出する。この場合ネットワーク送信
 自体を行わず、当該 `publish_id` を直接 DLQ（`PeerBodyTooLargeForEncryption`）へ回す（暗号化
@@ -94,6 +101,7 @@ DLQ_ERROR_PEER_REJECTED_TOO_LARGE = "PeerRejectedTooLarge"
 DLQ_ERROR_PEER_REVOKED = "PeerRevoked"
 DLQ_ERROR_PEER_DECRYPT_FAILED = "PeerDecryptFailed"
 DLQ_ERROR_BODY_TOO_LARGE_FOR_ENCRYPTION = "PeerBodyTooLargeForEncryption"
+DLQ_ERROR_ENCRYPTION_REQUIRED = "PeerEncryptionRequired"
 
 _OUTCOME_SUCCESS = "success"
 _OUTCOME_RETRY = "retry"
@@ -351,7 +359,8 @@ async def _process_lane(
         }
         # body のみ暗号化対象（メタデータはルーティングに要るため常に平文、モジュール
         # docstring「body の暗号化（JWE）」参照）。自分の暗号化鍵と宛先の pin 済み
-        # 暗号化鍵の両方が揃っているときだけ暗号化し、揃わなければ平文にフォールバックする。
+        # 暗号化鍵の両方が揃っているときだけ暗号化し、揃わなければ平文にフォールバックする
+        # （ただし暗号化必須が有効な場合はフォールバックせず DLQ へ回す、下記参照）。
         peer_enc_key_jwk = peer["enc_key_jwk"]
         if settings.jwe_private_key_pem and peer_enc_key_jwk is not None:
             try:
@@ -370,6 +379,40 @@ async def _process_lane(
                     )
                 break
         else:
+            # 暗号化鍵が揃わない。全体設定 `federation_require_encryption` または
+            # peer 単位の `require_encryption` が真なら、平文で送らず permanent error として
+            # DLQ へ回す（鍵が揃うまで再送しても直らないため retryable にしない）。
+            reason = "own_key_missing" if not settings.jwe_private_key_pem else "peer_key_missing"
+            if settings.federation_require_encryption or peer["require_encryption"]:
+                observability.record_event(
+                    app_state,
+                    "federation_encryption_required_unavailable",
+                    level="warning",
+                    stream_id=stream_id,
+                    peer=peer_handle,
+                    publish_id=publish_id,
+                    reason=reason,
+                )
+                for row in group_rows:
+                    _dlq_federation_row(
+                        db_conn,
+                        row,
+                        error_code=DLQ_ERROR_ENCRYPTION_REQUIRED,
+                        app_state=app_state,
+                    )
+                break
+            observability.record_event(
+                app_state,
+                "federation_plaintext_fallback",
+                level="warning",
+                stream_id=stream_id,
+                peer=peer_handle,
+                publish_id=publish_id,
+                reason=reason,
+            )
+            observability.inc_metric(
+                app_state, "relay_federation_plaintext_fallback_total", reason=reason
+            )
             envelope["body"] = body_text
 
         outcome, dlq_error_code, retry_after = await _send_envelope(

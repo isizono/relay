@@ -84,6 +84,7 @@ DEFAULT_MAX_STREAM_NAME_LENGTH = 128
 # federation（relay 間連合）の既定値。
 DEFAULT_FEDERATION_TS_SKEW_SECONDS = 300
 DEFAULT_FEDERATION_ALLOW_PRIVATE_LOCATORS = False
+DEFAULT_FEDERATION_REQUIRE_ENCRYPTION = False
 
 
 @dataclass(frozen=True)
@@ -149,6 +150,11 @@ class Settings:
     federation_base_url: str | None = None
     federation_ts_skew_seconds: int = DEFAULT_FEDERATION_TS_SKEW_SECONDS
     federation_allow_private_locators: bool = DEFAULT_FEDERATION_ALLOW_PRIVATE_LOCATORS
+
+    # true の場合、暗号化鍵が双方揃わない peer 宛の配達を平文フォールバックさせず
+    # permanent error として DLQ に回す（peer 単位の `peers.require_encryption` との OR、
+    # relay.federation_egress 参照）。既定 false は既存ロールアウトの互換性を壊さないため。
+    federation_require_encryption: bool = DEFAULT_FEDERATION_REQUIRE_ENCRYPTION
 
 
 def _parse_bool_env(env_var: str, default: bool) -> bool:
@@ -290,6 +296,10 @@ def load_settings_from_env() -> Settings:
         federation_allow_private_locators=_parse_bool_env(
             "RELAY_FEDERATION_ALLOW_PRIVATE_LOCATORS",
             DEFAULT_FEDERATION_ALLOW_PRIVATE_LOCATORS,
+        ),
+        federation_require_encryption=_parse_bool_env(
+            "RELAY_FEDERATION_REQUIRE_ENCRYPTION",
+            DEFAULT_FEDERATION_REQUIRE_ENCRYPTION,
         ),
     )
 

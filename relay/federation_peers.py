@@ -292,6 +292,7 @@ def _peer_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "revoked_at": row["revoked_at"],
         "disclosure_level": row["disclosure_level"],
         "enc_key_jwk": json.loads(enc_key_jwk) if enc_key_jwk is not None else None,
+        "require_encryption": bool(row["require_encryption"]),
     }
 
 
@@ -382,6 +383,29 @@ def set_peer_enc_key(db_path: str, *, fingerprint: str, enc_key_jwk: dict[str, A
         cur = conn.execute(
             "UPDATE peers SET enc_key_jwk = ? WHERE fingerprint = ?",
             (json.dumps(enc_key_jwk), fingerprint),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def set_peer_require_encryption(db_path: str, *, handle: str, required: bool) -> bool:
+    """peer 単位の暗号化必須フラグ（`peers.require_encryption`）を切り替える。
+
+    `python -m relay.invite peer require-encryption <handle> on|off` から呼ぶ。真の場合、
+    この peer 宛の配達は暗号化鍵が双方揃わない限り平文フォールバックせず permanent error
+    として DLQ に回す（`relay.federation_egress` 参照。全体設定
+    `Settings.federation_require_encryption` との OR で最終判定する）。
+
+    Returns:
+        対象 handle の peer が存在し更新できたかどうか。
+    """
+    conn = db.get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "UPDATE peers SET require_encryption = ? WHERE handle = ?",
+            (1 if required else 0, handle),
         )
         conn.commit()
         return cur.rowcount > 0

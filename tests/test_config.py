@@ -88,19 +88,23 @@ class TestLoadSettingsFromEnv:
         monkeypatch.delenv("RELAY_BASE_URL", raising=False)
         monkeypatch.delenv("RELAY_FEDERATION_TS_SKEW_SECONDS", raising=False)
         monkeypatch.delenv("RELAY_FEDERATION_ALLOW_PRIVATE_LOCATORS", raising=False)
+        monkeypatch.delenv("RELAY_FEDERATION_REQUIRE_ENCRYPTION", raising=False)
         settings = load_settings_from_env()
         assert settings.federation_base_url is None
         assert settings.federation_ts_skew_seconds == 300
         assert settings.federation_allow_private_locators is False
+        assert settings.federation_require_encryption is False
 
     def test_reads_federation_settings_from_env(self, monkeypatch):
         monkeypatch.setenv("RELAY_BASE_URL", "https://relay-a.example")
         monkeypatch.setenv("RELAY_FEDERATION_TS_SKEW_SECONDS", "60")
         monkeypatch.setenv("RELAY_FEDERATION_ALLOW_PRIVATE_LOCATORS", "true")
+        monkeypatch.setenv("RELAY_FEDERATION_REQUIRE_ENCRYPTION", "true")
         settings = load_settings_from_env()
         assert settings.federation_base_url == "https://relay-a.example"
         assert settings.federation_ts_skew_seconds == 60
         assert settings.federation_allow_private_locators is True
+        assert settings.federation_require_encryption is True
 
     @pytest.mark.parametrize("raw", ["1", "true", "TRUE", "True"])
     def test_federation_allow_private_locators_truthy_values(self, monkeypatch, raw):
@@ -113,6 +117,18 @@ class TestLoadSettingsFromEnv:
         monkeypatch.setenv("RELAY_FEDERATION_ALLOW_PRIVATE_LOCATORS", raw)
         settings = load_settings_from_env()
         assert settings.federation_allow_private_locators is False
+
+    @pytest.mark.parametrize("raw", ["1", "true", "TRUE", "True"])
+    def test_federation_require_encryption_truthy_values(self, monkeypatch, raw):
+        monkeypatch.setenv("RELAY_FEDERATION_REQUIRE_ENCRYPTION", raw)
+        settings = load_settings_from_env()
+        assert settings.federation_require_encryption is True
+
+    @pytest.mark.parametrize("raw", ["0", "false", "", "no"])
+    def test_federation_require_encryption_falsy_values(self, monkeypatch, raw):
+        monkeypatch.setenv("RELAY_FEDERATION_REQUIRE_ENCRYPTION", raw)
+        settings = load_settings_from_env()
+        assert settings.federation_require_encryption is False
 
 
 class TestValidateLocalIdentity:
