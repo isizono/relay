@@ -20,7 +20,7 @@ from relay.app import app as relay_app
 logger = logging.getLogger("relay.serve")
 
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8000
+DEFAULT_PORT = 8770  # relay.invite の招待URL生成の既定ポートと揃える
 DEFAULT_LISTEN_BACKLOG = 2048
 
 DEFAULT_TCP_KEEPIDLE_SECONDS = 60

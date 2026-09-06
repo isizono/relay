@@ -5,12 +5,12 @@ relay サーバーの起動・bind 先の選び方・TCP keepalive・招待 URL 
 ## 起動
 
 ```bash
-uv run python -m relay.serve --host 127.0.0.1 --port 8000
+uv run python -m relay.serve --host 127.0.0.1 --port 8770
 ```
 
 `relay.serve`（`relay/serve.py`）は listen socket を自前で作って TCP keepalive を設定したうえで uvicorn に渡し、`relay.app:app` を起動する。詳細は後述の「TCP keepalive」を参照。
 
-`uv run uvicorn relay.app:app --host 127.0.0.1 --port 8000` で直接起動することもできる。ASGI アプリケーションとしての振る舞いは同一だが、この起動方法では TCP keepalive は OS 既定のままになる。
+`uv run uvicorn relay.app:app --host 127.0.0.1 --port 8770` で直接起動することもできる。ASGI アプリケーションとしての振る舞いは同一だが、この起動方法では TCP keepalive は OS 既定のままになる。
 
 ## `--host` の選び方
 

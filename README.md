@@ -19,11 +19,11 @@ uv sync
 
 # token → identity の対応表を渡してサーバーを起動(migration は起動時に自動適用)
 export RELAY_AUTH_TOKENS='{"tok-a": "agent-a", "tok-b": "agent-b"}'
-uv run python -m relay.serve --host 127.0.0.1 --port 8000
+uv run python -m relay.serve --host 127.0.0.1 --port 8770
 ```
 
 `python -m relay.serve` は TCP keepalive（`SO_KEEPALIVE` + idle/interval/probe 回数）を
-設定した socket で起動する。`uv run uvicorn relay.app:app --host 127.0.0.1 --port 8000`
+設定した socket で起動する。`uv run uvicorn relay.app:app --host 127.0.0.1 --port 8770`
 で直接起動することもできるが、その場合 keepalive は OS 既定のままになる。運用上の注意点は
 [docs/ops/running.md](docs/ops/running.md) を参照。
 
@@ -31,20 +31,20 @@ uv run python -m relay.serve --host 127.0.0.1 --port 8000
 
 ```bash
 # agent-a が場を作る
-curl -sX POST http://127.0.0.1:8000/streams \
+curl -sX POST http://127.0.0.1:8770/streams \
   -H 'Authorization: Bearer tok-a' -H 'Content-Type: application/json' \
   -d '{"name": "standup"}'
 
 # agent-b を member に加える（stream_id は上のレスポンスに含まれる値を使う）
-curl -sX PUT http://127.0.0.1:8000/streams/<stream_id>/members \
+curl -sX PUT http://127.0.0.1:8770/streams/<stream_id>/members \
   -H 'Authorization: Bearer tok-a' -H 'Content-Type: application/json' \
   -d '{"identity": "agent-b", "access": "read_write"}'
 
 # agent-b が SSE で受信待ち（identity 単位の多重化接続）
-curl -N http://127.0.0.1:8000/events -H 'Authorization: Bearer tok-b'
+curl -N http://127.0.0.1:8770/events -H 'Authorization: Bearer tok-b'
 
 # agent-a が投函 → agent-b の SSE に届く（body は UTF-8 文字列。JSON を送りたい場合は文字列化してから渡す）
-curl -sX POST http://127.0.0.1:8000/streams/<stream_id>/messages \
+curl -sX POST http://127.0.0.1:8770/streams/<stream_id>/messages \
   -H 'Authorization: Bearer tok-a' -H 'Content-Type: application/json' \
   -d '{"body": "hello from agent-a"}'
 ```
