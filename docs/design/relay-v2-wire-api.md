@@ -71,6 +71,7 @@ SSE 接続（`GET /events`）は **認証済み identity の単一多重化接�
 |---|---|---|
 | **場 (stream)** | | |
 | `POST /streams` | 場の作成 | `201 { stream_id }` |
+| `GET /streams` | 呼び出し元が read 権限を持つ場の一覧 | `200 { streams: [...] }` |
 | `DELETE /streams/{stream_id}` | 場の close（新規投函停止のみ） | `204` |
 | `GET /streams/{stream_id}` | 場のメタ取得 | `200 { stream_id, state, created_at }` |
 | `POST /streams/{stream_id}/messages` | 場への投函（場 publish） | `202 { publish_id, matched_members }` |
@@ -207,6 +208,22 @@ DELETE /streams/{stream_id}
 - close 済み場の in-memory record は idle-GC の対象になる（§6.8）。close から猶予期間を過ぎ、かつ
   その場の未配達 outbox エントリが drain し切ったものを registry から除去する。除去後の同名 `stream_id`
   は不在（`GET` は `404`）となり、再作成が可能になる。
+
+### 3.5 `GET /streams` — 一覧
+
+```
+GET /streams
+→ 200 OK { streams: [ { stream_id, state, created_at }, ... ] }
+→ 401 Unauthorized
+```
+
+- 呼び出し元 identity が **read 権限**（`access: "read" | "read_write"`）を持つ member である
+  場だけを列挙する。member でない場は結果に含めない（§3.3 の参照系と同じく非露呈）。
+  read 権限を持たない場（例: write 単独権限のみで自身に read を付与していない作成者）は、
+  自分が作成した場であっても一覧には現れない — `GET /streams/{stream_id}`（§3.3）の単体参照が
+  member であること（access 種別を問わない）を基準にするのとは異なる基準である。
+- 各要素は `GET /streams/{stream_id}`（§3.3 参照）のレスポンスと同一のメタ形状を持つ。
+- ページングは持たない（v1 スコープ外。件数が問題になった段階で別途検討する）。
 
 ---
 

@@ -224,12 +224,12 @@ read 権限を持つ member でない」を同一の `404 Not Found` と明記�
 
 ### 既知のギャップ（後続タスクへの申し送り）
 
-1. **`GET /streams`（一覧）は wire-api.md に存在しない**。本タスクの依頼文には
-   「`GET /streams`」という記載があったが、`relay-v2-wire-api.md` §2 / §3 の
-   endpoint 一覧には `GET /streams/{stream_id}`（単一 stream のメタ取得）しか
-   定義されていない。一覧 endpoint を新設するかどうかは仕様上未確定のため、本タスクでは
-   `GET /streams/{stream_id}` のみを実装し、一覧 endpoint は実装していない。必要であれば
-   別途仕様を確定してから追加すべきである。
+1. **（解消済み）** `GET /streams`（一覧）を追加した。`relay-v2-wire-api.md` §3.5 に
+   仕様を確定し、`StreamRegistry.list_readable_meta` + `relay.streams.list_streams`
+   （`relay/streams.py`）で実装した。呼び出し元 identity が **read 権限**を持つ member
+   である場のみを列挙し（write 単独権限の作成者は自身に read を付与しない限り一覧に
+   現れない — `GET /streams/{stream_id}` の単体参照が member であること全般を基準に
+   するのとは異なる基準）、各要素は単体参照と同じメタ形状を返す。ページングは持たない。
 2. **（解消済み、Delivery タスクで対応）** `idempotency_key` の 15 分 dedup
    （wire-api.md §6.3）は `relay/idempotency.py` の共通ヘルパーで実装した。
    stream レーン（本モジュール）と subscription レーンの `POST /publish` の両方が

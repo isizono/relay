@@ -1,8 +1,9 @@
 """stream（場）関連 endpoint（relay-v2-wire-api.md §3）。
 
-`POST /streams` / `GET /streams/{stream_id}` / `DELETE /streams/{stream_id}` /
-`POST /streams/{stream_id}/messages` / `PUT`・`DELETE`・`GET /streams/{stream_id}/members` /
-`POST /streams/{stream_id}/ack` を実装する。
+`POST /streams` / `GET /streams`（一覧） / `GET /streams/{stream_id}` /
+`DELETE /streams/{stream_id}` / `POST /streams/{stream_id}/messages` /
+`PUT`・`DELETE`・`GET /streams/{stream_id}/members` / `POST /streams/{stream_id}/ack`
+を実装する。
 
 stream の状態（membership 含む）は relay-v2-wire-api.md §0 の R1 原則により in-memory
 実装とする（`StreamRegistry`）。SQLite には streams / memberships table を持たない。
@@ -388,6 +389,27 @@ class StreamRegistry:
                 if record.members.get(identity) in ("read", "read_write")
             ]
 
+    def list_readable_meta(self, identity: str) -> list[dict[str, str]]:
+        """`identity` が read 権限を持つ stream の一覧を、`GET /streams/{stream_id}`
+        （`get_stream`）と同じメタ形状（stream_id/state/created_at）で返す（wire-api.md §3.5）。
+
+        write 単独権限の member（作成者 bootstrap の既定）は含めない。`GET /streams/{id}`
+        の単体参照は `is_member`（access 種別を問わない）を基準にするのに対し、一覧は
+        受信可能な場だけを見せる意図で read 権限（`read` / `read_write`）を基準にする —
+        両者は意図的に異なる基準であり、write 単独の作成者は自分の stream を一覧に見るには
+        明示的に read（または read_write）を自身に付与する必要がある。
+        """
+        with self._lock:
+            return [
+                {
+                    "stream_id": record.stream_id,
+                    "state": record.state,
+                    "created_at": record.created_at,
+                }
+                for record in self._streams.values()
+                if record.members.get(identity) in ("read", "read_write")
+            ]
+
 
 def get_registry_from_state(app_state) -> StreamRegistry:
     """`request.app.state.stream_registry` を遅延初期化して返す。
@@ -532,6 +554,22 @@ async def create_stream(request: Request) -> Response:
     return JSONResponse(
         {"stream_id": record.stream_id, "created_at": record.created_at}, status_code=201
     )
+
+
+# ---------------------------------------------------------------------------
+# endpoint: GET /streams（一覧）
+# ---------------------------------------------------------------------------
+
+
+@require_authn
+async def list_streams(request: Request) -> Response:
+    """呼び出し元 identity が read 権限を持つ member である stream の一覧を返す
+    （wire-api.md §3.5）。member でない stream は結果に含めない（存在を露呈しない）。
+    """
+    identity: Identity = request.state.identity
+    registry = _get_registry(request)
+    streams = registry.list_readable_meta(identity.id)
+    return JSONResponse({"streams": streams})
 
 
 # ---------------------------------------------------------------------------
@@ -930,6 +968,7 @@ async def ack_stream(request: Request) -> Response:
 
 routes: list[Route] = [
     Route("/streams", create_stream, methods=["POST"]),
+    Route("/streams", list_streams, methods=["GET"]),
     Route("/streams/{stream_id}", get_stream, methods=["GET"]),
     Route("/streams/{stream_id}", close_stream, methods=["DELETE"]),
     Route("/streams/{stream_id}/messages", post_stream_message, methods=["POST"]),
