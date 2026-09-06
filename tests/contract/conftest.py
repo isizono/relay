@@ -91,6 +91,9 @@ def make_recording_client(base_url: str, token: str) -> httpx.Client:
     relay が返す生の status code / JSON body（error envelope の `code` / `message` 等）を
     直接検証したいテストは `client.last_response`（直前に送ったリクエストの生
     `httpx.Response`）を見る。
+
+    `last_response` は直前の 1 リクエスト分しか保持しない（同一 client で複数 request を
+    送ると上書きされる）。検証したい呼び出しの直後に読むこと。
     """
     client = make_client(base_url, bearer_token=token)
     client.last_response = None
