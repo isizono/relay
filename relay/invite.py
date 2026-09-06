@@ -1,7 +1,7 @@
 """招待 URL 発行 CLI（`python -m relay.invite`）。
 
-relay DB へ直接 INSERT するローカル CLI。発行操作をネットワークに晒さないための
-D1 の実現手段であり、HTTP 発行 endpoint は存在しない。
+relay DB へ直接 INSERT するローカル CLI。発行操作をネットワークに晒さない設計方針の
+実現手段であり、HTTP 発行 endpoint は存在しない。
 
 DB パスの解決順は `--db` 明示 → env `RELAY_DB_PATH` → canonical 絶対パス
 `~/.local/state/relay/relay.db`（cwd 相対 fallback は持たない）。launchd が export する
@@ -205,6 +205,34 @@ def _cmd_list(args: argparse.Namespace) -> int:
             f" state={state}"
         )
     return 0
+
+
+def _print_client_alias_deprecation_notice(command: str) -> None:
+    """裸コマンド（`invite <command>`）呼び出し時に stderr へ非推奨通知を1行出す。
+
+    stdout・終了コードは呼び出し先の `_cmd_*` がそのまま決めるため、この関数は
+    stderr への出力のみを行う。
+    """
+    print(
+        f"`python -m relay.invite {command}` は非推奨です。"
+        f"`python -m relay.invite client {command}` を使うこと",
+        file=sys.stderr,
+    )
+
+
+def _cmd_new_deprecated(args: argparse.Namespace) -> int:
+    _print_client_alias_deprecation_notice("new")
+    return _cmd_new(args)
+
+
+def _cmd_revoke_deprecated(args: argparse.Namespace) -> int:
+    _print_client_alias_deprecation_notice("revoke")
+    return _cmd_revoke(args)
+
+
+def _cmd_list_deprecated(args: argparse.Namespace) -> int:
+    _print_client_alias_deprecation_notice("list")
+    return _cmd_list(args)
 
 
 # ---------------------------------------------------------------------------
@@ -582,30 +610,73 @@ def _cmd_peer_revoke(args: argparse.Namespace) -> int:
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m relay.invite")
-    sub = parser.add_subparsers(dest="command", required=True)
+def _add_client_new_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--identity", required=True)
+    parser.add_argument("--ttl", default="15m")
+    parser.add_argument("--credential-ttl", default="none")
+    parser.add_argument("--base-url", default=None)
+    parser.add_argument("--db", default=None)
 
-    new_parser = sub.add_parser("new", help="招待 URL を新規発行する")
-    new_parser.add_argument("--identity", required=True)
-    new_parser.add_argument("--ttl", default="15m")
-    new_parser.add_argument("--credential-ttl", default="none")
-    new_parser.add_argument("--base-url", default=None)
-    new_parser.add_argument("--db", default=None)
-    new_parser.set_defaults(func=_cmd_new)
 
-    revoke_parser = sub.add_parser("revoke", help="credential を失効する")
-    selector = revoke_parser.add_mutually_exclusive_group(required=True)
+def _add_client_revoke_args(parser: argparse.ArgumentParser) -> None:
+    selector = parser.add_mutually_exclusive_group(required=True)
     selector.add_argument("--identity")
     selector.add_argument("--credential-id", type=int)
-    revoke_parser.add_argument("--db", default=None)
-    revoke_parser.set_defaults(func=_cmd_revoke)
+    parser.add_argument("--db", default=None)
 
-    list_parser = sub.add_parser("list", help="invitations / credentials を一覧表示する")
-    list_parser.add_argument("--db", default=None)
-    list_parser.set_defaults(func=_cmd_list)
 
-    peer_parser = sub.add_parser("peer", help="federation peer 操作")
+def _add_client_list_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--db", default=None)
+
+
+CLIENT_MODEL_HELP = "1 つの relay に複数の Claude Code 等が接続するための招待"
+PEER_MODEL_HELP = "2 つの独立した relay 同士を接続するための招待"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m relay.invite",
+        description=(
+            "relay への招待 URL を発行・管理する。2 つの接続モデルがある。\n\n"
+            f"  client: {CLIENT_MODEL_HELP}\n"
+            f"  peer:   {PEER_MODEL_HELP}"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    client_parser = sub.add_parser("client", help=CLIENT_MODEL_HELP)
+    client_sub = client_parser.add_subparsers(dest="client_command", required=True)
+
+    client_new_parser = client_sub.add_parser("new", help="招待 URL を新規発行する")
+    _add_client_new_args(client_new_parser)
+    client_new_parser.set_defaults(func=_cmd_new)
+
+    client_revoke_parser = client_sub.add_parser("revoke", help="credential を失効する")
+    _add_client_revoke_args(client_revoke_parser)
+    client_revoke_parser.set_defaults(func=_cmd_revoke)
+
+    client_list_parser = client_sub.add_parser(
+        "list", help="invitations / credentials を一覧表示する"
+    )
+    _add_client_list_args(client_list_parser)
+    client_list_parser.set_defaults(func=_cmd_list)
+
+    # 後方互換: 従来の裸コマンド（`invite new` 等）を client サブコマンドの別名として
+    # 動かし続ける。実行時に stderr へ非推奨通知を出す。
+    new_parser = sub.add_parser("new", help="非推奨: `client new` を使うこと")
+    _add_client_new_args(new_parser)
+    new_parser.set_defaults(func=_cmd_new_deprecated)
+
+    revoke_parser = sub.add_parser("revoke", help="非推奨: `client revoke` を使うこと")
+    _add_client_revoke_args(revoke_parser)
+    revoke_parser.set_defaults(func=_cmd_revoke_deprecated)
+
+    list_parser = sub.add_parser("list", help="非推奨: `client list` を使うこと")
+    _add_client_list_args(list_parser)
+    list_parser.set_defaults(func=_cmd_list_deprecated)
+
+    peer_parser = sub.add_parser("peer", help=PEER_MODEL_HELP)
     peer_sub = peer_parser.add_subparsers(dest="peer_command", required=True)
 
     peer_new_parser = peer_sub.add_parser("new", help="peer 招待 URL を新規発行する")

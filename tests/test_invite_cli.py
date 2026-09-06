@@ -68,7 +68,7 @@ class TestCmdNew:
     def test_prints_fragment_url_and_inserts_row(self, tmp_path, capsys, monkeypatch):
         monkeypatch.delenv("RELAY_BASE_URL", raising=False)
         db_path = str(tmp_path / "cli.db")
-        rc = invite.main(["new", "--identity", "cc-memory", "--db", db_path])
+        rc = invite.main(["client", "new", "--identity", "cc-memory", "--db", db_path])
         assert rc == 0
         out = capsys.readouterr().out.strip()
         assert out.startswith("http://127.0.0.1:8770/invitations/redeem#v=1&t=it_")
@@ -85,6 +85,7 @@ class TestCmdNew:
         db_path = str(tmp_path / "cli.db")
         invite.main(
             [
+                "client",
                 "new",
                 "--identity",
                 "cc-memory",
@@ -100,7 +101,7 @@ class TestCmdNew:
     def test_env_base_url_used_when_no_explicit_flag(self, tmp_path, capsys, monkeypatch):
         monkeypatch.setenv("RELAY_BASE_URL", "https://relay.example.org")
         db_path = str(tmp_path / "cli.db")
-        rc = invite.main(["new", "--identity", "cc-memory", "--db", db_path])
+        rc = invite.main(["client", "new", "--identity", "cc-memory", "--db", db_path])
         assert rc == 0
         captured = capsys.readouterr()
         assert captured.out.strip().startswith(
@@ -113,6 +114,7 @@ class TestCmdNew:
         db_path = str(tmp_path / "cli.db")
         rc = invite.main(
             [
+                "client",
                 "new",
                 "--identity",
                 "cc-memory",
@@ -132,7 +134,7 @@ class TestCmdNew:
     def test_neither_given_falls_back_to_default_and_warns(self, tmp_path, capsys, monkeypatch):
         monkeypatch.delenv("RELAY_BASE_URL", raising=False)
         db_path = str(tmp_path / "cli.db")
-        rc = invite.main(["new", "--identity", "cc-memory", "--db", db_path])
+        rc = invite.main(["client", "new", "--identity", "cc-memory", "--db", db_path])
         assert rc == 0
         captured = capsys.readouterr()
         assert captured.out.strip().startswith(
@@ -143,23 +145,27 @@ class TestCmdNew:
 
     def test_rejects_none_ttl_for_invite(self, tmp_path, capsys):
         db_path = str(tmp_path / "cli.db")
-        rc = invite.main(["new", "--identity", "cc-memory", "--db", db_path, "--ttl", "none"])
+        rc = invite.main(
+            ["client", "new", "--identity", "cc-memory", "--db", db_path, "--ttl", "none"]
+        )
         assert rc != 0
 
     def test_rejects_invalid_ttl_format(self, tmp_path, capsys):
         db_path = str(tmp_path / "cli.db")
-        rc = invite.main(["new", "--identity", "cc-memory", "--db", db_path, "--ttl", "bogus"])
+        rc = invite.main(
+            ["client", "new", "--identity", "cc-memory", "--db", db_path, "--ttl", "bogus"]
+        )
         assert rc != 0
 
 
 class TestCmdList:
     def test_lists_invitation_with_masked_token(self, tmp_path, capsys):
         db_path = str(tmp_path / "cli.db")
-        invite.main(["new", "--identity", "cc-memory", "--db", db_path])
+        invite.main(["client", "new", "--identity", "cc-memory", "--db", db_path])
         full_url = capsys.readouterr().out.strip()
         full_token = full_url.rsplit("t=", 1)[1]
 
-        rc = invite.main(["list", "--db", db_path])
+        rc = invite.main(["client", "list", "--db", db_path])
         assert rc == 0
         out = capsys.readouterr().out
         assert "cc-memory" in out
@@ -168,7 +174,7 @@ class TestCmdList:
 
     def test_lists_redeemed_credential(self, tmp_path, capsys):
         db_path = str(tmp_path / "cli.db")
-        invite.main(["new", "--identity", "cc-memory", "--db", db_path])
+        invite.main(["client", "new", "--identity", "cc-memory", "--db", db_path])
         full_url = capsys.readouterr().out.strip()
         token = full_url.rsplit("t=", 1)[1]
 
@@ -178,7 +184,7 @@ class TestCmdList:
         finally:
             conn.close()
 
-        rc = invite.main(["list", "--db", db_path])
+        rc = invite.main(["client", "list", "--db", db_path])
         assert rc == 0
         out = capsys.readouterr().out
         assert "redeemed" in out
@@ -186,7 +192,7 @@ class TestCmdList:
 
     def test_empty_db_lists_nothing_but_succeeds(self, tmp_path, capsys):
         db_path = str(tmp_path / "empty.db")
-        rc = invite.main(["list", "--db", db_path])
+        rc = invite.main(["client", "list", "--db", db_path])
         assert rc == 0
         out = capsys.readouterr().out
         assert "invitations:" in out
@@ -196,7 +202,7 @@ class TestCmdList:
 class TestCmdRevoke:
     def test_revoke_by_identity_marks_credential_revoked(self, tmp_path, capsys):
         db_path = str(tmp_path / "cli.db")
-        invite.main(["new", "--identity", "cc-memory", "--db", db_path])
+        invite.main(["client", "new", "--identity", "cc-memory", "--db", db_path])
         full_url = capsys.readouterr().out.strip()
         token = full_url.rsplit("t=", 1)[1]
 
@@ -206,7 +212,7 @@ class TestCmdRevoke:
         finally:
             conn.close()
 
-        rc = invite.main(["revoke", "--identity", "cc-memory", "--db", db_path])
+        rc = invite.main(["client", "revoke", "--identity", "cc-memory", "--db", db_path])
         assert rc == 0
 
         conn = db.get_connection(db_path)
@@ -220,7 +226,7 @@ class TestCmdRevoke:
 
     def test_revoke_by_credential_id(self, tmp_path, capsys):
         db_path = str(tmp_path / "cli.db")
-        invite.main(["new", "--identity", "cc-memory", "--db", db_path])
+        invite.main(["client", "new", "--identity", "cc-memory", "--db", db_path])
         full_url = capsys.readouterr().out.strip()
         token = full_url.rsplit("t=", 1)[1]
 
@@ -231,26 +237,104 @@ class TestCmdRevoke:
         finally:
             conn.close()
 
-        rc = invite.main(["revoke", "--credential-id", str(cred_id), "--db", db_path])
+        rc = invite.main(["client", "revoke", "--credential-id", str(cred_id), "--db", db_path])
         assert rc == 0
 
     def test_revoke_no_match_returns_nonzero(self, tmp_path):
         db_path = str(tmp_path / "cli.db")
         db.init_db(db_path)
-        rc = invite.main(["revoke", "--identity", "nobody", "--db", db_path])
+        rc = invite.main(["client", "revoke", "--identity", "nobody", "--db", db_path])
         assert rc != 0
 
     def test_revoke_requires_identity_or_credential_id(self, tmp_path):
         db_path = str(tmp_path / "cli.db")
         with pytest.raises(SystemExit):
-            invite.main(["revoke", "--db", db_path])
+            invite.main(["client", "revoke", "--db", db_path])
 
 
 class TestCmdNewRejectsAtInIdentity:
     def test_at_in_identity_returns_nonzero(self, tmp_path):
         db_path = str(tmp_path / "cli.db")
-        rc = invite.main(["new", "--identity", "orch@bob", "--db", db_path])
+        rc = invite.main(["client", "new", "--identity", "orch@bob", "--db", db_path])
         assert rc != 0
+
+
+class TestClientAliasBackwardCompatibility:
+    """裸コマンド（`invite new` 等）が `client` サブコマンドの別名として動き続けること、
+
+    stdout・終了コードを変えずに stderr へ非推奨通知だけを追加することを検証する。
+    """
+
+    def test_bare_new_forwards_to_client_new_and_warns(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.delenv("RELAY_BASE_URL", raising=False)
+        client_db = str(tmp_path / "client.db")
+        bare_db = str(tmp_path / "bare.db")
+
+        rc_client = invite.main(
+            ["client", "new", "--identity", "cc-memory", "--db", client_db]
+        )
+        client_captured = capsys.readouterr()
+
+        rc_bare = invite.main(["new", "--identity", "cc-memory", "--db", bare_db])
+        bare_captured = capsys.readouterr()
+
+        assert rc_bare == rc_client == 0
+        # 発行 token はランダムなので完全一致ではなく URL の形式（prefix）で比較する
+        expected_prefix = "http://127.0.0.1:8770/invitations/redeem#v=1&t=it_"
+        assert client_captured.out.startswith(expected_prefix)
+        assert bare_captured.out.startswith(expected_prefix)
+        assert bare_captured.err != client_captured.err  # 非推奨通知の分だけ増える
+        assert "client new" in bare_captured.err
+        assert "非推奨" in bare_captured.err
+
+    def test_bare_revoke_forwards_to_client_revoke_and_warns(self, tmp_path, capsys):
+        db_path = str(tmp_path / "cli.db")
+        invite.main(["client", "new", "--identity", "cc-memory", "--db", db_path])
+        full_url = capsys.readouterr().out.strip()
+        token = full_url.rsplit("t=", 1)[1]
+
+        conn = db.get_connection(db_path)
+        try:
+            credentials.redeem_invite(conn, token, credentials._now_iso())
+        finally:
+            conn.close()
+
+        rc = invite.main(["revoke", "--identity", "cc-memory", "--db", db_path])
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "client revoke" in captured.err
+        assert "非推奨" in captured.err
+
+    def test_bare_list_forwards_to_client_list_and_warns(self, tmp_path, capsys):
+        db_path = str(tmp_path / "cli.db")
+        invite.main(["client", "new", "--identity", "cc-memory", "--db", db_path])
+        capsys.readouterr()
+
+        rc = invite.main(["list", "--db", db_path])
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "cc-memory" in captured.out
+        assert "client list" in captured.err
+        assert "非推奨" in captured.err
+
+
+class TestHelpTextExplainsConnectionModels:
+    def test_top_level_help_mentions_client_and_peer_models(self, capsys):
+        with pytest.raises(SystemExit):
+            invite.main(["--help"])
+        out = capsys.readouterr().out
+        assert "client" in out
+        assert "peer" in out
+        assert "1 つの relay に複数の Claude Code 等が接続するための招待" in out
+        assert "2 つの独立した relay 同士を接続するための招待" in out
+
+    def test_client_subcommand_routes_new_list_revoke(self, capsys):
+        with pytest.raises(SystemExit):
+            invite.main(["client", "--help"])
+        out = capsys.readouterr().out
+        assert "new" in out
+        assert "list" in out
+        assert "revoke" in out
 
 
 def _generate_private_pem() -> str:
