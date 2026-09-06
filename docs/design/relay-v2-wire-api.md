@@ -663,7 +663,7 @@ Request:
 ```
 
 - 招待 token の発行は本書の scope 外（HTTP 発行 endpoint は存在しない）。`python -m relay.invite new`
-  というローカル CLI が DB へ直接 INSERT する。
+  （現行では `python -m relay.invite client new`）というローカル CLI が DB へ直接 INSERT する。
 - redeem は一回性（atomic UPDATE の rowcount 判定）で exactly-once に落ちる。並行 redeem は
   1 リクエストのみ成功し、他は 404 になる。
 - 発行された bearer token は `Authorization: Bearer <token>` として他の全 endpoint の認証に
