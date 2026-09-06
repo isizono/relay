@@ -834,9 +834,17 @@ relay_sdk/
 ### 未実装 / 後続タスクへの申し送り
 
 1. **AsyncClient / asyncio 版 API は未実装**（§8 で v1 スコープ外と明記。同期版のみ）。
-2. **`tests/contract/`（§7.3 の独立 contract test）は未作成**。wire フォーマットの整合は
-   integration test（実 relay に対する往復）で間接的に検証している。ワイヤ API ドキュメント
-   更新時に SDK 側追随漏れを機械検知する専用スイートは後続で追加すべきである。
+2. **（解消済み）** `tests/contract/`（§7.3 の独立 contract test）を追加した。
+   `relay_sdk.http` の公開関数（dispatcher / `Subscription` が実際に使う唯一のリクエスト
+   構築経路）を実 relay（uvicorn を実 TCP port で起動、`GET /events` の真のストリーミングを
+   ASGITransport では検証できないため `tests/test_delivery.py` と同じ `LiveServer` 方式）に
+   対して呼び、応答を wire-api.md の記載形状と突き合わせる。subscribe / lease renew /
+   publish / SSE `id:` 行と payload `publish_id` の一致 / ack / unsubscribe / 場レーン
+   publish / 主要 error envelope（404 の秘匿, 409 重複, 413 サイズ超過, 401）を対象にした。
+   401 の応答（`relay/identity.py` の `require_authn`）は他の endpoint が使う共通
+   `{code, message}` envelope（`relay/errors.py`）を経由せず `{"error": <str>}` を直接
+   返すことが分かった。この不一致はどちらの仕様書にも明記が無く、本 PR の対象外の申し送り
+   事項として残す（統一するかどうかは別途決めるべきである）。
 3. **§7.2 の integration 観点のうち未自動化のもの**:
    - subscriber プロセス再起動 → 新規 subscribe → 古い outbox の 7 日後 GC（time-shift
      fixture）: dispatcher 側の DLQ 7 日 GC は `_gc_dlq` の単体テストで検証済みだが、

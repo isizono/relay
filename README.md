@@ -61,7 +61,7 @@ relay_sdk/      # Python SDK
 docs/
   design/           # プロトコル・SDK の仕様書（一次情報源）
   ARCHITECTURE.md   # 実装のモジュール構成と設計判断の記録
-tests/          # サーバー・SDK のテスト（integration/ に E2E roundtrip）
+tests/          # サーバー・SDK のテスト（integration/ に E2E roundtrip、contract/ に wire 仕様の契約テスト）
 ```
 
 ## 設定
