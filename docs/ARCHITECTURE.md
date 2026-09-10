@@ -993,3 +993,40 @@ medium3 の回帰テスト作成中に、`FakeRelay`（テスト用 stub、`rela
 変更した（`self.rfile` からの再読み込みをやめた）。これは `relay_sdk` 本体のバグではなく
 test double 側の実装欠陥だが、修正しない限り「同一 keep-alive 接続上で outage 中に
 複数回 request する」パターンのテストが不安定になるため、あわせて修正した。
+
+## `tests/integration/federation_harness.py`（2 relay federation 統合テストの基盤）
+
+`relay/federation_egress.py`（送信側）・`relay/federation_inbound.py`（受信側）は
+それぞれ単体テスト済みだが、2 relay 間で実際に署名付き HTTP 越しの配達が通ることそのもの
+を検証する integration test はこれまで無かった（`tests/integration/test_federation_cli_roundtrip.py`
+は招待 / redeem / enc-key の CLI 面を実 2 relay で検証済みだが、stream publish → egress →
+inbound → SSE 受信までは通していない）。`tests/integration/federation_harness.py` は
+この経路を埋める test harness で、`tests/integration/test_federation_roundtrip.py` から使う。
+
+### 構成
+
+`LiveRelay` が 1 relay インスタンスを実 TCP port（uvicorn + daemon thread、
+`tests/test_delivery.py` の `LiveServer` と同型）で起動する。`FederationPair` が A/B
+2 つの `LiveRelay` を束ね、`start()` 内で `python -m relay.invite peer new/redeem/enc-key`
+を実際に呼んで招待発行 → redeem → enc-key 交換までを完了させる。以降は
+`create_stream` / `add_federation_member` / `publish` / `open_sse` を組み合わせて
+往復を書ける。`federation_pair` という pytest fixture（`federation_harness.py` 定義）が
+この完了済み `FederationPair` を渡す。
+
+### 再利用時の注意
+
+- dispatcher（egress / local push とも）は各 `LiveRelay` の in-process asyncio task
+  （`relay/app.py` の lifespan、`Settings.dispatcher_poll_interval_seconds` で待ち時間を
+  縮めている）が担う。テスト側で dispatcher を別途起動する配線は要らない
+- `GET /events` は終端しないストリームのため ASGI transport / Starlette `TestClient` では
+  読めない（`tests/test_delivery.py` 冒頭 docstring 参照）。`FederationPair.open_sse` は
+  実ソケット越しの `httpx.Client.stream()` を使う
+- `tests/integration/` に `__init__.py` は無い（pytest の rootless import 前提）ため、
+  harness の import は `from federation_harness import ...`（相対 import ではない）
+- peer registry に `enc_key_jwk` が pin 済みであることは、実際に配達された envelope が
+  暗号化（`body_jwe`）されたことの証明にはならない（平文フォールバックへの regression でも
+  registry 側の値は変わらない）。wire 上で実際にどちらが送られたかを確認したい場合は
+  `capture_egress_envelope(monkeypatch)` を使う。`relay.federation_net.build_async_client`
+  を実ソケットのまま `event_hooks` で差し替え、egress dispatcher が POST する envelope
+  JSON を横取りする（`tests/test_federation_egress.py` の `_patch_transport` と異なり
+  `httpx.MockTransport` には差し替えないため、実際の配送は妨げない）
