@@ -255,8 +255,9 @@ _METRIC_HELP: dict[str, tuple[str, str]] = {
     ),
     "relay_federation_plaintext_fallback_total": (
         "counter",
-        "Total number of federation envelopes sent with an unencrypted body because an"
-        " encryption key was missing on either side, by reason.",
+        "Total number of federation envelopes whose first send attempt used an unencrypted"
+        " body because an encryption key was missing on either side, by reason. Counted once"
+        " per outbox row regardless of whether that attempt ultimately succeeds.",
     ),
     "relay_outbox_depth": (
         "gauge",

@@ -1017,7 +1017,7 @@ body を見ることができる。関与するのは「relay インスタンス
 改竄からの保護」のみである。
 
 暗号化鍵が双方揃わない場合は互換のため平文 `body` にフォールバックする（`relay-server.jsonl`
-への `federation_plaintext_fallback` 警告ログと `relay_federation_plaintext_fallback_total`
+への `federation_plaintext_fallback` ログと `relay_federation_plaintext_fallback_total`
 カウンタで可視化される）。全体設定 `Settings.federation_require_encryption` または peer 単位の
 `peers.require_encryption`（`python -m relay.invite peer require-encryption`）を真にすると、
 このフォールバックをやめて `PeerEncryptionRequired` で DLQ に回す（README「設定」節参照）。
