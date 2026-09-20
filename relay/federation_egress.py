@@ -63,9 +63,10 @@ envelope の `body`（メッセージ本文）は、自分に `Settings.jwe_priv
 / `from_sub` / `to_members` はいずれの場合も平文のまま送る（配達ルーティングに必要な
 メタデータであり、暗号化するとルーティング自体が機能しなくなるため対象外）。
 
-この平文フォールバックが発生するたびに構造化ログ（`federation_plaintext_fallback`、
-`reason` は `own_key_missing` / `peer_key_missing`）と Prometheus カウンタ
-（`relay_federation_plaintext_fallback_total`）を記録する。`Settings.federation_require_encryption`
+この平文フォールバックで送信に成功するたびに構造化ログ（`federation_plaintext_fallback`、
+`level="info"`、`reason` は `own_key_missing` / `peer_key_missing`）と Prometheus カウンタ
+（`relay_federation_plaintext_fallback_total`）を記録する（送信試行ではなく確定送信の回数。
+retry 中の再試行では増やさない）。`Settings.federation_require_encryption`
 （全体設定）または宛先 `peers.require_encryption`（peer 単位、`python -m relay.invite peer
 require-encryption` で切替）のいずれかが真の場合はこのフォールバックを行わず、平文で送らずに
 `PeerEncryptionRequired` で DLQ へ回す（鍵が揃うまで再送しても直らないため retryable にしない）。
@@ -362,6 +363,7 @@ async def _process_lane(
         # 暗号化鍵の両方が揃っているときだけ暗号化し、揃わなければ平文にフォールバックする
         # （ただし暗号化必須が有効な場合はフォールバックせず DLQ へ回す、下記参照）。
         peer_enc_key_jwk = peer["enc_key_jwk"]
+        plaintext_fallback_reason: str | None = None
         if settings.jwe_private_key_pem and peer_enc_key_jwk is not None:
             try:
                 envelope["body_jwe"] = federation_peers.encrypt_envelope_body(
@@ -401,19 +403,8 @@ async def _process_lane(
                         app_state=app_state,
                     )
                 break
-            observability.record_event(
-                app_state,
-                "federation_plaintext_fallback",
-                level="warning",
-                stream_id=stream_id,
-                peer=peer_handle,
-                publish_id=publish_id,
-                reason=reason,
-            )
-            observability.inc_metric(
-                app_state, "relay_federation_plaintext_fallback_total", reason=reason
-            )
             envelope["body"] = body_text
+            plaintext_fallback_reason = reason
 
         outcome, dlq_error_code, retry_after = await _send_envelope(
             client,
@@ -427,6 +418,22 @@ async def _process_lane(
         )
 
         if outcome == _OUTCOME_SUCCESS:
+            if plaintext_fallback_reason is not None:
+                # 確定送信のみ計上する（retry中の再試行では増やさない）。
+                observability.record_event(
+                    app_state,
+                    "federation_plaintext_fallback",
+                    level="info",
+                    stream_id=stream_id,
+                    peer=peer_handle,
+                    publish_id=publish_id,
+                    reason=plaintext_fallback_reason,
+                )
+                observability.inc_metric(
+                    app_state,
+                    "relay_federation_plaintext_fallback_total",
+                    reason=plaintext_fallback_reason,
+                )
             for row in group_rows:
                 db_conn.execute("DELETE FROM outbox WHERE id = ?", (row["id"],))
             observability.inc_metric(app_state, "relay_push_delivered_total", lane="federation")
