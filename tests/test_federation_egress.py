@@ -962,7 +962,7 @@ class TestEnvelopeBodyEncryption:
     ):
         """自分は暗号化鍵を設定しているが、宛先 peer にまだ pin されていない場合は平文。
 
-        この平文フォールバックは `federation_plaintext_fallback` 警告ログと
+        この平文フォールバックは `federation_plaintext_fallback` ログ（level="info"）と
         `relay_federation_plaintext_fallback_total` カウンタ（reason=peer_key_missing）を
         必ず伴う（可視化なしの無言フォールバックへの regression を防ぐ）。
         """
@@ -992,6 +992,7 @@ class TestEnvelopeBodyEncryption:
         log_entries = _read_server_log(settings)
         fallback_entries = [e for e in log_entries if e["event"] == "federation_plaintext_fallback"]
         assert len(fallback_entries) == 1
+        assert fallback_entries[0]["level"] == "info"
         assert fallback_entries[0]["reason"] == "peer_key_missing"
         assert fallback_entries[0]["peer"] == "bob"
 
@@ -1034,6 +1035,99 @@ class TestEnvelopeBodyEncryption:
 
         counters = observability.get_metrics_registry(app_state).snapshot()
         assert counters["relay_federation_plaintext_fallback_total"][(("reason", "own_key_missing"),)] == 1.0
+
+    def test_plaintext_fallback_recorded_on_first_attempt_even_if_send_fails(
+        self, monkeypatch, settings, app_state, pinned_bob, enc_keypair_a
+    ):
+        """平文で回線に出した事実は、その送信が結局失敗（timeout/5xx等）しても記録が残る。
+
+        `attempt_count == 0`（この outbox 行への最初の送信試行）の時点で記録するため、
+        直後に 500 が返って retryable 扱いになっても federation_plaintext_fallback は
+        既に 1 件記録済みのまま残る。
+        """
+        import dataclasses
+
+        settings = dataclasses.replace(settings, jwe_private_key_pem=enc_keypair_a["private_pem"])
+        app_state.settings = settings
+
+        registry = StreamRegistry()
+        registry.create("orch:collab", "orch", None)
+        registry.put_member("orch:collab", "orch@bob", "read")
+        _publish(settings, "orch:collab", "orch@bob", body="plain payload")
+
+        def handler(request):
+            return httpx.Response(500)
+
+        _patch_transport(monkeypatch, handler)
+        _run(_run_egress(app_state, settings, registry))
+
+        # 送信は失敗（retry対象で残る）だが、平文で送ろうとした事実は記録済み。
+        rows = _outbox_rows(settings, "orch:collab", "orch@bob")
+        assert len(rows) == 1
+        assert rows[0]["attempt_count"] == 1
+
+        log_entries = _read_server_log(settings)
+        fallback_entries = [e for e in log_entries if e["event"] == "federation_plaintext_fallback"]
+        assert len(fallback_entries) == 1
+        assert fallback_entries[0]["level"] == "info"
+        assert fallback_entries[0]["reason"] == "peer_key_missing"
+
+        counters = observability.get_metrics_registry(app_state).snapshot()
+        assert counters["relay_federation_plaintext_fallback_total"][(("reason", "peer_key_missing"),)] == 1.0
+
+    def test_plaintext_fallback_not_double_counted_on_retry(
+        self, monkeypatch, settings, app_state, pinned_bob, enc_keypair_a
+    ):
+        """同一 outbox 行がリトライで複数回処理されても、記録は最初の試行分だけ。
+
+        1回目の 500 応答（retryable）で1件記録された後、backoff 明けの再送が 202 で
+        成功しても件数は増えない（attempt_count がもう 0 でないため再記録されない）。
+        """
+        import dataclasses
+
+        settings = dataclasses.replace(settings, jwe_private_key_pem=enc_keypair_a["private_pem"])
+        app_state.settings = settings
+
+        registry = StreamRegistry()
+        registry.create("orch:collab", "orch", None)
+        registry.put_member("orch:collab", "orch@bob", "read")
+        publish_id = _publish(settings, "orch:collab", "orch@bob", body="plain payload")
+
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(500)
+            return httpx.Response(202)
+
+        _patch_transport(monkeypatch, handler)
+        _run(_run_egress(app_state, settings, registry))
+
+        # 1回目（失敗）で既に1件記録されている。
+        log_entries = _read_server_log(settings)
+        assert len([e for e in log_entries if e["event"] == "federation_plaintext_fallback"]) == 1
+        counters = observability.get_metrics_registry(app_state).snapshot()
+        assert counters["relay_federation_plaintext_fallback_total"][(("reason", "peer_key_missing"),)] == 1.0
+
+        conn = db.get_connection(settings.db_path)
+        try:
+            conn.execute(
+                "UPDATE outbox SET next_attempt_at = ? WHERE stream_id = ? AND publish_id = ?",
+                (_past_iso(5), "orch:collab", publish_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        _run(_run_egress(app_state, settings, registry))
+
+        assert _outbox_rows(settings, "orch:collab", "orch@bob") == []
+        log_entries = _read_server_log(settings)
+        fallback_entries = [e for e in log_entries if e["event"] == "federation_plaintext_fallback"]
+        assert len(fallback_entries) == 1
+        counters = observability.get_metrics_registry(app_state).snapshot()
+        assert counters["relay_federation_plaintext_fallback_total"][(("reason", "peer_key_missing"),)] == 1.0
 
     def test_require_encryption_global_setting_dlqs_instead_of_plaintext(
         self, monkeypatch, settings, app_state, pinned_bob, enc_keypair_a
