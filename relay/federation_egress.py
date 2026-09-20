@@ -63,9 +63,10 @@ envelope の `body`（メッセージ本文）は、自分に `Settings.jwe_priv
 / `from_sub` / `to_members` はいずれの場合も平文のまま送る（配達ルーティングに必要な
 メタデータであり、暗号化するとルーティング自体が機能しなくなるため対象外）。
 
-この平文フォールバックが発生するたびに構造化ログ（`federation_plaintext_fallback`、
-`reason` は `own_key_missing` / `peer_key_missing`）と Prometheus カウンタ
-（`relay_federation_plaintext_fallback_total`）を記録する。`Settings.federation_require_encryption`
+この平文フォールバックの最初の送信試行時（`outbox.attempt_count == 0`）に一度だけ構造化ログ
+（`federation_plaintext_fallback`、`level="info"`、`reason` は `own_key_missing` /
+`peer_key_missing`）と Prometheus カウンタ（`relay_federation_plaintext_fallback_total`）を
+記録する（同一 outbox 行が backoff 後に再試行されても再記録しない）。`Settings.federation_require_encryption`
 （全体設定）または宛先 `peers.require_encryption`（peer 単位、`python -m relay.invite peer
 require-encryption` で切替）のいずれかが真の場合はこのフォールバックを行わず、平文で送らずに
 `PeerEncryptionRequired` で DLQ へ回す（鍵が揃うまで再送しても直らないため retryable にしない）。
@@ -401,19 +402,23 @@ async def _process_lane(
                         app_state=app_state,
                     )
                 break
-            observability.record_event(
-                app_state,
-                "federation_plaintext_fallback",
-                level="warning",
-                stream_id=stream_id,
-                peer=peer_handle,
-                publish_id=publish_id,
-                reason=reason,
-            )
-            observability.inc_metric(
-                app_state, "relay_federation_plaintext_fallback_total", reason=reason
-            )
             envelope["body"] = body_text
+            if head["attempt_count"] == 0:
+                # この outbox 行への最初の送信試行時にのみ記録する（retry の再試行では
+                # 記録しない。attempt_count は retryable 失敗時のみ+1され、DLQ・成功時は
+                # 更新されないため、0 は「この行を一度も送信試行していない」ことと同値）。
+                observability.record_event(
+                    app_state,
+                    "federation_plaintext_fallback",
+                    level="info",
+                    stream_id=stream_id,
+                    peer=peer_handle,
+                    publish_id=publish_id,
+                    reason=reason,
+                )
+                observability.inc_metric(
+                    app_state, "relay_federation_plaintext_fallback_total", reason=reason
+                )
 
         outcome, dlq_error_code, retry_after = await _send_envelope(
             client,
