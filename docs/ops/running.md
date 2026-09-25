@@ -5,12 +5,12 @@ relay サーバーの起動・bind 先の選び方・TCP keepalive・招待 URL 
 ## 起動
 
 ```bash
-uv run python -m relay.serve --host 127.0.0.1 --port 8000
+uv run python -m relay.serve --host 127.0.0.1 --port 8770
 ```
 
 `relay.serve`（`relay/serve.py`）は listen socket を自前で作って TCP keepalive を設定したうえで uvicorn に渡し、`relay.app:app` を起動する。詳細は後述の「TCP keepalive」を参照。
 
-`uv run uvicorn relay.app:app --host 127.0.0.1 --port 8000` で直接起動することもできる。ASGI アプリケーションとしての振る舞いは同一だが、この起動方法では TCP keepalive は OS 既定のままになる。
+`uv run uvicorn relay.app:app --host 127.0.0.1 --port 8770` で直接起動することもできる。ASGI アプリケーションとしての振る舞いは同一だが、この起動方法では TCP keepalive は OS 既定のままになる。
 
 ## `--host` の選び方
 
@@ -24,7 +24,7 @@ uv run python -m relay.serve --host 127.0.0.1 --port 8000
 
 事実として、特定の IP アドレスを `--host` に指定すると listen socket はそのインタフェースにのみ bind され、ループバックインタフェース（`127.0.0.1`）は含まれない。そのため、同一マシン上で `127.0.0.1` 宛に接続していた既存のクライアント（`python -m relay.invite` の既定 `--base-url` や、動作確認用の `curl http://127.0.0.1:...` 等）は、`--host` をマシン固有の IP に変更した途端に接続できなくなる。同一マシンからの接続と LAN からの接続を両方とも受け付けたい場合は、特定 IP ではなく `0.0.0.0` を指定する必要がある。
 
-LAN 上の他マシンから relay を共有したい場合は `--host 0.0.0.0` が必要になる。ただしこれは relay の TCP ポートを LAN 上の任意のホストから到達可能にすることを意味する。relay は Bearer token（`RELAY_AUTH_TOKENS` で静的に設定するか、招待 `python -m relay.invite new` で発行した credential）による認証を要求する設計であり、`GET /` と `GET /.well-known/agent-card.json` を除く endpoint は無効な token を弾く。`0.0.0.0` で bind する場合、この認証設定（有効な token を関係者以外に渡さないこと、不要になった credential は `python -m relay.invite revoke` で失効させること）が到達可能性の唯一の防御線になる点に留意する。
+LAN 上の他マシンから relay を共有したい場合は `--host 0.0.0.0` が必要になる。ただしこれは relay の TCP ポートを LAN 上の任意のホストから到達可能にすることを意味する。relay は Bearer token（`RELAY_AUTH_TOKENS` で静的に設定するか、招待 `python -m relay.invite client new` で発行した credential）による認証を要求する設計であり、`GET /` と `GET /.well-known/agent-card.json` を除く endpoint は無効な token を弾く。`0.0.0.0` で bind する場合、この認証設定（有効な token を関係者以外に渡さないこと、不要になった credential は `python -m relay.invite client revoke` で失効させること）が到達可能性の唯一の防御線になる点に留意する。
 
 ## TCP keepalive
 
@@ -45,7 +45,7 @@ listen socket に設定した keepalive オプションは `accept()` で生成�
 
 ## `RELAY_BASE_URL` の役割
 
-`RELAY_BASE_URL` は、招待 URL（`python -m relay.invite new` / `peer new` が出力する URL）の base として使う値であり、federation peer の redeem 応答に載せる自分自身の locator（相手が以後この relay 宛にメッセージを送る際の宛先）にも使われる。
+`RELAY_BASE_URL` は、招待 URL（`python -m relay.invite client new` / `peer new` が出力する URL）の base として使う値であり、federation peer の redeem 応答に載せる自分自身の locator（相手が以後この relay 宛にメッセージを送る際の宛先）にも使われる。
 
 `python -m relay.invite` 系コマンドの base URL 解決順序は次のとおりである。
 
