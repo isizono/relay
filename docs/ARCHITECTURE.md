@@ -224,12 +224,12 @@ read 権限を持つ member でない」を同一の `404 Not Found` と明記�
 
 ### 既知のギャップ（後続タスクへの申し送り）
 
-1. **`GET /streams`（一覧）は wire-api.md に存在しない**。本タスクの依頼文には
-   「`GET /streams`」という記載があったが、`relay-v2-wire-api.md` §2 / §3 の
-   endpoint 一覧には `GET /streams/{stream_id}`（単一 stream のメタ取得）しか
-   定義されていない。一覧 endpoint を新設するかどうかは仕様上未確定のため、本タスクでは
-   `GET /streams/{stream_id}` のみを実装し、一覧 endpoint は実装していない。必要であれば
-   別途仕様を確定してから追加すべきである。
+1. **（解消済み）** `GET /streams`（一覧）を追加した。`relay-v2-wire-api.md` §3.5 に
+   仕様を確定し、`StreamRegistry.list_readable_meta` + `relay.streams.list_streams`
+   （`relay/streams.py`）で実装した。呼び出し元 identity が **read 権限**を持つ member
+   である場のみを列挙し（write 単独権限の作成者は自身に read を付与しない限り一覧に
+   現れない — `GET /streams/{stream_id}` の単体参照が member であること全般を基準に
+   するのとは異なる基準）、各要素は単体参照と同じメタ形状を返す。ページングは持たない。
 2. **（解消済み、Delivery タスクで対応）** `idempotency_key` の 15 分 dedup
    （wire-api.md §6.3）は `relay/idempotency.py` の共通ヘルパーで実装した。
    stream レーン（本モジュール）と subscription レーンの `POST /publish` の両方が
@@ -834,9 +834,17 @@ relay_sdk/
 ### 未実装 / 後続タスクへの申し送り
 
 1. **AsyncClient / asyncio 版 API は未実装**（§8 で v1 スコープ外と明記。同期版のみ）。
-2. **`tests/contract/`（§7.3 の独立 contract test）は未作成**。wire フォーマットの整合は
-   integration test（実 relay に対する往復）で間接的に検証している。ワイヤ API ドキュメント
-   更新時に SDK 側追随漏れを機械検知する専用スイートは後続で追加すべきである。
+2. **（解消済み）** `tests/contract/`（§7.3 の独立 contract test）を追加した。
+   `relay_sdk.http` の公開関数（dispatcher / `Subscription` が実際に使う唯一のリクエスト
+   構築経路）を実 relay（uvicorn を実 TCP port で起動、`GET /events` の真のストリーミングを
+   ASGITransport では検証できないため `tests/test_delivery.py` と同じ `LiveServer` 方式）に
+   対して呼び、応答を wire-api.md の記載形状と突き合わせる。subscribe / lease renew /
+   publish / SSE `id:` 行と payload `publish_id` の一致 / ack / unsubscribe / 場レーン
+   publish / 主要 error envelope（404 の秘匿, 409 重複, 413 サイズ超過, 401）を対象にした。
+   401 の応答（`relay/identity.py` の `require_authn`）は他の endpoint が使う共通
+   `{code, message}` envelope（`relay/errors.py`）を経由せず `{"error": <str>}` を直接
+   返すことが分かった。この不一致はどちらの仕様書にも明記が無く、本 PR の対象外の申し送り
+   事項として残す（統一するかどうかは別途決めるべきである）。
 3. **§7.2 の integration 観点のうち未自動化のもの**:
    - subscriber プロセス再起動 → 新規 subscribe → 古い outbox の 7 日後 GC（time-shift
      fixture）: dispatcher 側の DLQ 7 日 GC は `_gc_dlq` の単体テストで検証済みだが、

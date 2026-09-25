@@ -223,6 +223,37 @@ class TestStreamRegistry:
         registry = StreamRegistry()
         assert registry.has_peer_write_member("nope", "bob") is False
 
+    def test_list_readable_meta_excludes_write_only_member(self):
+        # bootstrap の creator は access="write" のみを持つため、read 権限を追加しない
+        # 限り自分の作成した stream は一覧に含まれない。
+        registry = StreamRegistry()
+        registry.create("s1", "agent-a", None)
+        assert registry.list_readable_meta("agent-a") == []
+
+    def test_list_readable_meta_includes_read_and_read_write_members(self):
+        registry = StreamRegistry()
+        registry.create("s1", "agent-a", None)
+        registry.create("s2", "agent-a", None)
+        registry.put_member("s1", "agent-b", "read")
+        registry.put_member("s2", "agent-b", "read_write")
+        result = {meta["stream_id"] for meta in registry.list_readable_meta("agent-b")}
+        assert result == {"s1", "s2"}
+
+    def test_list_readable_meta_shape_matches_get(self):
+        registry = StreamRegistry()
+        record = registry.create("s1", "agent-a", None)
+        registry.put_member("s1", "agent-a", "read_write")
+        [meta] = registry.list_readable_meta("agent-a")
+        assert meta == {
+            "stream_id": record.stream_id,
+            "state": record.state,
+            "created_at": record.created_at,
+        }
+
+    def test_list_readable_meta_empty_for_identity_with_no_streams(self):
+        registry = StreamRegistry()
+        assert registry.list_readable_meta("agent-a") == []
+
 
 def _past_iso(seconds: int) -> str:
     return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).strftime(
@@ -503,6 +534,57 @@ class TestCreateStreamResourceLimits:
         r = limited_client.post("/streams", json={"name": "s4"}, headers=_auth("tok-b"))
         assert r.status_code == 429
         assert r.json()["code"] == "ResourceLimitExceededError"
+
+
+class TestListStreams:
+    def test_visible_set_differs_by_identity(self, client):
+        # agent-a が作った s1 に agent-b を read member として招待する。agent-a 自身は
+        # bootstrap の write 単独権限のままなので s1 は agent-a の一覧には出ない。
+        client.post("/streams", json={"name": "s1"}, headers=_auth("tok-a"))
+        client.put(
+            f"/streams/{SID}/members",
+            json={"identity": "agent-b", "access": "read"},
+            headers=_auth("tok-a"),
+        )
+        # agent-b が別途 s2 を作るが誰にも read を付与しない（agent-a には見えない）。
+        client.post("/streams", json={"name": "s2"}, headers=_auth("tok-b"))
+
+        r_a = client.get("/streams", headers=_auth("tok-a"))
+        r_b = client.get("/streams", headers=_auth("tok-b"))
+        assert r_a.status_code == r_b.status_code == 200
+        assert [s["stream_id"] for s in r_a.json()["streams"]] == []
+        assert [s["stream_id"] for s in r_b.json()["streams"]] == ["agent-a:s1"]
+
+    def test_element_shape_matches_get_single_stream(self, client):
+        client.post("/streams", json={"name": "s1"}, headers=_auth("tok-a"))
+        client.put(
+            f"/streams/{SID}/members",
+            json={"identity": "agent-a", "access": "read_write"},
+            headers=_auth("tok-a"),
+        )
+        single = client.get(f"/streams/{SID}", headers=_auth("tok-a")).json()
+        listed = client.get("/streams", headers=_auth("tok-a")).json()["streams"]
+        assert listed == [single]
+
+    def test_empty_list_for_identity_with_no_readable_streams(self, client):
+        r = client.get("/streams", headers=_auth("tok-c"))
+        assert r.status_code == 200
+        assert r.json() == {"streams": []}
+
+    def test_non_member_stream_not_included(self, client):
+        # agent-a の stream に一切 member でない agent-c には出現しない。
+        client.post("/streams", json={"name": "s1"}, headers=_auth("tok-a"))
+        client.put(
+            f"/streams/{SID}/members",
+            json={"identity": "agent-a", "access": "read_write"},
+            headers=_auth("tok-a"),
+        )
+        r = client.get("/streams", headers=_auth("tok-c"))
+        assert r.json() == {"streams": []}
+
+    def test_requires_auth(self, client):
+        r = client.get("/streams")
+        assert r.status_code == 401
 
 
 class TestGetStream:

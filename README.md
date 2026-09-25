@@ -61,7 +61,7 @@ relay_sdk/      # Python SDK
 docs/
   design/           # プロトコル・SDK の仕様書（一次情報源）
   ARCHITECTURE.md   # 実装のモジュール構成と設計判断の記録
-tests/          # サーバー・SDK のテスト（integration/ に E2E roundtrip）
+tests/          # サーバー・SDK のテスト（integration/ に E2E roundtrip、contract/ に wire 仕様の契約テスト）
 ```
 
 ## 設定
@@ -86,7 +86,7 @@ federation envelope の暗号化（`RELAY_JWE_PRIVATE_KEY_PEM`）が守るのは
 
 | 機能 | endpoint | 状態 |
 |---|---|---|
-| 場 (stream) CRUD + membership | `POST /streams`, `GET/DELETE /streams/{id}`, `PUT/DELETE/GET /streams/{id}/members` | 実装済み |
+| 場 (stream) CRUD + membership | `POST /streams`, `GET /streams`（read 権限を持つ場の一覧）, `GET/DELETE /streams/{id}`, `PUT/DELETE/GET /streams/{id}/members` | 実装済み |
 | 場 publish + cumulative ack | `POST /streams/{id}/messages`, `POST /streams/{id}/ack` | 実装済み |
 | subscription（subscribe / lease / unsubscribe / ack / publish） | `POST /subscriptions` 他 | 実装済み |
 | SSE 多重化購読（outbox dispatcher / retry / DLQ） | `GET /events` | 実装済み |
