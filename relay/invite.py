@@ -534,6 +534,26 @@ def _cmd_peer_enc_key(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_peer_require_encryption(args: argparse.Namespace) -> int:
+    """peer 単位の暗号化必須フラグを on/off する（`federation_peers.set_peer_require_encryption`）。
+
+    on にすると、この peer 宛の配達は暗号化鍵が双方揃わない限り平文フォールバックせず
+    DLQ へ回す（`RELAY_FEDERATION_REQUIRE_ENCRYPTION` 全体設定との OR で判定）。
+    """
+    db_path = _resolve_db_path(args.db)
+    db.init_db(db_path)
+    required = args.state == "on"
+    updated = federation_peers.set_peer_require_encryption(
+        db_path, handle=args.handle, required=required
+    )
+    if not updated:
+        print(f"peer '{args.handle}' は pin されていません", file=sys.stderr)
+        return 1
+    state_label = "有効" if required else "無効"
+    print(f"peer '{args.handle}' の暗号化必須化を{state_label}にしました")
+    return 0
+
+
 def _cmd_peer_list(args: argparse.Namespace) -> int:
     db_path = _resolve_db_path(args.db)
     db.init_db(db_path)
@@ -542,9 +562,11 @@ def _cmd_peer_list(args: argparse.Namespace) -> int:
     for p in peers:
         state = "revoked" if p["revoked_at"] is not None else "active"
         enc = "yes" if p.get("enc_key_jwk") is not None else "no"
+        require_enc = "yes" if p.get("require_encryption") else "no"
         print(
             f"  handle={p['handle']} fingerprint={p['fingerprint']}"
             f" locator={p['locator']} created_at={p['created_at']} state={state} enc_key={enc}"
+            f" require_encryption={require_enc}"
         )
     return 0
 
@@ -615,6 +637,14 @@ def build_parser() -> argparse.ArgumentParser:
     peer_revoke_parser.add_argument("--handle", required=True)
     peer_revoke_parser.add_argument("--db", default=None)
     peer_revoke_parser.set_defaults(func=_cmd_peer_revoke)
+
+    peer_require_encryption_parser = peer_sub.add_parser(
+        "require-encryption", help="peer 単位で envelope 暗号化を必須化する（on/off）"
+    )
+    peer_require_encryption_parser.add_argument("handle")
+    peer_require_encryption_parser.add_argument("state", choices=["on", "off"])
+    peer_require_encryption_parser.add_argument("--db", default=None)
+    peer_require_encryption_parser.set_defaults(func=_cmd_peer_require_encryption)
 
     return parser
 

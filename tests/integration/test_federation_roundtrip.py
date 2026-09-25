@@ -178,3 +178,57 @@ class TestFederationRoundTrip:
             time.sleep(0.05)
 
         assert error_codes == ["PeerRevoked"]
+
+    def test_require_encryption_dlqs_until_peer_key_registered(
+        self, federation_pair: FederationPair
+    ):
+        """peer 単位で暗号化必須化すると、相手の暗号化鍵が未登録の間は配達されず DLQ に回り、
+        鍵を登録し直すと同じ stream への publish が正常に届く。
+
+        `federation_pair` フィクスチャは enc-key 交換まで完了済みで双方の鍵が pin されて
+        いるため、まず B の暗号化鍵を意図的に外して「相手鍵未登録」状態を作ってから検証する。
+        """
+        pair = federation_pair
+        stream_id = pair.create_stream(pair.relay_a, pair.TOKEN_A, "chat-require-enc")
+        resp = pair.add_federation_member(
+            pair.relay_a,
+            pair.TOKEN_A,
+            stream_id,
+            f"{pair.IDENTITY_B}@{pair.HANDLE_B_ON_A}",
+        )
+        assert resp.status_code == 200, resp.text
+
+        peer_on_a = federation_peers.get_peer_by_handle(
+            pair.relay_a.settings.db_path, pair.HANDLE_B_ON_A
+        )
+        fingerprint_b = peer_on_a["fingerprint"]
+        original_enc_key_b = peer_on_a["enc_key_jwk"]
+        assert original_enc_key_b is not None, "フィクスチャで双方 pin 済みのはずの前提が崩れている"
+
+        federation_peers.set_peer_enc_key(
+            pair.relay_a.settings.db_path, fingerprint=fingerprint_b, enc_key_jwk=None
+        )
+        assert federation_peers.set_peer_require_encryption(
+            pair.relay_a.settings.db_path, handle=pair.HANDLE_B_ON_A, required=True
+        )
+
+        publish_id = pair.publish(pair.relay_a, pair.TOKEN_A, stream_id, "must wait for key")
+
+        deadline = time.time() + 5
+        error_codes: list[str] = []
+        while time.time() < deadline:
+            error_codes = _select_dlq_error_codes(pair.relay_a.settings.db_path, publish_id)
+            if error_codes:
+                break
+            time.sleep(0.05)
+        assert error_codes == ["PeerEncryptionRequired"]
+
+        # 鍵を登録し直すと、暗号化必須フラグを立てたままでも以後の publish は正常に届く。
+        federation_peers.set_peer_enc_key(
+            pair.relay_a.settings.db_path, fingerprint=fingerprint_b, enc_key_jwk=original_enc_key_b
+        )
+
+        with pair.open_sse(pair.relay_b, pair.TOKEN_B) as resp:
+            pair.publish(pair.relay_a, pair.TOKEN_A, stream_id, "arrives after key registered")
+            event = read_data_event(resp)
+        assert event["body"] == "arrives after key registered"

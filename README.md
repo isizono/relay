@@ -74,10 +74,13 @@ tests/          # サーバー・SDK のテスト（integration/ に E2E roundtr
 | `RELAY_AUTH_TOKENS` | Bearer token → identity の対応表（JSON object） |
 | `RELAY_SERVER_LOG_PATH` | 構造化ログ + サーバーログ sink（JSON Lines、TTL 90 日） |
 | `RELAY_JWS_PRIVATE_KEY_PEM` / `RELAY_JWS_KID` / `RELAY_JWS_JKU` | AgentCard の ES256 署名（未設定なら署名なし最小セット）。federation マシン鍵も兼ねる |
-| `RELAY_JWE_PRIVATE_KEY_PEM` | federation envelope body の暗号化鍵（ECDH-ES + A256GCM）。署名鍵とは別鍵。未設定なら envelope は互換のため平文で送る |
+| `RELAY_JWE_PRIVATE_KEY_PEM` | relay 間区間の envelope body 暗号化鍵（ECDH-ES + A256GCM）。署名鍵とは別鍵。未設定、または宛先 peer に暗号化鍵が未登録なら envelope は互換のため平文で送る（`RELAY_FEDERATION_REQUIRE_ENCRYPTION` / peer 単位フラグで必須化できる） |
+| `RELAY_FEDERATION_REQUIRE_ENCRYPTION` | 既定 `false`。`true` で全 peer 宛の配達に envelope 暗号化を必須化し、鍵が双方揃わない配達は平文で送らず DLQ に回す。peer 単位でも `python -m relay.invite peer require-encryption <handle> on\|off` で切替できる（いずれかが真なら必須） |
 | `RELAY_BASE_URL` | 自 relay の公開 base URL（招待 URL 生成・federation redeem 応答の locator に使う）。`python -m relay.invite` 系コマンドの `--base-url` 省略時にも参照する |
 | `RELAY_FEDERATION_ALLOW_PRIVATE_LOCATORS` | 既定 `false`。`true` で federation の outbound dial 先に localhost / private IP を許可（同一ホスト検証・開発用） |
 | `RELAY_TCP_KEEPIDLE` / `RELAY_TCP_KEEPINTVL` / `RELAY_TCP_KEEPCNT` | `python -m relay.serve` の TCP keepalive 設定（既定 60 秒 / 10 秒 / 3 回）。`uvicorn relay.app:app` 直接起動には効かない |
+
+federation envelope の暗号化（`RELAY_JWE_PRIVATE_KEY_PEM`）が守るのは**送信 relay → 受信 relay の区間（relay 間区間）のみ**である。受信側の relay は復号したうえで outbox / publish_log に平文のまま保存し、そこから先（`GET /events` の SSE 配達を含む）は既存の Bearer token 認証済み経路に委ねる。セッション（agent）に届くまでのエンドツーエンドの暗号化ではない。
 
 ## 機能とエンドポイント
 
@@ -93,6 +96,7 @@ tests/          # サーバー・SDK のテスト（integration/ に E2E roundtr
 | Python SDK（クライアント側） | `relay_sdk/` パッケージ | 実装済み |
 | federation peer レジストリ（招待ベース鍵ピン留め） + relay 間メッセージ配達 | `POST /federation/peers/redeem`、`POST /federation/streams/{id}/messages`（受信側 inbound endpoint）、`python -m relay.invite peer new/redeem/list/revoke` | 実装済み（送信側は既存 outbox dispatcher の egress ステップ、受信側は上記 inbound endpoint） |
 | federation envelope 暗号化鍵の追加登録（招待をやり直さない再 pin） | `POST /federation/peers/enc-key`、`python -m relay.invite peer enc-key` | 実装済み |
+| peer 単位の envelope 暗号化必須化 | `python -m relay.invite peer require-encryption <handle> on\|off` | 実装済み |
 
 wire レベルの仕様は [docs/design/relay-v2-wire-api.md](docs/design/relay-v2-wire-api.md)、identity / 認可モデルは [docs/design/relay-v2-identity-authz.md](docs/design/relay-v2-identity-authz.md) を参照。
 

@@ -253,6 +253,13 @@ _METRIC_HELP: dict[str, tuple[str, str]] = {
         "counter",
         "Total number of SSE connections force-disconnected as slow consumers.",
     ),
+    "relay_federation_plaintext_fallback_total": (
+        "counter",
+        "Total number of federation send attempts that used an unencrypted body because an"
+        " encryption key was missing on either side, by reason. Incremented once per attempt,"
+        " including retries of the same outbox row, regardless of whether that attempt"
+        " ultimately succeeds.",
+    ),
     "relay_outbox_depth": (
         "gauge",
         "Current number of pending (undelivered) outbox entries across both lanes.",

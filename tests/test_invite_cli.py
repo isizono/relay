@@ -590,3 +590,42 @@ class TestCmdPeerRevoke:
         db.init_db(db_path)
         rc = invite.main(["peer", "revoke", "--handle", "nobody", "--db", db_path])
         assert rc != 0
+
+
+class TestCmdPeerRequireEncryption:
+    def _pin_bob(self, db_path: str) -> None:
+        db.init_db(db_path)
+        jwk = ECKey.generate_key("P-256", private=True).as_dict(private=False)
+        fp = federation_peers.compute_fingerprint(jwk)
+        federation_peers.add_peer(
+            db_path, handle="bob", fingerprint=fp, key_jwk=jwk, locator="https://relay-b.example"
+        )
+
+    def test_on_sets_require_encryption_true(self, tmp_path):
+        db_path = str(tmp_path / "peer.db")
+        self._pin_bob(db_path)
+        rc = invite.main(["peer", "require-encryption", "bob", "on", "--db", db_path])
+        assert rc == 0
+        peer = federation_peers.get_peer_by_handle(db_path, "bob")
+        assert peer["require_encryption"] is True
+
+    def test_off_sets_require_encryption_false(self, tmp_path):
+        db_path = str(tmp_path / "peer.db")
+        self._pin_bob(db_path)
+        federation_peers.set_peer_require_encryption(db_path, handle="bob", required=True)
+        rc = invite.main(["peer", "require-encryption", "bob", "off", "--db", db_path])
+        assert rc == 0
+        peer = federation_peers.get_peer_by_handle(db_path, "bob")
+        assert peer["require_encryption"] is False
+
+    def test_unknown_handle_returns_nonzero(self, tmp_path):
+        db_path = str(tmp_path / "peer.db")
+        db.init_db(db_path)
+        rc = invite.main(["peer", "require-encryption", "nobody", "on", "--db", db_path])
+        assert rc != 0
+
+    def test_invalid_state_rejected_by_argparse(self, tmp_path):
+        db_path = str(tmp_path / "peer.db")
+        self._pin_bob(db_path)
+        with pytest.raises(SystemExit):
+            invite.main(["peer", "require-encryption", "bob", "maybe", "--db", db_path])

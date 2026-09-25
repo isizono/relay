@@ -115,6 +115,12 @@ def validate_enc_key_jwk(jwk: Any) -> None:
     P-256 に固定する（曲線 confusion の余地を減らす）。秘密鍵成分 `d` を含む場合は
     送信側の実装ミスで秘密鍵そのものが漏洩した可能性があるため拒否する（相手の秘密鍵を
     自分の DB に保存してしまう事故を未然に防ぐ）。
+
+    構造チェックの後、`ECKey.import_key` で実際にインポートし、`x`/`y` が P-256 曲線上の
+    有効な点であることまで確認する（cryptography ライブラリの
+    `EllipticCurvePublicNumbers.public_key` が curve 上の点かどうかを検証する）。曲線外の
+    座標や base64url として不正な `x`/`y` は、構造上は正しく見えても pin してしまうと
+    以後の ECDH 鍵合意がその peer 宛だけ常に失敗する事故になるため、pin 前にここで弾く。
     """
     if not isinstance(jwk, dict):
         raise ValueError("enc_key は JSON object でなければなりません")
@@ -128,6 +134,10 @@ def validate_enc_key_jwk(jwk: Any) -> None:
         raise ValueError("enc_key.y は必須の非空文字列です")
     if "d" in jwk:
         raise ValueError("enc_key に秘密鍵成分 'd' を含めることはできません")
+    try:
+        ECKey.import_key(jwk)
+    except Exception as exc:
+        raise ValueError(f"enc_key が P-256 曲線上の有効な点ではありません: {exc}") from exc
 
 
 class EnvelopeDecryptionError(Exception):
@@ -282,6 +292,7 @@ def _peer_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "revoked_at": row["revoked_at"],
         "disclosure_level": row["disclosure_level"],
         "enc_key_jwk": json.loads(enc_key_jwk) if enc_key_jwk is not None else None,
+        "require_encryption": bool(row["require_encryption"]),
     }
 
 
@@ -372,6 +383,29 @@ def set_peer_enc_key(db_path: str, *, fingerprint: str, enc_key_jwk: dict[str, A
         cur = conn.execute(
             "UPDATE peers SET enc_key_jwk = ? WHERE fingerprint = ?",
             (json.dumps(enc_key_jwk), fingerprint),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def set_peer_require_encryption(db_path: str, *, handle: str, required: bool) -> bool:
+    """peer 単位の暗号化必須フラグ（`peers.require_encryption`）を切り替える。
+
+    `python -m relay.invite peer require-encryption <handle> on|off` から呼ぶ。真の場合、
+    この peer 宛の配達は暗号化鍵が双方揃わない限り平文フォールバックせず permanent error
+    として DLQ に回す（`relay.federation_egress` 参照。全体設定
+    `Settings.federation_require_encryption` との OR で最終判定する）。
+
+    Returns:
+        対象 handle の peer が存在し更新できたかどうか。
+    """
+    conn = db.get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "UPDATE peers SET require_encryption = ? WHERE handle = ?",
+            (1 if required else 0, handle),
         )
         conn.commit()
         return cur.rowcount > 0

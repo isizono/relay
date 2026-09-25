@@ -994,6 +994,34 @@ medium3 の回帰テスト作成中に、`FakeRelay`（テスト用 stub、`rela
 test double 側の実装欠陥だが、修正しない限り「同一 keep-alive 接続上で outage 中に
 複数回 request する」パターンのテストが不安定になるため、あわせて修正した。
 
+## federation envelope 暗号化のスコープ（relay 間区間のみ、E2E ではない）
+
+`relay/federation_peers.py`（`encrypt_envelope_body` / `decrypt_envelope_body`）が提供する
+JWE 暗号化（ECDH-ES + A256GCM）が守るのは、**送信側 relay が宛先 peer relay へ HTTP `POST`
+する区間（relay 間区間）だけ**である。これは federation という機能が「別々の relay インスタンス
+の間」でメッセージを中継する層であり、各 relay インスタンス自身とそこに繋がる agent
+（publisher / subscriber）との間は、federation を経由しない local な stream / subscription
+と同じく、既存の Bearer token 認証済み HTTP / SSE 経路がそのまま使われることによる。
+
+- 送信側（`relay/federation_egress.py`）: envelope の `body` を暗号化し `body_jwe` として送る
+  かどうかは自分と宛先 peer の鍵の有無で決まる。`origin_stream_id` / `origin_publish_id` /
+  `from_sub` / `to_members` は配達ルーティングに必要なメタデータのため、暗号化の有無に
+  関わらず常に平文のまま送る（envelope 全体が暗号化されるわけではない）
+- 受信側（`relay/federation_inbound.py`）: `body_jwe` を自分の秘密鍵で復号したあと、
+  他の受信メッセージと同様 `publish_log` / `outbox` に**平文で** INSERT する。以後の
+  local member への配達（`GET /events` の SSE）は暗号化されない、既存の認証済み経路である
+
+したがって、この暗号化は「publish した agent から購読側 agent までのエンドツーエンドの
+暗号化」ではない。中間の relay インスタンス自身（disk 上の DB、プロセスメモリ）は平文の
+body を見ることができる。関与するのは「relay インスタンス間のネットワーク区間の盗聴・
+改竄からの保護」のみである。
+
+暗号化鍵が双方揃わない場合は互換のため平文 `body` にフォールバックする（`relay-server.jsonl`
+への `federation_plaintext_fallback` ログと `relay_federation_plaintext_fallback_total`
+カウンタで可視化される）。全体設定 `Settings.federation_require_encryption` または peer 単位の
+`peers.require_encryption`（`python -m relay.invite peer require-encryption`）を真にすると、
+このフォールバックをやめて `PeerEncryptionRequired` で DLQ に回す（README「設定」節参照）。
+
 ## `tests/integration/federation_harness.py`（2 relay federation 統合テストの基盤）
 
 `relay/federation_egress.py`（送信側）・`relay/federation_inbound.py`（受信側）は
