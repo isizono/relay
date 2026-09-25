@@ -1041,9 +1041,8 @@ class TestEnvelopeBodyEncryption:
     ):
         """平文で回線に出した事実は、その送信が結局失敗（timeout/5xx等）しても記録が残る。
 
-        `attempt_count == 0`（この outbox 行への最初の送信試行）の時点で記録するため、
-        直後に 500 が返って retryable 扱いになっても federation_plaintext_fallback は
-        既に 1 件記録済みのまま残る。
+        送信を試みた時点で記録するため、直後に 500 が返って retryable 扱いになっても
+        federation_plaintext_fallback は既に 1 件記録済みのまま残る。
         """
         import dataclasses
 
@@ -1075,13 +1074,13 @@ class TestEnvelopeBodyEncryption:
         counters = observability.get_metrics_registry(app_state).snapshot()
         assert counters["relay_federation_plaintext_fallback_total"][(("reason", "peer_key_missing"),)] == 1.0
 
-    def test_plaintext_fallback_not_double_counted_on_retry(
+    def test_plaintext_fallback_recorded_again_on_retry(
         self, monkeypatch, settings, app_state, pinned_bob, enc_keypair_a
     ):
-        """同一 outbox 行がリトライで複数回処理されても、記録は最初の試行分だけ。
+        """同一 outbox 行がリトライで複数回処理されると、平文で送信を試みるたびに記録が増える。
 
-        1回目の 500 応答（retryable）で1件記録された後、backoff 明けの再送が 202 で
-        成功しても件数は増えない（attempt_count がもう 0 でないため再記録されない）。
+        1回目の 500 応答（retryable）で1件記録された後、backoff 明けの再送も鍵が揃わず
+        平文になるため、202 で成功したその再送分でも記録が増え、合計 2 件になる。
         """
         import dataclasses
 
@@ -1125,9 +1124,86 @@ class TestEnvelopeBodyEncryption:
         assert _outbox_rows(settings, "orch:collab", "orch@bob") == []
         log_entries = _read_server_log(settings)
         fallback_entries = [e for e in log_entries if e["event"] == "federation_plaintext_fallback"]
-        assert len(fallback_entries) == 1
+        assert len(fallback_entries) == 2
         counters = observability.get_metrics_registry(app_state).snapshot()
-        assert counters["relay_federation_plaintext_fallback_total"][(("reason", "peer_key_missing"),)] == 1.0
+        assert counters["relay_federation_plaintext_fallback_total"][(("reason", "peer_key_missing"),)] == 2.0
+
+    def test_plaintext_fallback_logged_when_own_key_lost_before_retry(
+        self, monkeypatch, settings, app_state, pinned_bob, enc_keypair_a, enc_keypair_b
+    ):
+        """1回目は暗号化に成功して送信 → peer の 5xx で retryable 失敗 → 再試行までの間に
+        自分の暗号化鍵が失われる（再起動で `RELAY_JWE_PRIVATE_KEY_PEM` 未設定に戻る想定）と、
+        2回目の送信は平文にフォールバックする。
+
+        このとき `attempt_count` は既に 1 になっており「行への最初の送信試行かどうか」では
+        判定できないが、平文で実際に送信を試みた事実として記録が残ることを確認する。
+        """
+        import dataclasses
+
+        federation_peers.set_peer_enc_key(
+            settings.db_path, fingerprint=pinned_bob, enc_key_jwk=enc_keypair_b["public_jwk"]
+        )
+        settings_with_key = dataclasses.replace(settings, jwe_private_key_pem=enc_keypair_a["private_pem"])
+        app_state.settings = settings_with_key
+
+        registry = StreamRegistry()
+        registry.create("orch:collab", "orch", None)
+        registry.put_member("orch:collab", "orch@bob", "read")
+        publish_id = _publish(settings, "orch:collab", "orch@bob", body="secret then plain")
+
+        first_envelope = {}
+
+        def handler_first(request):
+            first_envelope["envelope"] = _decode_envelope(request)
+            return httpx.Response(500)
+
+        _patch_transport(monkeypatch, handler_first)
+        _run(_run_egress(app_state, settings_with_key, registry))
+
+        # 1回目は暗号化して送信 → 失敗。この時点で平文フォールバックはまだ記録されない。
+        assert "body_jwe" in first_envelope["envelope"]
+        rows = _outbox_rows(settings, "orch:collab", "orch@bob")
+        assert len(rows) == 1
+        assert rows[0]["attempt_count"] == 1
+        assert not any(
+            e["event"] == "federation_plaintext_fallback" for e in _read_server_log(settings)
+        )
+
+        # 再試行までの間に自分の暗号化鍵が失われる（再起動で env 未設定に戻る想定）。
+        settings_without_key = dataclasses.replace(settings_with_key, jwe_private_key_pem=None)
+        app_state.settings = settings_without_key
+
+        conn = db.get_connection(settings.db_path)
+        try:
+            conn.execute(
+                "UPDATE outbox SET next_attempt_at = ? WHERE stream_id = ? AND publish_id = ?",
+                (_past_iso(5), "orch:collab", publish_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        second_envelope = {}
+
+        def handler_second(request):
+            second_envelope["envelope"] = _decode_envelope(request)
+            return httpx.Response(202)
+
+        _patch_transport(monkeypatch, handler_second)
+        _run(_run_egress(app_state, settings_without_key, registry))
+
+        # 2回目は平文で送信され成功する。
+        assert second_envelope["envelope"]["body"] == "secret then plain"
+        assert "body_jwe" not in second_envelope["envelope"]
+        assert _outbox_rows(settings, "orch:collab", "orch@bob") == []
+
+        # attempt_count が既に 1 であっても、平文で送信を試みればここで記録される。
+        log_entries = _read_server_log(settings)
+        fallback_entries = [e for e in log_entries if e["event"] == "federation_plaintext_fallback"]
+        assert len(fallback_entries) == 1
+        assert fallback_entries[0]["reason"] == "own_key_missing"
+        counters = observability.get_metrics_registry(app_state).snapshot()
+        assert counters["relay_federation_plaintext_fallback_total"][(("reason", "own_key_missing"),)] == 1.0
 
     def test_require_encryption_global_setting_dlqs_instead_of_plaintext(
         self, monkeypatch, settings, app_state, pinned_bob, enc_keypair_a
